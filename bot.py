@@ -13,13 +13,16 @@ Gemini сам ищет в Google и читает страницы — отдел
 """
 
 import asyncio
+import base64
 import datetime
 import json
 import logging
 import os
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -28,6 +31,10 @@ from aiogram.filters import Command, CommandObject
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
+YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
+YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
+YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
 GEMINI_MODEL = "gemini-3.5-flash-lite"   # 15 запросов/мин, 500 в день на бесплатном тарифе
 
 BOT_NAME = "мяч"            # обращение без команды: «Мяч, когда тренировка?»
@@ -113,6 +120,83 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
 
+async def yandex_search_urls(query: str) -> list[str]:
+    """Ищет через Yandex Search API, возвращает список ссылок.
+    Подробно логирует ответ — чтобы при пустом результате была видна причина."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://searchapi.api.cloud.yandex.net/v2/web/search",
+            headers={"Authorization": f"Api-Key {YANDEX_API_KEY}"},
+            json={
+                "query": {"searchType": "SEARCH_TYPE_RU", "queryText": query},
+                "folderId": YANDEX_FOLDER_ID,
+                "responseFormat": "FORMAT_XML",
+            },
+        ) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                print(f"[DEBUG] Yandex Search статус={resp.status}, тело={raw[:400]!r}")
+                return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        print(f"[DEBUG] Yandex Search вернул не-JSON: {raw[:300]!r}")
+        return []
+    if "rawData" not in data:
+        print(f"[DEBUG] Yandex Search без rawData, ответ: {str(data)[:400]!r}")
+        return []
+    try:
+        xml_text = base64.b64decode(data["rawData"]).decode("utf-8", errors="ignore")
+        root = ET.fromstring(xml_text)
+        error_el = root.find(".//error")
+        if error_el is not None:
+            print(f"[DEBUG] Yandex Search ошибка в XML: {''.join(error_el.itertext())!r}")
+            return []
+        urls = []
+        for doc in root.iter("doc"):
+            url_el = doc.find("url")
+            if url_el is not None and url_el.text:
+                urls.append(url_el.text)
+            if len(urls) >= 4:
+                break
+        if not urls:
+            print(f"[DEBUG] Yandex Search: ссылок нет. Начало XML: {xml_text[:400]!r}")
+        return urls
+    except Exception as e:
+        print(f"[DEBUG] не удалось разобрать ответ Yandex Search: {e}")
+        return []
+
+
+async def fetch_page_text(url: str) -> str:
+    """Скачивает страницу и вытаскивает читаемый текст без HTML-тегов."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            html = await resp.text()
+    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+
+
+async def collect_web_context(query: str) -> str:
+    """Ищет и читает страницы целиком — сниппеты часто не содержат таблиц
+    с расписаниями, а сама страница обычно да."""
+    urls = await yandex_search_urls(query)
+    print(f"[DEBUG] поиск, ссылки: {urls}")
+    collected = []
+    for url in urls:
+        try:
+            text = await fetch_page_text(url)
+            if len(text) > 500:
+                print(f"[DEBUG] прочитал {url}, символов: {len(text)}")
+                collected.append(f"Источник {url}:\n{text[:8000]}")
+            else:
+                print(f"[DEBUG] страница {url} дала мало текста ({len(text)}), пропускаю")
+        except Exception as e:
+            print(f"[DEBUG] не удалось открыть {url}: {e}")
+        if len(collected) >= 2:
+            break
+    return "\n\n---\n\n".join(collected)
+
+
 async def ask_gemini(question: str, history: list[dict] | None = None,
                      system_extra: str = "") -> str:
     """Задаёт вопрос Gemini со включённым веб-поиском Google.
@@ -122,8 +206,9 @@ async def ask_gemini(question: str, history: list[dict] | None = None,
     system_text = (
         f"Сегодня {today}. Ты — помощник в семейном чате, отвечай по-русски, "
         f"кратко и по делу.\n"
-        f"Для вопросов о расписаниях, результатах и текущих событиях ОБЯЗАТЕЛЬНО "
-        f"используй веб-поиск, а не свои внутренние знания — они устаревают.\n"
+        f"Если ниже даны материалы из интернета — отвечай по ним, а не по своим "
+        f"внутренним знаниям: они устаревают. Не пиши «информация не объявлена», "
+        f"если в материалах есть конкретные даты и время.\n"
         f"Не пересчитывай время между часовыми поясами сам: указывай время так, "
         f"как оно дано в источнике, и пиши, какой это пояс.\n"
         f"Если вопрос подразумевает список (например, все матчи за день) — "
@@ -135,7 +220,6 @@ async def ask_gemini(question: str, history: list[dict] | None = None,
     payload = {
         "systemInstruction": {"parts": [{"text": system_text}]},
         "contents": history + [{"role": "user", "parts": [{"text": question}]}],
-        "tools": [{"google_search": {}}],
     }
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent")
@@ -144,31 +228,15 @@ async def ask_gemini(question: str, history: list[dict] | None = None,
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=payload) as resp:
             raw = await resp.text()
-            status = resp.status
-
-        # Если упёрлись в квоту — возможно, платным является именно веб-поиск.
-        # Пробуем тот же вопрос без него: ответ будет из знаний модели, но бот ответит.
-        if status == 429:
-            print(f"[DEBUG] Gemini 429 с веб-поиском, пробую без поиска. Тело: {raw[:300]!r}")
-            payload_no_search = {k: v for k, v in payload.items() if k != "tools"}
-            async with session.post(url, headers=headers, json=payload_no_search) as resp2:
-                raw = await resp2.text()
-                status = resp2.status
-                if status == 200:
-                    print("[DEBUG] без веб-поиска запрос прошёл — значит, квота именно на поиск")
-
-        if status != 200:
-            print(f"[DEBUG] Gemini статус={status}, тело={raw[:500]!r}")
-            raise RuntimeError(f"Gemini вернул статус {status}: {raw[:200]}")
-        data = json.loads(raw)
+            if resp.status != 200:
+                print(f"[DEBUG] Gemini статус={resp.status}, тело={raw[:500]!r}")
+                raise RuntimeError(f"Gemini вернул статус {resp.status}: {raw[:200]}")
+            data = json.loads(raw)
 
     candidate = data["candidates"][0]
     parts = candidate.get("content", {}).get("parts", [])
     answer = "".join(p.get("text", "") for p in parts).strip()
 
-    # В лог — реально ли модель искала в интернете (пустой список = отвечала по памяти)
-    queries = candidate.get("groundingMetadata", {}).get("webSearchQueries", [])
-    print(f"[DEBUG] Gemini поисковые запросы: {queries}")
     if not answer:
         raise RuntimeError(f"Gemini вернул пустой ответ: {raw[:300]}")
     return answer
@@ -195,11 +263,14 @@ async def handle_question(message: types.Message, question: str) -> None:
     system_extra = ""
     if is_sports_question(question):
         sites = preferred_sites(question)
-        print(f"[DEBUG] спортивный вопрос, предпочтительные источники: {sites}")
-        system_extra = (
-            f"Это вопрос о спорте. При поиске отдавай предпочтение источникам: "
-            f"{sites}. Если там нужного нет — ищи шире."
-        )
+        print(f"[DEBUG] спортивный вопрос, источники: {sites}")
+        site_filter = " OR ".join(f"site:{s.strip()}" for s in sites.split(","))
+        context = await collect_web_context(f"{question} {site_filter}")
+        if not context:
+            print("[DEBUG] по указанным сайтам пусто, ищу без ограничений")
+            context = await collect_web_context(question)
+        if context:
+            system_extra = f"Материалы из интернета по теме вопроса:\n{context}"
     try:
         answer = await ask_gemini(question, history, system_extra)
         await thinking_msg.edit_text(answer)
@@ -231,14 +302,17 @@ async def send_training_poll() -> None:
 async def check_ural_game() -> None:
     """Каждый день проверяет, играет ли «Урал» сегодня. Пишет в чат только если да."""
     today = datetime.date.today()
-    prompt = (
-        f"Найди в интернете ближайший матч футбольного клуба «Урал» (Екатеринбург), "
-        f"считая от {today.strftime('%d.%m.%Y')} включительно. "
-        f"Проверь fc-ural.ru, premierliga.ru, championat.com. "
-        f"Ответь СТРОГО в формате, без пояснений и лишних слов:\n"
-        f"ДД.ММ.ГГГГ|ЧЧ:ММ|название соперника"
-    )
     try:
+        context = await collect_web_context(
+            "ФК Урал Екатеринбург ближайший матч расписание site:fc-ural.ru OR site:premierliga.ru OR site:championat.com"
+        )
+        prompt = (
+            f"Вот материалы из интернета:\n{context}\n\n"
+            f"Найди ближайший матч футбольного клуба «Урал» (Екатеринбург), "
+            f"считая от {today.strftime('%d.%m.%Y')} включительно. "
+            f"Ответь СТРОГО в формате, без пояснений и лишних слов:\n"
+            f"ДД.ММ.ГГГГ|ЧЧ:ММ|название соперника"
+        )
         answer = await ask_gemini(prompt)
         print(f"[DEBUG] проверка игры Урала: {answer!r}")
         parts = answer.strip().split("|")
