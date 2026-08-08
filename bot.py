@@ -155,6 +155,9 @@ def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
         if match:
             name = match.group(1).strip().title()
             players.append((name, int(match.group(2)), int(match.group(3))))
+        elif not any(ch.isdigit() for ch in chunk):
+            # Просто фамилия без цифр — играл, но не забил и не отдал
+            players.append((chunk.title(), 0, 0))
         else:
             errors.append(chunk)
     return players, errors
@@ -561,7 +564,8 @@ async def cmd_remind(message: types.Message, command: CommandObject):
 async def cmd_match(message: types.Message, command: CommandObject):
     print(f"[DEBUG] сработал /матч, аргументы: {command.args!r}")
     usage = ("Формат: /матч Фамилия голы+передачи, Фамилия голы+передачи\n"
-             "Например: /матч Иванов 2+1, Петров 0+3, Сидоров 1+0\n"
+             "Например: /матч Иванов 2+1, Петров 0+3, Соломин\n"
+             "Кто не забивал и не отдавал — можно просто фамилией, без цифр.\n"
              "Каждому перечисленному игроку засчитывается одна сыгранная игра.")
     if not command.args:
         await message.answer(usage)
