@@ -139,17 +139,28 @@ async def ask_gemini(question: str, history: list[dict] | None = None,
     }
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent")
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            url,
-            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-            json=payload,
-        ) as resp:
+        async with session.post(url, headers=headers, json=payload) as resp:
             raw = await resp.text()
-            if resp.status != 200:
-                print(f"[DEBUG] Gemini статус={resp.status}, тело={raw[:500]!r}")
-                raise RuntimeError(f"Gemini вернул статус {resp.status}: {raw[:200]}")
-            data = json.loads(raw)
+            status = resp.status
+
+        # Если упёрлись в квоту — возможно, платным является именно веб-поиск.
+        # Пробуем тот же вопрос без него: ответ будет из знаний модели, но бот ответит.
+        if status == 429:
+            print(f"[DEBUG] Gemini 429 с веб-поиском, пробую без поиска. Тело: {raw[:300]!r}")
+            payload_no_search = {k: v for k, v in payload.items() if k != "tools"}
+            async with session.post(url, headers=headers, json=payload_no_search) as resp2:
+                raw = await resp2.text()
+                status = resp2.status
+                if status == 200:
+                    print("[DEBUG] без веб-поиска запрос прошёл — значит, квота именно на поиск")
+
+        if status != 200:
+            print(f"[DEBUG] Gemini статус={status}, тело={raw[:500]!r}")
+            raise RuntimeError(f"Gemini вернул статус {status}: {raw[:200]}")
+        data = json.loads(raw)
 
     candidate = data["candidates"][0]
     parts = candidate.get("content", {}).get("parts", [])
