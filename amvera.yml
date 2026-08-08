@@ -8,7 +8,6 @@ build:
   requirementsPath: requirements.txt
   useCache: false
 run:
-  scriptName: bot.py
-  command: null
   persistenceMount: /data
+  scriptName: bot.py
   containerPort: 80
