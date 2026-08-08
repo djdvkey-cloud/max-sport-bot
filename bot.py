@@ -329,6 +329,69 @@ async def web_search_deep(query: str) -> str:
     return await web_search(query)
 
 
+async def gigachat_completion(messages: list[dict]) -> str:
+    """Низкоуровневый вызов GigaChat — без поиска, истории и системных подсказок.
+    Нужен отдельно от ask_gigachat, чтобы вспомогательные вызовы (например,
+    извлечение названия команды) не запускали её же маршрутизацию по кругу."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "RqUID": str(uuid.uuid4()),
+                "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
+            },
+            data={"scope": "GIGACHAT_API_PERS"},
+            ssl=False,
+        ) as token_resp:
+            raw = await token_resp.text()
+            print(f"[DEBUG] GigaChat oauth статус={token_resp.status}, тело={raw[:400]!r}")
+            try:
+                token_data = json.loads(raw)
+            except ValueError:
+                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {token_resp.status}): {raw[:200]}")
+            if token_resp.status != 200:
+                raise RuntimeError(token_data.get("message", f"ошибка получения токена, статус {token_resp.status}"))
+            access_token = token_data["access_token"]
+        async with session.post(
+            "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"model": "GigaChat", "messages": messages},
+            ssl=False,
+        ) as resp:
+            raw = await resp.text()
+            print(f"[DEBUG] GigaChat completions статус={resp.status}, тело={raw[:400]!r}")
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {resp.status}): {raw[:200]}")
+            if resp.status != 200:
+                raise RuntimeError(data.get("message", f"ошибка запроса, статус {resp.status}"))
+            return data["choices"][0]["message"]["content"]
+
+
+async def extract_team_name_english(question: str) -> str:
+    """api-sports.io принимает в поиске только латиницу — вытаскиваем название
+    команды из русского вопроса и переводим отдельным простым вызовом (не через
+    ask_gigachat, чтобы не зациклиться на футбольном/хоккейном вопросе)."""
+    try:
+        answer = await gigachat_completion([{
+            "role": "user",
+            "content": (
+                f"Определи, о какой спортивной команде идёт речь, и ответь "
+                f"СТРОГО её официальным названием на английском языке, без "
+                f"пояснений и лишних слов: {question}"
+            ),
+        }])
+        cleaned = "".join(c for c in answer if c.isalnum() or c.isspace()).strip()
+        print(f"[DEBUG] извлечённое название команды (англ.): {cleaned!r}")
+        return cleaned
+    except Exception as e:
+        print(f"[DEBUG] не удалось определить название команды: {e}")
+        return ""
+
+
 async def ask_gigachat(question: str, history: list[dict], search_query: str | None = None) -> str:
     query = search_query or question
     if search_query is not None:
@@ -336,13 +399,10 @@ async def ask_gigachat(question: str, history: list[dict], search_query: str | N
     elif is_football_hockey_question(question):
         hockey_indicators = ["хокке", "нхл", "кхл"]
         sport = "hockey" if any(ind in question.lower() for ind in hockey_indicators) else "football"
-        # Пробуем угадать название команды простым способом — берём вопрос как есть,
-        # api-sports.io сам ищет по подстроке в названии команды
         search_results = ""
-        for candidate in [w for w in question.split() if len(w) > 3]:
-            search_results = await api_sports_next_match(candidate, sport)
-            if search_results:
-                break
+        team_name = await extract_team_name_english(question)
+        if team_name:
+            search_results = await api_sports_next_match(team_name, sport)
         if not search_results:
             print("[DEBUG] api-sports.io не нашёл команду, использую обычный глубокий поиск")
             search_results = await web_search_deep(f"{question} {OTHER_SPORTS_SITES}")
@@ -384,53 +444,7 @@ async def ask_gigachat(question: str, history: list[dict], search_query: str | N
             f"чем полагаться только на свои внутренние знания."
         )
     messages = [{"role": "system", "content": system_content}] + history + [{"role": "user", "content": question}]
-    async with aiohttp.ClientSession() as session:
-        # Шаг 1 — временный access_token (живёт 30 минут; берём новый на каждый
-        # вопрос, так код проще, а лишний запрос погоды не делает)
-        async with session.post(
-            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-                "RqUID": str(uuid.uuid4()),
-                "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
-            },
-            data={"scope": "GIGACHAT_API_PERS"},
-            ssl=False,  # у GigaChat свои сертификаты, стандартная проверка их не распознаёт
-        ) as token_resp:
-            raw = await token_resp.text()
-            print(f"[DEBUG] GigaChat oauth статус={token_resp.status}, тело={raw[:400]!r}")
-            print(f"[DEBUG] GigaChat oauth заголовки ответа={dict(token_resp.headers)}")
-            try:
-                token_data = json.loads(raw)
-            except ValueError:
-                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {token_resp.status}): {raw[:200]}")
-            if token_resp.status != 200:
-                raise RuntimeError(token_data.get("message", f"ошибка получения токена, статус {token_resp.status}"))
-            access_token = token_data["access_token"]
-
-        # Шаг 2 — сам вопрос
-        async with session.post(
-            "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "GigaChat",
-                "messages": messages,
-            },
-            ssl=False,
-        ) as resp:
-            raw = await resp.text()
-            print(f"[DEBUG] GigaChat completions статус={resp.status}, тело={raw[:400]!r}")
-            try:
-                data = json.loads(raw)
-            except ValueError:
-                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {resp.status}): {raw[:200]}")
-            if resp.status != 200:
-                raise RuntimeError(data.get("message", f"ошибка запроса, статус {resp.status}"))
-            return data["choices"][0]["message"]["content"]
+    return await gigachat_completion(messages)
 
 
 @dp.message(Command("start"))
