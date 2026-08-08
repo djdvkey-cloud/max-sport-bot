@@ -1,29 +1,26 @@
 """
-Семейный/футбольный Telegram-бот на Gemini API со встроенным веб-поиском.
+Семейный/футбольный Telegram-бот на Claude API со встроенным веб-поиском.
 
-Gemini сам ищет в Google и читает страницы — отдельный поисковый сервис
-(как раньше Yandex Search) больше не нужен.
+Claude сам ищет в интернете и читает страницы. Поиск можно ограничить
+конкретными сайтами (allowed_domains) — отдельный поисковый сервис не нужен.
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (в Amvera → «Переменные»):
-    BOT_TOKEN      — токен от @BotFather
-    GEMINI_API_KEY — ключ с aistudio.google.com
+    BOT_TOKEN         — токен от @BotFather
+    ANTHROPIC_API_KEY — ключ с console.anthropic.com
 
 ЗАПУСК:
     python bot.py
 """
 
 import asyncio
-import base64
 import datetime
 import json
 import logging
 import os
 import re
-import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -32,12 +29,10 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
-YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
-YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
-YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
-GEMINI_MODEL = "gemini-3.5-flash-lite"   # 15 запросов/мин, 500 в день на бесплатном тарифе
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Sonnet — баланс качества и цены. Для экономии можно поставить
+# "claude-haiku-4-5-20251001", для сложных задач — "claude-opus-5".
+CLAUDE_MODEL = "claude-sonnet-5"
 
 BOT_NAME = "мяч"            # обращение без команды: «Мяч, когда тренировка?»
 MAX_HISTORY_MESSAGES = 10   # сколько последних сообщений помнить (5 пар вопрос-ответ)
@@ -45,32 +40,32 @@ ALLOWED_CHAT_IDS = {-5579173684}      # где боту разрешено от�
 TRAINING_POLL_CHAT_ID = -5579173684   # куда постить опросы и напоминания
 GAME_TIME = "21:30"                   # время тренировки, попадает в текст опроса
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
-STATS_FILE = "/data/stats.json"   # статистика игроков по чатам — не удалять
+STATS_FILE = "/data/stats.json"       # статистика игроков по чатам — не удалять
 
 # Первый опрос — 09.08.2026 в 12:00 по Екатеринбургу, дальше каждые 2 дня.
 # Дата в тексте опроса всегда «завтра» относительно дня публикации:
 # опрос 09.08 → тренировка 10.08, опрос 11.08 → тренировка 12.08 и т.д.
 POLL_START = datetime.datetime(2026, 8, 9, 12, 0, tzinfo=YEKB_TZ)
-POLL_INTERVAL_DAYS = 2   # точка отсчёта расписания опроса — не удалять
+POLL_INTERVAL_DAYS = 2
 
-# --- Предпочитаемые источники по видам спорта -----------------------------
-# Gemini ищет сам, поэтому это не жёсткий фильтр, а подсказка в промпте.
+# --- Сайты по видам спорта (для allowed_domains веб-поиска) ---------------
+# Порядок проверки важен: НХЛ раньше КХЛ, т.к. слово «хоккей» есть у обоих.
 
 NHL_KEYWORDS = ["нхл", "nhl"]
-NHL_SITES = "nhl.com, nhl.ru, hockey-reference.com"
+NHL_SITES = ["nhl.com", "nhl.ru", "hockey-reference.com"]
 
 FUTSAL_KEYWORDS = ["футзал", "мини-футбол", "синара", "мфк виз", "виз-синара"]
-FUTSAL_SITES = "superliga.rfs.ru, mfkviz.ru, futsal.rfs.ru, uefa.com"
+FUTSAL_SITES = ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru", "uefa.com"]
 
 KHL_KEYWORDS = ["кхл", "khl", "автомобилист", "хоккей"]
-KHL_SITES = "khl.ru, hc-avto.ru, news.sportbox.ru"
+KHL_SITES = ["khl.ru", "hc-avto.ru", "news.sportbox.ru"]
 
-OTHER_SPORTS_SITES = (
-    "premierliga.ru, uefa.com, fnl.pro, fc-ural.ru, premierleague.com, "
-    "news.sportbox.ru, championat.com, sports.ru, matchtv.ru, "
-    "sport-express.ru, sport24.ru, metaratings.ru, laliga.com, "
-    "bundesliga.com, legaseriea.it"
-)
+OTHER_SPORTS_SITES = [
+    "premierliga.ru", "uefa.com", "fnl.pro", "fc-ural.ru", "premierleague.com",
+    "news.sportbox.ru", "championat.com", "sports.ru", "matchtv.ru",
+    "sport-express.ru", "sport24.ru", "metaratings.ru", "laliga.com",
+    "bundesliga.com", "legaseriea.it",
+]
 SPORTS_KEYWORDS = [
     "матч", "игра", "играет", "команда", "чемпионат", "лига", "соперник",
     "турнир", "счёт", "футбол", "баскетбол", "теннис", "спортсмен", "спорт",
@@ -85,9 +80,8 @@ def is_sports_question(question: str) -> bool:
     return any(kw in question.lower() for kw in SPORTS_KEYWORDS)
 
 
-def preferred_sites(question: str) -> str:
-    """Какие источники предпочесть для этого вопроса.
-    Порядок важен: НХЛ проверяется раньше КХЛ, т.к. слово «хоккей» есть у обоих."""
+def preferred_sites(question: str) -> list[str]:
+    """Какие сайты разрешить поиску для этого вопроса."""
     q = question.lower()
     if any(kw in q for kw in NHL_KEYWORDS):
         return NHL_SITES
@@ -105,13 +99,11 @@ def get_history(chat_id: int, user_id: int) -> list[dict]:
 def update_history(chat_id: int, user_id: int, question: str, answer: str) -> None:
     key = (chat_id, user_id)
     history = conversation_history.get(key, [])
-    history.append({"role": "user", "parts": [{"text": question}]})
-    history.append({"role": "model", "parts": [{"text": answer}]})
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": answer})
     conversation_history[key] = history[-MAX_HISTORY_MESSAGES:]
 
 
-# Короткий таймаут: на хостинге связь с Telegram иногда пропадает, и ждать
-# ответа по минуте бессмысленно — лучше быстро упасть и повторить попытку.
 # --- Статистика игроков ---------------------------------------------------
 
 def load_stats() -> dict:
@@ -126,8 +118,7 @@ def load_stats() -> dict:
     except Exception as e:
         print(f"[DEBUG] не удалось прочитать статистику: {e}")
         return {}
-    # Совместимость со старым форматом без "players"
-    for chat_key, chat_data in list(data.items()):
+    for chat_key, chat_data in list(data.items()):   # совместимость со старым форматом
         if "players" not in chat_data:
             data[chat_key] = {"players": chat_data, "last": []}
     return data
@@ -144,8 +135,8 @@ def save_stats(stats: dict) -> None:
 
 
 def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
-    """Разбирает «Иванов 2+1, Петров 0+3» → [(имя, голы, передачи), ...].
-    Вторым значением возвращает куски, которые не удалось разобрать."""
+    """Разбирает «Иванов 2+1, Соломин, Петров 0+3» → [(имя, голы, передачи), ...].
+    Фамилия без цифр считается как 0+0. Вторым значением — неразобранные куски."""
     players, errors = [], []
     for chunk in text.split(","):
         chunk = chunk.strip()
@@ -153,174 +144,80 @@ def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
             continue
         match = re.match(r"^(.+?)\s+(\d+)\s*\+\s*(\d+)$", chunk)
         if match:
-            name = match.group(1).strip().title()
-            players.append((name, int(match.group(2)), int(match.group(3))))
+            players.append((match.group(1).strip().title(),
+                            int(match.group(2)), int(match.group(3))))
         elif not any(ch.isdigit() for ch in chunk):
-            # Просто фамилия без цифр — играл, но не забил и не отдал
             players.append((chunk.title(), 0, 0))
         else:
             errors.append(chunk)
     return players, errors
 
 
+# Короткий таймаут: на хостинге связь с Telegram иногда пропадает, и ждать
+# ответа по минуте бессмысленно — лучше быстро упасть и повторить попытку.
 bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=20))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
 
-async def yandex_search_urls(query: str) -> list[str]:
-    """Ищет через Yandex Search API, возвращает список ссылок.
-    Подробно логирует ответ — чтобы при пустом результате была видна причина."""
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://searchapi.api.cloud.yandex.net/v2/web/search",
-            headers={"Authorization": f"Api-Key {YANDEX_API_KEY}"},
-            json={
-                "query": {"searchType": "SEARCH_TYPE_RU", "queryText": query},
-                "folderId": YANDEX_FOLDER_ID,
-                "responseFormat": "FORMAT_XML",
-            },
-        ) as resp:
-            raw = await resp.text()
-            if resp.status != 200:
-                print(f"[DEBUG] Yandex Search статус={resp.status}, тело={raw[:400]!r}")
-                return []
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        print(f"[DEBUG] Yandex Search вернул не-JSON: {raw[:300]!r}")
-        return []
-    if "rawData" not in data:
-        print(f"[DEBUG] Yandex Search без rawData, ответ: {str(data)[:400]!r}")
-        return []
-    try:
-        xml_text = base64.b64decode(data["rawData"]).decode("utf-8", errors="ignore")
-        root = ET.fromstring(xml_text)
-        error_el = root.find(".//error")
-        if error_el is not None:
-            print(f"[DEBUG] Yandex Search ошибка в XML: {''.join(error_el.itertext())!r}")
-            return []
-        urls = []
-        for doc in root.iter("doc"):
-            url_el = doc.find("url")
-            if url_el is not None and url_el.text:
-                urls.append(url_el.text)
-            if len(urls) >= 4:
-                break
-        if not urls:
-            print(f"[DEBUG] Yandex Search: ссылок нет. Начало XML: {xml_text[:400]!r}")
-        return urls
-    except Exception as e:
-        print(f"[DEBUG] не удалось разобрать ответ Yandex Search: {e}")
-        return []
-
-
-async def fetch_page_text(url: str) -> str:
-    """Скачивает страницу и вытаскивает читаемый текст без HTML-тегов."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
-                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            html = await resp.text()
-    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
-
-
-def has_own_topic(question: str) -> bool:
-    """Есть ли в вопросе собственная тема: название лиги/команды или имя
-    собственное. Если есть — вопрос самодостаточный, контекст ему не нужен."""
-    q = question.lower()
-    topic_words = NHL_KEYWORDS + FUTSAL_KEYWORDS + KHL_KEYWORDS + [
-        "рпл", "апл", "лч", "премьер-лига", "урал", "нба", "чемпионат", "лига",
-    ]
-    if any(w in q for w in topic_words):
-        return True
-    # Слово с заглавной буквы не в начале предложения — скорее всего, название
-    return any(w[:1].isupper() for w in question.split()[1:])
-
-
-def build_search_query(question: str, history: list[dict]) -> str:
-    """Для уточняющих вопросов («а во сколько?», «где играют?») добавляет
-    предыдущий вопрос — иначе поиск теряет тему разговора. Самодостаточные
-    вопросы (где тема названа прямо) оставляет как есть."""
-    if has_own_topic(question):
-        return question
-    words = question.split()
-    looks_like_followup = len(words) <= 6 or question.lower().startswith(("а ", "и ", "ещё", "еще"))
-    if looks_like_followup and history:
-        prior = [m["parts"][0]["text"] for m in history if m.get("role") == "user"]
-        if prior:
-            return f"{prior[-1]} {question}"
-    return question
-
-
-async def collect_web_context(query: str, preferred: str = "") -> str:
-    """Ищет и читает страницы целиком — сниппеты часто не содержат таблиц
-    с расписаниями, а сама страница обычно да.
-    Фильтр site: в запрос НЕ добавляем: Яндекс не переваривает много сайтов
-    через OR и возвращает «ничего не найдено». Вместо этого поднимаем
-    страницы с предпочтительных сайтов выше в списке найденного."""
-    urls = await yandex_search_urls(query)
-    if preferred:
-        pref_hosts = [s.strip() for s in preferred.split(",") if s.strip()]
-        urls.sort(key=lambda u: 0 if any(h in u for h in pref_hosts) else 1)
-    print(f"[DEBUG] поиск, ссылки (предпочтительные первыми): {urls}")
-    collected = []
-    for url in urls:
-        try:
-            text = await fetch_page_text(url)
-            if len(text) > 500:
-                print(f"[DEBUG] прочитал {url}, символов: {len(text)}")
-                collected.append(f"Источник {url}:\n{text[:8000]}")
-            else:
-                print(f"[DEBUG] страница {url} дала мало текста ({len(text)}), пропускаю")
-        except Exception as e:
-            print(f"[DEBUG] не удалось открыть {url}: {e}")
-        if len(collected) >= 2:
-            break
-    return "\n\n---\n\n".join(collected)
-
-
-async def ask_gemini(question: str, history: list[dict] | None = None,
+async def ask_claude(question: str, history: list[dict] | None = None,
+                     allowed_domains: list[str] | None = None,
                      system_extra: str = "") -> str:
-    """Задаёт вопрос Gemini со включённым веб-поиском Google.
-    Модель сама решает, искать ли, формирует запросы и читает страницы."""
+    """Задаёт вопрос Claude со встроенным веб-поиском.
+    allowed_domains ограничивает поиск конкретными сайтами."""
     history = history or []
     today = datetime.date.today().strftime("%d.%m.%Y")
     system_text = (
         f"Сегодня {today}. Ты — помощник в семейном чате, отвечай по-русски, "
         f"кратко и по делу.\n"
-        f"Если ниже даны материалы из интернета — отвечай по ним, а не по своим "
-        f"внутренним знаниям: они устаревают. Не пиши «информация не объявлена», "
-        f"если в материалах есть конкретные даты и время.\n"
-        f"Не пересчитывай время между часовыми поясами сам: указывай время так, "
-        f"как оно дано в источнике, и пиши, какой это пояс.\n"
+        f"Для вопросов о расписаниях, результатах и текущих событиях обязательно "
+        f"ищи в интернете, а не полагайся на свои знания — они устаревают.\n"
+        f"Не пересчитывай время между часовыми поясами: указывай его так, как "
+        f"в источнике, и уточняй, какой это пояс.\n"
         f"Если вопрос подразумевает список (например, все матчи за день) — "
-        f"перечисли ВСЕ подходящие пункты, а не только первый."
+        f"перечисли все подходящие пункты, а не только первый.\n"
+        f"Не используй markdown-разметку со звёздочками — в Telegram она "
+        f"отображается как есть."
     )
     if system_extra:
         system_text += f"\n{system_extra}"
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_text}]},
-        "contents": history + [{"role": "user", "parts": [{"text": question}]}],
-    }
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{GEMINI_MODEL}:generateContent")
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    search_tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+    if allowed_domains:
+        search_tool["allowed_domains"] = allowed_domains
 
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 1500,
+        "system": system_text,
+        "messages": history + [{"role": "user", "content": question}],
+        "tools": [search_tool],
+    }
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
+        async with session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
             raw = await resp.text()
             if resp.status != 200:
-                print(f"[DEBUG] Gemini статус={resp.status}, тело={raw[:500]!r}")
-                raise RuntimeError(f"Gemini вернул статус {resp.status}: {raw[:200]}")
+                print(f"[DEBUG] Claude статус={resp.status}, тело={raw[:500]!r}")
+                raise RuntimeError(f"Claude вернул статус {resp.status}: {raw[:200]}")
             data = json.loads(raw)
 
-    candidate = data["candidates"][0]
-    parts = candidate.get("content", {}).get("parts", [])
-    answer = "".join(p.get("text", "") for p in parts).strip()
-
+    # Ответ состоит из блоков: текст, запросы поиска, результаты поиска
+    queries = [b.get("input", {}).get("query") for b in data.get("content", [])
+               if b.get("type") == "server_tool_use"]
+    print(f"[DEBUG] Claude искал: {queries}")
+    answer = "".join(b.get("text", "") for b in data.get("content", [])
+                     if b.get("type") == "text").strip()
     if not answer:
-        raise RuntimeError(f"Gemini вернул пустой ответ: {raw[:300]}")
+        raise RuntimeError(f"Claude вернул пустой ответ: {raw[:300]}")
     return answer
 
 
@@ -341,26 +238,23 @@ async def answer_with_retry(message: types.Message, text: str, attempts: int = 3
 async def handle_question(message: types.Message, question: str) -> None:
     """Общая логика для /ии и обращения по имени."""
     # «Думаю...» — приятный, но не обязательный шаг. Если Telegram сейчас
-    # недоступен (на хостинге это бывает), не блокируемся на нём, а работаем дальше.
+    # недоступен (на хостинге бывает), не блокируемся на нём, а работаем дальше.
     try:
         thinking_msg = await asyncio.wait_for(message.answer("Думаю..."), timeout=15)
     except Exception as e:
         print(f"[DEBUG] не удалось отправить «Думаю...», продолжаю без него: {e}")
         thinking_msg = None
+
     history = get_history(message.chat.id, message.from_user.id)
-    system_extra = ""
+    domains = None
     if is_sports_question(question):
-        sites = preferred_sites(question)
-        search_query = build_search_query(question, history)
-        print(f"[DEBUG] спортивный вопрос, поисковый запрос: {search_query!r}")
-        context = await collect_web_context(search_query, sites)
-        if context:
-            system_extra = f"Материалы из интернета по теме вопроса:\n{context}"
+        domains = preferred_sites(question)
+        print(f"[DEBUG] спортивный вопрос, поиск ограничен: {domains}")
     try:
-        answer = await ask_gemini(question, history, system_extra)
+        answer = await ask_claude(question, history, allowed_domains=domains)
         update_history(message.chat.id, message.from_user.id, question, answer)
     except Exception as e:
-        print(f"[DEBUG] ошибка запроса к Gemini: {e}")
+        print(f"[DEBUG] ошибка запроса к Claude: {e}")
         answer = "Не получилось получить ответ, попробуйте ещё раз чуть позже."
     try:
         if thinking_msg is not None:
@@ -395,19 +289,19 @@ async def send_training_poll() -> None:
 TRACKED_CLUBS = [
     {
         "name": "МФК «Синара» (Екатеринбург)",
-        "query": "МФК Синара Екатеринбург ближайший матч расписание",
+        "query": "ближайший матч МФК Синара Екатеринбург: турнир, дата, время, место, соперник",
         "sites": FUTSAL_SITES,
         "icon": "🥅",
     },
     {
         "name": "ФК «Урал» (Екатеринбург)",
-        "query": "ФК Урал Екатеринбург ближайший матч расписание",
-        "sites": "fc-ural.ru, fnl.pro, championat.com",
+        "query": "ближайший матч ФК Урал Екатеринбург: турнир, дата, время, место, соперник",
+        "sites": ["fc-ural.ru", "fnl.pro", "championat.com"],
         "icon": "⚽",
     },
     {
         "name": "ХК «Автомобилист» (Екатеринбург)",
-        "query": "ХК Автомобилист Екатеринбург ближайший матч расписание",
+        "query": "ближайший матч ХК Автомобилист Екатеринбург: турнир, дата, время, место, соперник",
         "sites": KHL_SITES,
         "icon": "🏒",
     },
@@ -417,21 +311,15 @@ TRACKED_CLUBS = [
 async def next_match_for_club(club: dict) -> str:
     """Возвращает строку с анонсом ближайшей игры клуба или пустую строку."""
     today = datetime.date.today()
+    prompt = (
+        f"{club['query']}. Найди БЛИЖАЙШИЙ предстоящий матч, считая от "
+        f"{today.strftime('%d.%m.%Y')} включительно. "
+        f"Ответь СТРОГО в одном из двух видов, без пояснений и лишних слов:\n"
+        f"Турнир|ДД.ММ.ГГГГ|ЧЧ:ММ|Место проведения|Соперник\n"
+        f"НЕТ — если данных о предстоящем матче найти не удалось."
+    )
     try:
-        context = await collect_web_context(club["query"], preferred=club["sites"])
-        if not context:
-            print(f"[DEBUG] {club['name']}: материалов не нашлось")
-            return ""
-        prompt = (
-            f"Вот материалы из интернета:\n{context}\n\n"
-            f"Найди БЛИЖАЙШИЙ предстоящий матч команды {club['name']}, "
-            f"считая от {today.strftime('%d.%m.%Y')} включительно. "
-            f"Ответь СТРОГО в одном из двух видов, без пояснений и лишних слов:\n"
-            f"Турнир|ДД.ММ.ГГГГ|ЧЧ:ММ|Место проведения|Соперник\n"
-            f"НЕТ — если в материалах нет данных о предстоящем матче.\n"
-            f"Время указывай так, как в источнике, не пересчитывай пояса."
-        )
-        answer = (await ask_gemini(prompt)).strip()
+        answer = (await ask_claude(prompt, allowed_domains=club["sites"])).strip()
         print(f"[DEBUG] {club['name']}: {answer!r}")
         if answer.upper().startswith("НЕТ"):
             return ""
@@ -495,12 +383,12 @@ async def cmd_help(message: types.Message):
         "/напомнить ДД.ММ ЧЧ:ММ текст — запланировать напоминание\n"
         "/забыть — начать разговор заново\n"
         "\nСтатистика игр:\n"
-        "/матч Иванов 2+1, Петров 0+3 — записать результаты игры\n"
+        "/матч Иванов 2+1, Петров 0+3, Соломин — записать результаты игры\n"
         "/статистика — таблица игроков\n"
         "/отменить — убрать последнюю записанную игру\n"
         "/переименовать Старое = Новое — переименовать игрока\n"
         "/обнулить да — стереть всю статистику чата\n"
-        "Или просто начните сообщение с «Мяч» — например: «Мяч, когда тренировка?»"
+        "\nИли просто начните сообщение с «Мяч» — например: «Мяч, когда тренировка?»"
     )
 
 
@@ -620,21 +508,6 @@ async def cmd_stats(message: types.Message):
     await message.answer("\n".join(lines))
 
 
-@dp.message(Command("обнулить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
-async def cmd_reset_stats(message: types.Message, command: CommandObject):
-    print(f"[DEBUG] сработал /обнулить, аргументы: {command.args!r}")
-    if (command.args or "").strip().lower() != "да":
-        await message.answer(
-            "Это сотрёт всю статистику чата без возможности восстановить.\n"
-            "Если уверены — отправьте: /обнулить да"
-        )
-        return
-    stats = load_stats()
-    stats.pop(str(message.chat.id), None)
-    save_stats(stats)
-    await message.answer("Статистика чата очищена.")
-
-
 @dp.message(Command("отменить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
 async def cmd_undo(message: types.Message):
     print("[DEBUG] сработал /отменить")
@@ -684,13 +557,27 @@ async def cmd_rename(message: types.Message, command: CommandObject):
     merged = target["games"] > 0 or target["goals"] > 0 or target["assists"] > 0
     for key in ("games", "goals", "assists"):
         target[key] += rec[key]
-    # в истории последней игры тоже поправим имя, чтобы /отменить сработал верно
-    for entry in chat.get("last", []):
+    for entry in chat.get("last", []):   # чтобы /отменить сработал верно
         if entry[0] == old_name:
             entry[0] = new_name
     save_stats(stats)
     tail = " Статистика объединена." if merged else ""
     await message.answer(f"«{old_name}» теперь «{new_name}».{tail}")
+
+
+@dp.message(Command("обнулить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+async def cmd_reset_stats(message: types.Message, command: CommandObject):
+    print(f"[DEBUG] сработал /обнулить, аргументы: {command.args!r}")
+    if (command.args or "").strip().lower() != "да":
+        await message.answer(
+            "Это сотрёт всю статистику чата без возможности восстановить.\n"
+            "Если уверены — отправьте: /обнулить да"
+        )
+        return
+    stats = load_stats()
+    stats.pop(str(message.chat.id), None)
+    save_stats(stats)
+    await message.answer("Статистика чата очищена.")
 
 
 @dp.message()
@@ -715,7 +602,7 @@ async def main():
     scheduler.add_job(
         send_training_poll,
         IntervalTrigger(days=POLL_INTERVAL_DAYS, start_date=POLL_START, timezone=YEKB_TZ),
-        misfire_grace_time=1800,   # если бот был недоступен больше 30 минут — пропустить, а не слать с опозданием
+        misfire_grace_time=1800,   # если бот был недоступен больше 30 минут — пропустить
         coalesce=True,             # не слать несколько опросов подряд за пропущенные дни
     )
     print(f"[DEBUG] опрос про тренировку: старт {POLL_START:%d.%m.%Y %H:%M}, "
@@ -728,7 +615,7 @@ async def main():
     )
     print("[DEBUG] анонсы матчей клубов: каждый день в 10:00 по Екатеринбургу")
     scheduler.start()
-    print("Бот запущен (Gemini). Для остановки — Ctrl+C")
+    print(f"Бот запущен (Claude, {CLAUDE_MODEL}). Для остановки — Ctrl+C")
     await dp.start_polling(bot)
 
 
