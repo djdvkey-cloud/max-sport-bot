@@ -176,11 +176,29 @@ async def fetch_page_text(url: str) -> str:
     return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
 
 
-async def collect_web_context(query: str) -> str:
+def build_search_query(question: str, history: list[dict]) -> str:
+    """Для коротких уточняющих вопросов («а во сколько?», «где играют?»)
+    добавляет предыдущий вопрос — иначе поиск теряет тему разговора."""
+    words = question.split()
+    looks_like_followup = len(words) <= 6 or question.lower().startswith(("а ", "и ", "ещё", "еще"))
+    if looks_like_followup and history:
+        prior = [m["parts"][0]["text"] for m in history if m.get("role") == "user"]
+        if prior:
+            return f"{prior[-1]} {question}"
+    return question
+
+
+async def collect_web_context(query: str, preferred: str = "") -> str:
     """Ищет и читает страницы целиком — сниппеты часто не содержат таблиц
-    с расписаниями, а сама страница обычно да."""
+    с расписаниями, а сама страница обычно да.
+    Фильтр site: в запрос НЕ добавляем: Яндекс не переваривает много сайтов
+    через OR и возвращает «ничего не найдено». Вместо этого поднимаем
+    страницы с предпочтительных сайтов выше в списке найденного."""
     urls = await yandex_search_urls(query)
-    print(f"[DEBUG] поиск, ссылки: {urls}")
+    if preferred:
+        pref_hosts = [s.strip() for s in preferred.split(",") if s.strip()]
+        urls.sort(key=lambda u: 0 if any(h in u for h in pref_hosts) else 1)
+    print(f"[DEBUG] поиск, ссылки (предпочтительные первыми): {urls}")
     collected = []
     for url in urls:
         try:
@@ -263,12 +281,9 @@ async def handle_question(message: types.Message, question: str) -> None:
     system_extra = ""
     if is_sports_question(question):
         sites = preferred_sites(question)
-        print(f"[DEBUG] спортивный вопрос, источники: {sites}")
-        site_filter = " OR ".join(f"site:{s.strip()}" for s in sites.split(","))
-        context = await collect_web_context(f"{question} {site_filter}")
-        if not context:
-            print("[DEBUG] по указанным сайтам пусто, ищу без ограничений")
-            context = await collect_web_context(question)
+        search_query = build_search_query(question, history)
+        print(f"[DEBUG] спортивный вопрос, поисковый запрос: {search_query!r}")
+        context = await collect_web_context(search_query, sites)
         if context:
             system_extra = f"Материалы из интернета по теме вопроса:\n{context}"
     try:
@@ -304,7 +319,8 @@ async def check_ural_game() -> None:
     today = datetime.date.today()
     try:
         context = await collect_web_context(
-            "ФК Урал Екатеринбург ближайший матч расписание site:fc-ural.ru OR site:premierliga.ru OR site:championat.com"
+            "ФК Урал Екатеринбург ближайший матч расписание",
+            preferred="fc-ural.ru, premierliga.ru, championat.com",
         )
         prompt = (
             f"Вот материалы из интернета:\n{context}\n\n"
