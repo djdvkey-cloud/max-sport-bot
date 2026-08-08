@@ -179,9 +179,25 @@ async def fetch_page_text(url: str) -> str:
     return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
 
 
+def has_own_topic(question: str) -> bool:
+    """Есть ли в вопросе собственная тема: название лиги/команды или имя
+    собственное. Если есть — вопрос самодостаточный, контекст ему не нужен."""
+    q = question.lower()
+    topic_words = NHL_KEYWORDS + FUTSAL_KEYWORDS + KHL_KEYWORDS + [
+        "рпл", "апл", "лч", "премьер-лига", "урал", "нба", "чемпионат", "лига",
+    ]
+    if any(w in q for w in topic_words):
+        return True
+    # Слово с заглавной буквы не в начале предложения — скорее всего, название
+    return any(w[:1].isupper() for w in question.split()[1:])
+
+
 def build_search_query(question: str, history: list[dict]) -> str:
-    """Для коротких уточняющих вопросов («а во сколько?», «где играют?»)
-    добавляет предыдущий вопрос — иначе поиск теряет тему разговора."""
+    """Для уточняющих вопросов («а во сколько?», «где играют?») добавляет
+    предыдущий вопрос — иначе поиск теряет тему разговора. Самодостаточные
+    вопросы (где тема названа прямо) оставляет как есть."""
+    if has_own_topic(question):
+        return question
     words = question.split()
     looks_like_followup = len(words) <= 6 or question.lower().startswith(("а ", "и ", "ещё", "еще"))
     if looks_like_followup and history:
