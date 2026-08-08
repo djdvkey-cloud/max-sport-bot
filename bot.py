@@ -478,6 +478,22 @@ async def cmd_id(message: types.Message):
     await message.answer(f"ID этого чата: {message.chat.id}")
 
 
+async def answer_with_retry(message: types.Message, text: str, attempts: int = 3, delay: int = 5):
+    """Отправляет сообщение с несколькими попытками — на случай кратковременного
+    сбоя связи с Telegram API (такое уже случалось на Amvera, обычно проходит
+    за секунды)."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return await message.answer(text)
+        except Exception as e:
+            last_error = e
+            print(f"[DEBUG] попытка {attempt + 1} отправить сообщение не удалась: {e}")
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+    raise last_error
+
+
 @dp.message(Command("ии"), F.chat.id.in_(ALLOWED_CHAT_IDS))
 async def cmd_ai(message: types.Message, command: CommandObject):
     print(f"[DEBUG] сработал /ии, вопрос: {command.args!r}")
@@ -485,7 +501,7 @@ async def cmd_ai(message: types.Message, command: CommandObject):
     if not question:
         await message.answer("Напишите вопрос после команды, например:\n/ии сколько лет живут черепахи")
         return
-    thinking_msg = await message.answer("Думаю...")
+    thinking_msg = await answer_with_retry(message, "Думаю...")
     history = get_history(message.chat.id, message.from_user.id)
     try:
         answer = await ask_gigachat(question, history)
@@ -550,7 +566,7 @@ async def catch_all(message: types.Message):
         if not question:
             await message.answer("Да? Спросите что-нибудь после имени.")
             return
-        thinking_msg = await message.answer("Думаю...")
+        thinking_msg = await answer_with_retry(message, "Думаю...")
         history = get_history(message.chat.id, message.from_user.id)
         try:
             answer = await ask_gigachat(question, history)
