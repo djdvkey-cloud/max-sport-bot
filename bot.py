@@ -18,6 +18,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
@@ -44,7 +45,13 @@ ALLOWED_CHAT_IDS = {-5579173684}      # где боту разрешено от�
 TRAINING_POLL_CHAT_ID = -5579173684   # куда постить опросы и напоминания
 GAME_TIME = "21:30"                   # время тренировки, попадает в текст опроса
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
-ANCHOR_FILE = "/data/poll_schedule_anchor.txt"   # точка отсчёта расписания опроса — не удалять
+STATS_FILE = "/data/stats.json"   # статистика игроков по чатам — не удалять
+
+# Первый опрос — 09.08.2026 в 12:00 по Екатеринбургу, дальше каждые 2 дня.
+# Дата в тексте опроса всегда «завтра» относительно дня публикации:
+# опрос 09.08 → тренировка 10.08, опрос 11.08 → тренировка 12.08 и т.д.
+POLL_START = datetime.datetime(2026, 8, 9, 12, 0, tzinfo=YEKB_TZ)
+POLL_INTERVAL_DAYS = 2   # точка отсчёта расписания опроса — не удалять
 
 # --- Предпочитаемые источники по видам спорта -----------------------------
 # Gemini ищет сам, поэтому это не жёсткий фильтр, а подсказка в промпте.
@@ -52,7 +59,7 @@ ANCHOR_FILE = "/data/poll_schedule_anchor.txt"   # точка отсчёта р�
 NHL_KEYWORDS = ["нхл", "nhl"]
 NHL_SITES = "nhl.com, nhl.ru, hockey-reference.com"
 
-FUTSAL_KEYWORDS = ["футзал", "мини-футбол", "мфк виз", "виз-синара"]
+FUTSAL_KEYWORDS = ["футзал", "мини-футбол", "синара", "мфк виз", "виз-синара"]
 FUTSAL_SITES = "superliga.rfs.ru, mfkviz.ru, futsal.rfs.ru, uefa.com"
 
 KHL_KEYWORDS = ["кхл", "khl", "автомобилист", "хоккей"]
@@ -103,21 +110,56 @@ def update_history(chat_id: int, user_id: int, question: str, answer: str) -> No
     conversation_history[key] = history[-MAX_HISTORY_MESSAGES:]
 
 
-def get_poll_anchor() -> datetime.datetime:
-    """Точка отсчёта расписания «раз в 2 дня» — хранится в файле, чтобы
-    переживать перезапуски и не сбиваться при каждой пересборке."""
-    if os.path.exists(ANCHOR_FILE):
-        with open(ANCHOR_FILE, "r") as f:
-            return datetime.datetime.fromisoformat(f.read().strip())
-    anchor = datetime.datetime.now(YEKB_TZ).replace(hour=12, minute=0, second=0, microsecond=0)
-    os.makedirs(os.path.dirname(ANCHOR_FILE), exist_ok=True)
-    with open(ANCHOR_FILE, "w") as f:
-        f.write(anchor.isoformat())
-    return anchor
-
-
 # Короткий таймаут: на хостинге связь с Telegram иногда пропадает, и ждать
 # ответа по минуте бессмысленно — лучше быстро упасть и повторить попытку.
+# --- Статистика игроков ---------------------------------------------------
+
+def load_stats() -> dict:
+    """Статистика по чатам:
+    {chat_id: {"players": {игрок: {games, goals, assists}}, "last": [записи]}}
+    "last" — последняя внесённая игра, нужна для /отменить."""
+    if not os.path.exists(STATS_FILE):
+        return {}
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[DEBUG] не удалось прочитать статистику: {e}")
+        return {}
+    # Совместимость со старым форматом без "players"
+    for chat_key, chat_data in list(data.items()):
+        if "players" not in chat_data:
+            data[chat_key] = {"players": chat_data, "last": []}
+    return data
+
+
+def chat_stats_of(stats: dict, chat_id: int) -> dict:
+    return stats.setdefault(str(chat_id), {"players": {}, "last": []})
+
+
+def save_stats(stats: dict) -> None:
+    os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
+    """Разбирает «Иванов 2+1, Петров 0+3» → [(имя, голы, передачи), ...].
+    Вторым значением возвращает куски, которые не удалось разобрать."""
+    players, errors = [], []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        match = re.match(r"^(.+?)\s+(\d+)\s*\+\s*(\d+)$", chunk)
+        if match:
+            name = match.group(1).strip().title()
+            players.append((name, int(match.group(2)), int(match.group(3))))
+        else:
+            errors.append(chunk)
+    return players, errors
+
+
 bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=20))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
@@ -346,42 +388,84 @@ async def send_training_poll() -> None:
     )
 
 
-async def check_ural_game() -> None:
-    """Каждый день проверяет, играет ли «Урал» сегодня. Пишет в чат только если да."""
+# Клубы, по которым бот сам присылает анонс ближайшей игры каждое утро
+TRACKED_CLUBS = [
+    {
+        "name": "МФК «Синара» (Екатеринбург)",
+        "query": "МФК Синара Екатеринбург ближайший матч расписание",
+        "sites": FUTSAL_SITES,
+        "icon": "🥅",
+    },
+    {
+        "name": "ФК «Урал» (Екатеринбург)",
+        "query": "ФК Урал Екатеринбург ближайший матч расписание",
+        "sites": "fc-ural.ru, fnl.pro, championat.com",
+        "icon": "⚽",
+    },
+    {
+        "name": "ХК «Автомобилист» (Екатеринбург)",
+        "query": "ХК Автомобилист Екатеринбург ближайший матч расписание",
+        "sites": KHL_SITES,
+        "icon": "🏒",
+    },
+]
+
+
+async def next_match_for_club(club: dict) -> str:
+    """Возвращает строку с анонсом ближайшей игры клуба или пустую строку."""
     today = datetime.date.today()
     try:
-        context = await collect_web_context(
-            "ФК Урал Екатеринбург ближайший матч расписание",
-            preferred="fc-ural.ru, fnl.pro, championat.com",
-        )
+        context = await collect_web_context(club["query"], preferred=club["sites"])
+        if not context:
+            print(f"[DEBUG] {club['name']}: материалов не нашлось")
+            return ""
         prompt = (
             f"Вот материалы из интернета:\n{context}\n\n"
-            f"Найди ближайший матч футбольного клуба «Урал» (Екатеринбург), "
+            f"Найди БЛИЖАЙШИЙ предстоящий матч команды {club['name']}, "
             f"считая от {today.strftime('%d.%m.%Y')} включительно. "
-            f"Ответь СТРОГО в формате, без пояснений и лишних слов:\n"
-            f"ДД.ММ.ГГГГ|ЧЧ:ММ|название соперника"
+            f"Ответь СТРОГО в одном из двух видов, без пояснений и лишних слов:\n"
+            f"Турнир|ДД.ММ.ГГГГ|ЧЧ:ММ|Место проведения|Соперник\n"
+            f"НЕТ — если в материалах нет данных о предстоящем матче.\n"
+            f"Время указывай так, как в источнике, не пересчитывай пояса."
         )
-        answer = await ask_gemini(prompt)
-        print(f"[DEBUG] проверка игры Урала: {answer!r}")
-        parts = answer.strip().split("|")
-        if len(parts) < 3:
-            print("[DEBUG] неожиданный формат ответа про Урал, пропускаю")
-            return
-        game_date = datetime.datetime.strptime(parts[0].strip(), "%d.%m.%Y").date()
-        if game_date != today:
-            print(f"[DEBUG] ближайшая игра Урала не сегодня, а {game_date} — молчу")
-            return
-        text = f"⚽ Сегодня играет «Урал»! Начало в {parts[1].strip()}, соперник — {parts[2].strip()}."
-        for attempt in range(3):
-            try:
-                await bot.send_message(TRAINING_POLL_CHAT_ID, text)
-                break
-            except Exception as send_error:
-                print(f"[DEBUG] попытка {attempt + 1} отправить напоминание не удалась: {send_error}")
-                if attempt < 2:
-                    await asyncio.sleep(5)
+        answer = (await ask_gemini(prompt)).strip()
+        print(f"[DEBUG] {club['name']}: {answer!r}")
+        if answer.upper().startswith("НЕТ"):
+            return ""
+        parts = [p.strip() for p in answer.split("|")]
+        if len(parts) < 5:
+            print(f"[DEBUG] {club['name']}: неожиданный формат, пропускаю")
+            return ""
+        tournament, date_str, time_str, place, rival = parts[:5]
+        return (f"{club['icon']} Предстоящий матч {club['name']} проведёт:\n"
+                f"   {tournament}, {date_str} в {time_str}\n"
+                f"   Место: {place}\n"
+                f"   Соперник: {rival}")
     except Exception as e:
-        print(f"[DEBUG] ошибка проверки игры Урала: {e}")
+        print(f"[DEBUG] ошибка при проверке {club['name']}: {e}")
+        return ""
+
+
+async def check_clubs_games() -> None:
+    """Каждое утро присылает в чат анонсы ближайших игр отслеживаемых клубов."""
+    print("[DEBUG] утренняя проверка матчей клубов")
+    blocks = []
+    for club in TRACKED_CLUBS:
+        line = await next_match_for_club(club)
+        if line:
+            blocks.append(line)
+    if not blocks:
+        print("[DEBUG] ни по одному клубу данных не нашлось, ничего не отправляю")
+        return
+    text = "\n\n".join(blocks)
+    for attempt in range(3):
+        try:
+            await bot.send_message(TRAINING_POLL_CHAT_ID, text)
+            break
+        except Exception as e:
+            print(f"[DEBUG] попытка {attempt + 1} отправить анонсы не удалась: {e}")
+            if attempt < 2:
+                await asyncio.sleep(5)
 
 
 # --- Команды --------------------------------------------------------------
@@ -407,6 +491,12 @@ async def cmd_help(message: types.Message):
         "/опрос — создать опрос «Кто идёт на тренировку?»\n"
         "/напомнить ДД.ММ ЧЧ:ММ текст — запланировать напоминание\n"
         "/забыть — начать разговор заново\n"
+        "\nСтатистика игр:\n"
+        "/матч Иванов 2+1, Петров 0+3 — записать результаты игры\n"
+        "/статистика — таблица игроков\n"
+        "/отменить — убрать последнюю записанную игру\n"
+        "/переименовать Старое = Новое — переименовать игрока\n"
+        "/обнулить да — стереть всю статистику чата\n"
         "Или просто начните сообщение с «Мяч» — например: «Мяч, когда тренировка?»"
     )
 
@@ -467,6 +557,138 @@ async def cmd_remind(message: types.Message, command: CommandObject):
     await message.answer(f"Хорошо, напомню {remind_dt.strftime('%d.%m в %H:%M')}: «{text}»")
 
 
+@dp.message(Command("матч"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+async def cmd_match(message: types.Message, command: CommandObject):
+    print(f"[DEBUG] сработал /матч, аргументы: {command.args!r}")
+    usage = ("Формат: /матч Фамилия голы+передачи, Фамилия голы+передачи\n"
+             "Например: /матч Иванов 2+1, Петров 0+3, Сидоров 1+0\n"
+             "Каждому перечисленному игроку засчитывается одна сыгранная игра.")
+    if not command.args:
+        await message.answer(usage)
+        return
+    players, errors = parse_match_line(command.args)
+    if not players:
+        await message.answer(f"Не понял ни одного игрока.\n{usage}")
+        return
+
+    stats = load_stats()
+    chat = chat_stats_of(stats, message.chat.id)
+    for name, goals, assists in players:
+        rec = chat["players"].setdefault(name, {"games": 0, "goals": 0, "assists": 0})
+        rec["games"] += 1
+        rec["goals"] += goals
+        rec["assists"] += assists
+    chat["last"] = [list(p) for p in players]   # для /отменить
+    save_stats(stats)
+
+    lines = [f"Записал игру, участников: {len(players)}"]
+    for name, goals, assists in players:
+        lines.append(f"• {name}: {goals}+{assists}")
+    if errors:
+        lines.append(f"\nНе разобрал: {', '.join(errors)}")
+    lines.append("\n/статистика — таблица, /отменить — убрать эту запись")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("статистика"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+async def cmd_stats(message: types.Message):
+    print("[DEBUG] сработал /статистика")
+    chat_stats = load_stats().get(str(message.chat.id), {}).get("players", {})
+    if not chat_stats:
+        await message.answer(
+            "Статистики пока нет. Добавьте первую игру:\n"
+            "/матч Иванов 2+1, Петров 0+3"
+        )
+        return
+    rows = []
+    for name, r in chat_stats.items():
+        points = r["goals"] + r["assists"]
+        koef = points / r["games"] if r["games"] else 0
+        rows.append((koef, points, name, r))
+    rows.sort(reverse=True)
+
+    lines = ["📊 Статистика (И — игры, Г — голы, П — передачи, К — очки за игру)\n"]
+    for i, (koef, points, name, r) in enumerate(rows, 1):
+        lines.append(
+            f"{i}. {name} — И:{r['games']} Г:{r['goals']} П:{r['assists']} "
+            f"О:{points} К:{koef:.2f}"
+        )
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("обнулить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+async def cmd_reset_stats(message: types.Message, command: CommandObject):
+    print(f"[DEBUG] сработал /обнулить, аргументы: {command.args!r}")
+    if (command.args or "").strip().lower() != "да":
+        await message.answer(
+            "Это сотрёт всю статистику чата без возможности восстановить.\n"
+            "Если уверены — отправьте: /обнулить да"
+        )
+        return
+    stats = load_stats()
+    stats.pop(str(message.chat.id), None)
+    save_stats(stats)
+    await message.answer("Статистика чата очищена.")
+
+
+@dp.message(Command("отменить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+async def cmd_undo(message: types.Message):
+    print("[DEBUG] сработал /отменить")
+    stats = load_stats()
+    chat = chat_stats_of(stats, message.chat.id)
+    last = chat.get("last") or []
+    if not last:
+        await message.answer("Нечего отменять — последняя игра уже отменена или её ещё не было.")
+        return
+    for name, goals, assists in last:
+        rec = chat["players"].get(name)
+        if not rec:
+            continue
+        rec["games"] = max(0, rec["games"] - 1)
+        rec["goals"] = max(0, rec["goals"] - goals)
+        rec["assists"] = max(0, rec["assists"] - assists)
+        if rec["games"] == 0 and rec["goals"] == 0 and rec["assists"] == 0:
+            chat["players"].pop(name, None)   # игрок был только в этой игре
+    chat["last"] = []
+    save_stats(stats)
+    names = ", ".join(p[0] for p in last)
+    await message.answer(f"Последняя игра отменена. Затронуты: {names}")
+
+
+@dp.message(Command("переименовать"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+async def cmd_rename(message: types.Message, command: CommandObject):
+    print(f"[DEBUG] сработал /переименовать, аргументы: {command.args!r}")
+    usage = ("Формат: /переименовать Старое имя = Новое имя\n"
+             "Например: /переименовать Иванов = Иванов И.\n"
+             "Если новое имя уже есть в таблице — статистика сложится.")
+    if not command.args or "=" not in command.args:
+        await message.answer(usage)
+        return
+    old_name, new_name = [part.strip().title() for part in command.args.split("=", 1)]
+    if not old_name or not new_name:
+        await message.answer(usage)
+        return
+
+    stats = load_stats()
+    chat = chat_stats_of(stats, message.chat.id)
+    rec = chat["players"].pop(old_name, None)
+    if rec is None:
+        have = ", ".join(chat["players"].keys()) or "пока никого"
+        await message.answer(f"Игрока «{old_name}» в таблице нет.\nЕсть: {have}")
+        return
+    target = chat["players"].setdefault(new_name, {"games": 0, "goals": 0, "assists": 0})
+    merged = target["games"] > 0 or target["goals"] > 0 or target["assists"] > 0
+    for key in ("games", "goals", "assists"):
+        target[key] += rec[key]
+    # в истории последней игры тоже поправим имя, чтобы /отменить сработал верно
+    for entry in chat.get("last", []):
+        if entry[0] == old_name:
+            entry[0] = new_name
+    save_stats(stats)
+    tail = " Статистика объединена." if merged else ""
+    await message.answer(f"«{old_name}» теперь «{new_name}».{tail}")
+
+
 @dp.message()
 async def catch_all(message: types.Message):
     text = message.text or ""
@@ -488,12 +710,19 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     scheduler.add_job(
         send_training_poll,
-        IntervalTrigger(days=2, start_date=get_poll_anchor(), timezone=YEKB_TZ),
+        IntervalTrigger(days=POLL_INTERVAL_DAYS, start_date=POLL_START, timezone=YEKB_TZ),
+        misfire_grace_time=1800,   # если бот был недоступен больше 30 минут — пропустить, а не слать с опозданием
+        coalesce=True,             # не слать несколько опросов подряд за пропущенные дни
     )
+    print(f"[DEBUG] опрос про тренировку: старт {POLL_START:%d.%m.%Y %H:%M}, "
+          f"каждые {POLL_INTERVAL_DAYS} дня")
     scheduler.add_job(
-        check_ural_game,
-        CronTrigger(hour=12, minute=0, timezone=YEKB_TZ),
+        check_clubs_games,
+        CronTrigger(hour=10, minute=0, timezone=YEKB_TZ),
+        misfire_grace_time=1800,
+        coalesce=True,
     )
+    print("[DEBUG] анонсы матчей клубов: каждый день в 10:00 по Екатеринбургу")
     scheduler.start()
     print("Бот запущен (Gemini). Для остановки — Ctrl+C")
     await dp.start_polling(bot)
