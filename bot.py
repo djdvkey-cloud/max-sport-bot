@@ -352,7 +352,7 @@ async def check_ural_game() -> None:
     try:
         context = await collect_web_context(
             "ФК Урал Екатеринбург ближайший матч расписание",
-            preferred="fc-ural.ru, premierliga.ru, championat.com",
+            preferred="fc-ural.ru, fnl.pro, championat.com",
         )
         prompt = (
             f"Вот материалы из интернета:\n{context}\n\n"
