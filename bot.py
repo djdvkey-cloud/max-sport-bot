@@ -27,6 +27,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -115,7 +116,9 @@ def get_poll_anchor() -> datetime.datetime:
     return anchor
 
 
-bot = Bot(token=BOT_TOKEN)
+# Короткий таймаут: на хостинге связь с Telegram иногда пропадает, и ждать
+# ответа по минуте бессмысленно — лучше быстро упасть и повторить попытку.
+bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=20))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
@@ -276,7 +279,13 @@ async def answer_with_retry(message: types.Message, text: str, attempts: int = 3
 
 async def handle_question(message: types.Message, question: str) -> None:
     """Общая логика для /ии и обращения по имени."""
-    thinking_msg = await answer_with_retry(message, "Думаю...")
+    # «Думаю...» — приятный, но не обязательный шаг. Если Telegram сейчас
+    # недоступен (на хостинге это бывает), не блокируемся на нём, а работаем дальше.
+    try:
+        thinking_msg = await asyncio.wait_for(message.answer("Думаю..."), timeout=15)
+    except Exception as e:
+        print(f"[DEBUG] не удалось отправить «Думаю...», продолжаю без него: {e}")
+        thinking_msg = None
     history = get_history(message.chat.id, message.from_user.id)
     system_extra = ""
     if is_sports_question(question):
@@ -288,11 +297,18 @@ async def handle_question(message: types.Message, question: str) -> None:
             system_extra = f"Материалы из интернета по теме вопроса:\n{context}"
     try:
         answer = await ask_gemini(question, history, system_extra)
-        await thinking_msg.edit_text(answer)
         update_history(message.chat.id, message.from_user.id, question, answer)
     except Exception as e:
         print(f"[DEBUG] ошибка запроса к Gemini: {e}")
-        await thinking_msg.edit_text("Не получилось получить ответ, попробуйте ещё раз чуть позже.")
+        answer = "Не получилось получить ответ, попробуйте ещё раз чуть позже."
+    try:
+        if thinking_msg is not None:
+            await thinking_msg.edit_text(answer)
+        else:
+            await answer_with_retry(message, answer)
+    except Exception as e:
+        print(f"[DEBUG] не удалось отредактировать сообщение, шлю новым: {e}")
+        await answer_with_retry(message, answer)
 
 
 # --- Плановые задачи ------------------------------------------------------
