@@ -28,7 +28,7 @@ from aiogram.filters import Command, CommandObject
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = "gemini-3.6-flash"   # актуальная модель; при устаревании — сменить строку здесь
+GEMINI_MODEL = "gemini-3.5-flash-lite"   # 15 запросов/мин, 500 в день на бесплатном тарифе
 
 BOT_NAME = "мяч"            # обращение без команды: «Мяч, когда тренировка?»
 MAX_HISTORY_MESSAGES = 10   # сколько последних сообщений помнить (5 пар вопрос-ответ)
