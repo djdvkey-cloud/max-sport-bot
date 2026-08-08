@@ -34,7 +34,6 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]
 YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
 YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
-API_SPORTS_KEY = os.environ.get("API_SPORTS_KEY", "")   # ключ с api-sports.io, для футбола и хоккея
 
 BOT_NAME = "мяч"    # обращение к боту без команды, например "Мяч, когда тренировка?"
 MAX_HISTORY_MESSAGES = 10   # сколько последних сообщений помнить (5 пар вопрос-ответ)
@@ -61,28 +60,58 @@ def update_history(chat_id: int, user_id: int, question: str, answer: str) -> No
 
 ANCHOR_FILE = "/data/poll_schedule_anchor.txt"   # тут хранится точка отсчёта расписания опроса — не удалять
 
-FOOTBALL_HOCKEY_KEYWORDS = [
-    "футбол", "хоккей", "рпл", "кхл", "нхл", "апл", "лч", "премьер-лига", "урал", "автомобилист",
-]
-FUTSAL_KEYWORDS = ["футзал", "мфк виз", "суперлига"]
-FUTSAL_SITES = "site:superliga.rfs.ru OR site:mfkviz.ru"
-OTHER_SPORTS_SITES = "site:sportbox.ru OR site:sports.ru OR site:championat.com"
+# --- Категории спортивных вопросов и сайты, по которым искать ------------
+# Порядок проверки важен: НХЛ и футзал проверяются раньше КХЛ и общего спорта,
+# потому что слово «хоккей» встречается и в вопросах про НХЛ.
+
+NHL_KEYWORDS = ["нхл", "nhl"]
+NHL_SITES = "site:nhl.com OR site:nhl.ru OR site:hockey-reference.com"
+
+FUTSAL_KEYWORDS = ["футзал", "мини-футбол", "мфк виз", "виз-синара"]
+FUTSAL_SITES = "site:superliga.rfs.ru OR site:mfkviz.ru OR site:futsal.rfs.ru OR site:uefa.com"
+
+KHL_KEYWORDS = ["кхл", "khl", "автомобилист", "хоккей"]
+KHL_SITES = "site:khl.ru OR site:hc-avto.ru OR site:news.sportbox.ru"
+
+OTHER_SPORTS_SITES = (
+    "site:premierliga.ru OR site:uefa.com OR site:fnl.pro OR site:fc-ural.ru "
+    "OR site:premierleague.com OR site:news.sportbox.ru OR site:championat.com "
+    "OR site:sports.ru OR site:matchtv.ru OR site:sport-express.ru "
+    "OR site:sport24.ru OR site:metaratings.ru OR site:laliga.com "
+    "OR site:bundesliga.com OR site:legaseriea.it"
+)
 SPORTS_KEYWORDS = [
     "матч", "игра", "играет", "команда", "чемпионат", "лига", "соперник",
-    "турнир", "счёт", "баскетбол", "теннис", "спортсмен", "нба", "спорт",
-] + FOOTBALL_HOCKEY_KEYWORDS + FUTSAL_KEYWORDS
+    "турнир", "счёт", "футбол", "баскетбол", "теннис", "спортсмен", "спорт",
+    "рпл", "апл", "лч", "премьер-лига", "урал", "нба",
+] + NHL_KEYWORDS + FUTSAL_KEYWORDS + KHL_KEYWORDS
+
+
+def is_nhl_question(question: str) -> bool:
+    return any(kw in question.lower() for kw in NHL_KEYWORDS)
 
 
 def is_futsal_question(question: str) -> bool:
     return any(kw in question.lower() for kw in FUTSAL_KEYWORDS)
 
 
-def is_football_hockey_question(question: str) -> bool:
-    return any(kw in question.lower() for kw in FOOTBALL_HOCKEY_KEYWORDS)
+def is_khl_question(question: str) -> bool:
+    return any(kw in question.lower() for kw in KHL_KEYWORDS)
 
 
 def is_sports_question(question: str) -> bool:
     return any(kw in question.lower() for kw in SPORTS_KEYWORDS)
+
+
+def sites_for_question(question: str) -> str:
+    """Возвращает набор сайтов, по которым искать этот вопрос."""
+    if is_nhl_question(question):
+        return NHL_SITES
+    if is_futsal_question(question):
+        return FUTSAL_SITES
+    if is_khl_question(question):
+        return KHL_SITES
+    return OTHER_SPORTS_SITES
 
 
 def get_poll_anchor() -> datetime.datetime:
@@ -179,38 +208,6 @@ async def check_ural_game() -> None:
                 print(f"[DEBUG] ближайшая игра Урала не сегодня, а {game_date} — молчу")
     except Exception as e:
         print(f"[DEBUG] ошибка проверки игры Урала: {e}")
-
-
-async def api_sports_next_match(team_name: str, sport: str) -> str:
-    """Ищет команду по названию и её ближайший матч через api-sports.io —
-    структурированные данные, без угадывания текста. sport: 'football' или 'hockey'."""
-    if not API_SPORTS_KEY:
-        print("[DEBUG] API_SPORTS_KEY не задан, пропускаю api-sports.io")
-        return ""
-    base_url = "https://v3.football.api-sports.io" if sport == "football" else "https://v1.hockey.api-sports.io"
-    headers = {"x-apisports-key": API_SPORTS_KEY}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{base_url}/teams", headers=headers, params={"search": team_name}) as resp:
-                data = await resp.json()
-                print(f"[DEBUG] api-sports.io поиск команды {team_name!r}: {str(data)[:300]!r}")
-                teams = data.get("response", [])
-                if not teams:
-                    return ""
-                team_id = teams[0]["team"]["id"]
-            endpoint = "fixtures" if sport == "football" else "games"
-            async with session.get(
-                f"{base_url}/{endpoint}", headers=headers, params={"team": team_id, "next": "1"}
-            ) as resp:
-                data = await resp.json()
-                print(f"[DEBUG] api-sports.io ближайший матч: {str(data)[:500]!r}")
-                matches = data.get("response", [])
-                if not matches:
-                    return ""
-                return f"Данные с api-sports.io (структурированные, точные):\n{json.dumps(matches[0], ensure_ascii=False)}"
-    except Exception as e:
-        print(f"[DEBUG] ошибка api-sports.io: {e}")
-        return ""
 
 
 async def web_search(query: str) -> str:
@@ -371,51 +368,22 @@ async def gigachat_completion(messages: list[dict]) -> str:
             return data["choices"][0]["message"]["content"]
 
 
-async def extract_team_name_english(question: str) -> str:
-    """api-sports.io принимает в поиске только латиницу — вытаскиваем название
-    команды из русского вопроса и переводим отдельным простым вызовом (не через
-    ask_gigachat, чтобы не зациклиться на футбольном/хоккейном вопросе)."""
-    try:
-        answer = await gigachat_completion([{
-            "role": "user",
-            "content": (
-                f"Определи, о какой спортивной команде идёт речь, и ответь "
-                f"СТРОГО её официальным названием на английском языке, без "
-                f"пояснений и лишних слов: {question}"
-            ),
-        }])
-        cleaned = "".join(c for c in answer if c.isalnum() or c.isspace()).strip()
-        print(f"[DEBUG] извлечённое название команды (англ.): {cleaned!r}")
-        return cleaned
-    except Exception as e:
-        print(f"[DEBUG] не удалось определить название команды: {e}")
-        return ""
-
-
 async def ask_gigachat(question: str, history: list[dict], search_query: str | None = None) -> str:
     query = search_query or question
     if search_query is not None:
         search_results = await web_search(query)
-    elif is_football_hockey_question(question):
-        hockey_indicators = ["хокке", "нхл", "кхл"]
-        sport = "hockey" if any(ind in question.lower() for ind in hockey_indicators) else "football"
-        search_results = ""
-        team_name = await extract_team_name_english(question)
-        if team_name:
-            search_results = await api_sports_next_match(team_name, sport)
-        if not search_results:
-            print("[DEBUG] api-sports.io не нашёл команду, использую обычный глубокий поиск")
-            search_results = await web_search_deep(f"{question} {OTHER_SPORTS_SITES}")
-    elif is_futsal_question(question):
-        search_results = await web_search_deep(f"{question} {FUTSAL_SITES}")
     elif is_sports_question(question):
-        search_results = await web_search_deep(f"{question} {OTHER_SPORTS_SITES}")
+        sites = sites_for_question(question)
+        print(f"[DEBUG] спортивный вопрос, ищу по сайтам: {sites}")
+        search_results = await web_search_deep(f"{question} {sites}")
         if not search_results and history:
             prior_user_msgs = [m["content"] for m in history if m["role"] == "user"]
             if prior_user_msgs:
-                enriched_query = f"{prior_user_msgs[-1]} {question} {OTHER_SPORTS_SITES}"
-                print("[DEBUG] обычный поиск ничего не нашёл, пробую с контекстом предыдущего вопроса")
-                search_results = await web_search_deep(enriched_query)
+                print("[DEBUG] поиск ничего не нашёл, пробую с контекстом предыдущего вопроса")
+                search_results = await web_search_deep(f"{prior_user_msgs[-1]} {question} {sites}")
+        if not search_results:
+            print("[DEBUG] по указанным сайтам пусто, пробую обычный поиск без ограничений")
+            search_results = await web_search_deep(question)
     else:
         search_results = await web_search(query)
     system_content = (
