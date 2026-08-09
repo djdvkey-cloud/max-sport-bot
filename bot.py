@@ -33,6 +33,8 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 # Sonnet — баланс качества и цены. Для экономии можно поставить
 # "claude-haiku-4-5-20251001", для сложных задач — "claude-opus-5".
 CLAUDE_MODEL = "claude-sonnet-5"
+# Для шаблонных задач (утренняя проверка матчей) хватает более дешёвой модели
+CLAUDE_MODEL_FAST = "claude-haiku-4-5-20251001"
 
 BOT_NAME = "мяч"            # обращение без команды: «Мяч, когда тренировка?»
 MAX_HISTORY_MESSAGES = 10   # сколько последних сообщений помнить (5 пар вопрос-ответ)
@@ -162,7 +164,8 @@ scheduler = AsyncIOScheduler()
 
 async def ask_claude(question: str, history: list[dict] | None = None,
                      allowed_domains: list[str] | None = None,
-                     system_extra: str = "") -> str:
+                     system_extra: str = "", model: str | None = None,
+                     max_searches: int = 3) -> str:
     """Задаёт вопрос Claude со встроенным веб-поиском.
     allowed_domains ограничивает поиск конкретными сайтами."""
     history = history or []
@@ -182,12 +185,12 @@ async def ask_claude(question: str, history: list[dict] | None = None,
     if system_extra:
         system_text += f"\n{system_extra}"
 
-    search_tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+    search_tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": max_searches}
     if allowed_domains:
         search_tool["allowed_domains"] = allowed_domains
 
     payload = {
-        "model": CLAUDE_MODEL,
+        "model": model or CLAUDE_MODEL,
         "max_tokens": 1500,
         "system": system_text,
         "messages": history + [{"role": "user", "content": question}],
@@ -285,7 +288,8 @@ async def send_training_poll() -> None:
     )
 
 
-# Клубы, по которым бот сам присылает анонс ближайшей игры каждое утро
+# Клубы, по которым бот проверяет расписание каждое утро и напоминает,
+# если матч сегодня
 TRACKED_CLUBS = [
     {
         "name": "МФК «Синара» (Екатеринбург)",
@@ -309,36 +313,60 @@ TRACKED_CLUBS = [
 
 
 async def next_match_for_club(club: dict) -> str:
-    """Возвращает строку с анонсом ближайшей игры клуба или пустую строку."""
+    """Если клуб играет СЕГОДНЯ — возвращает текст напоминания, иначе пустую строку."""
     today = datetime.date.today()
     prompt = (
         f"{club['query']}. Найди БЛИЖАЙШИЙ предстоящий матч, считая от "
-        f"{today.strftime('%d.%m.%Y')} включительно. "
-        f"Ответь СТРОГО в одном из двух видов, без пояснений и лишних слов:\n"
+        f"{today.strftime('%d.%m.%Y')} включительно.\n"
+        f"ПОСЛЕДНЕЙ СТРОКОЙ ответа выдай данные строго в таком виде:\n"
         f"Турнир|ДД.ММ.ГГГГ|ЧЧ:ММ|Место проведения|Соперник\n"
-        f"НЕТ — если данных о предстоящем матче найти не удалось."
+        f"Дата — обязательно одним днём в формате ДД.ММ.ГГГГ. "
+        f"Время НЕ пересчитывай между поясами — бери как в источнике, но "
+        f"обязательно допиши пояс: «19:00 мск» или «19:00 екб». Если пояс в "
+        f"источнике не указан явно, но это российский турнир — пиши «мск». "
+        f"Если время неизвестно — напиши «уточняется», но строку всё равно выдай. "
+        f"Если предстоящего матча нет вовсе (межсезонье, расписание не "
+        f"опубликовано, известен только диапазон дат) — последней строкой напиши НЕТ."
     )
     try:
-        answer = (await ask_claude(prompt, allowed_domains=club["sites"])).strip()
+        answer = (await ask_claude(prompt, allowed_domains=club["sites"],
+                                   model=CLAUDE_MODEL_FAST)).strip()
         print(f"[DEBUG] {club['name']}: {answer!r}")
-        if answer.upper().startswith("НЕТ"):
+        # Claude часто добавляет пояснение перед ответом — берём последнюю
+        # строку с разделителями, а не весь текст целиком
+        data_line = None
+        for line in reversed(answer.splitlines()):
+            if line.count("|") >= 4:
+                data_line = line.strip()
+                break
+        if data_line is None:
+            print(f"[DEBUG] {club['name']}: данных о матче нет, пропускаю")
             return ""
-        parts = [p.strip() for p in answer.split("|")]
-        if len(parts) < 5:
-            print(f"[DEBUG] {club['name']}: неожиданный формат, пропускаю")
-            return ""
+        parts = [p.strip() for p in data_line.split("|")]
         tournament, date_str, time_str, place, rival = parts[:5]
-        return (f"{club['icon']} Предстоящий матч {club['name']} проведёт:\n"
-                f"   {tournament}, {date_str} в {time_str}\n"
-                f"   Место: {place}\n"
-                f"   Соперник: {rival}")
+
+        # Напоминаем только в день матча
+        try:
+            game_date = datetime.datetime.strptime(date_str, "%d.%m.%Y").date()
+        except ValueError:
+            print(f"[DEBUG] {club['name']}: дату {date_str!r} разобрать не смог, пропускаю")
+            return ""
+        if game_date != today:
+            print(f"[DEBUG] {club['name']}: ближайший матч {game_date}, не сегодня — молчу")
+            return ""
+
+        return (f"{club['icon']} Сегодня играет {club['name']}\n"
+                f"Турнир: {tournament}\n"
+                f"Время: {time_str}\n"
+                f"Место: {place}\n"
+                f"Соперник: {rival}")
     except Exception as e:
         print(f"[DEBUG] ошибка при проверке {club['name']}: {e}")
         return ""
 
 
 async def check_clubs_games() -> None:
-    """Каждое утро присылает в чат анонсы ближайших игр отслеживаемых клубов."""
+    """Каждое утро проверяет клубы и пишет в чат только о тех, кто играет сегодня."""
     print("[DEBUG] утренняя проверка матчей клубов")
     blocks = []
     for club in TRACKED_CLUBS:
@@ -346,7 +374,7 @@ async def check_clubs_games() -> None:
         if line:
             blocks.append(line)
     if not blocks:
-        print("[DEBUG] ни по одному клубу данных не нашлось, ничего не отправляю")
+        print("[DEBUG] сегодня никто из клубов не играет, ничего не отправляю")
         return
     text = "\n\n".join(blocks)
     for attempt in range(3):
@@ -613,7 +641,7 @@ async def main():
         misfire_grace_time=1800,
         coalesce=True,
     )
-    print("[DEBUG] анонсы матчей клубов: каждый день в 10:00 по Екатеринбургу")
+    print("[DEBUG] проверка матчей клубов: каждый день в 10:00, напоминание только в день игры")
     scheduler.start()
     print(f"Бот запущен (Claude, {CLAUDE_MODEL}). Для остановки — Ctrl+C")
     await dp.start_polling(bot)
