@@ -1,8 +1,9 @@
 """
-Семейный/футбольный Telegram-бот на Claude API со встроенным веб-поиском.
+Футбольный бот «Мяч» — опросы на тренировку, статистика игр и напоминания
+о матчах трёх клубов.
 
-Claude сам ищет в интернете и читает страницы. Поиск можно ограничить
-конкретными сайтами (allowed_domains) — отдельный поисковый сервис не нужен.
+ИИ используется ТОЛЬКО для утренней проверки матчей (Синара, Урал,
+Автомобилист). Всё остальное — обычный код, без обращений к Claude.
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (в Amvera → «Переменные»):
     BOT_TOKEN         — токен от @BotFather
@@ -23,95 +24,41 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-# Sonnet — баланс качества и цены. Для экономии можно поставить
-# "claude-haiku-4-5-20251001", для сложных задач — "claude-opus-5".
-CLAUDE_MODEL = "claude-sonnet-5"
-# Для шаблонных задач (утренняя проверка матчей) хватает более дешёвой модели
-CLAUDE_MODEL_FAST = "claude-haiku-4-5-20251001"
+# Шаблонная задача — хватает быстрой и дешёвой модели
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
-BOT_NAME = "мяч"            # обращение без команды: «Мяч, когда тренировка?»
-MAX_HISTORY_MESSAGES = 10   # сколько последних сообщений помнить (5 пар вопрос-ответ)
 ALLOWED_CHAT_IDS = {-5579173684}      # где боту разрешено отвечать
 TRAINING_POLL_CHAT_ID = -5579173684   # куда постить опросы и напоминания
 GAME_TIME = "21:30"                   # время тренировки, попадает в текст опроса
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
-STATS_FILE = "/data/stats.json"       # статистика игроков по чатам — не удалять
 
-# Первый опрос — 09.08.2026 в 12:00 по Екатеринбургу, дальше каждые 2 дня.
-# Дата в тексте опроса всегда «завтра» относительно дня публикации:
-# опрос 09.08 → тренировка 10.08, опрос 11.08 → тренировка 12.08 и т.д.
-POLL_START = datetime.datetime(2026, 8, 9, 12, 0, tzinfo=YEKB_TZ)
+STATS_FILE = "/data/stats.json"          # статистика игроков по чатам — не удалять
+LAST_POLL_FILE = "/data/last_poll.txt"   # дата последнего опроса — не удалять
+
+# Опрос про тренировку: отсчёт от 09.08.2026, каждые 2 дня, в 12:00.
+# Дата в тексте опроса — всегда следующий день после публикации.
+POLL_START_DATE = datetime.date(2026, 8, 9)
 POLL_INTERVAL_DAYS = 2
+POLL_HOUR = 12
+CLUBS_CHECK_HOUR = 10   # во сколько проверять матчи клубов
 
-# --- Сайты по видам спорта (для allowed_domains веб-поиска) ---------------
-# Порядок проверки важен: НХЛ раньше КХЛ, т.к. слово «хоккей» есть у обоих.
-
-NHL_KEYWORDS = ["нхл", "nhl"]
-NHL_SITES = ["nhl.com", "nhl.ru", "hockey-reference.com"]
-
-FUTSAL_KEYWORDS = ["футзал", "мини-футбол", "синара", "мфк виз", "виз-синара"]
-FUTSAL_SITES = ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru", "uefa.com"]
-
-KHL_KEYWORDS = ["кхл", "khl", "автомобилист", "хоккей"]
-KHL_SITES = ["khl.ru", "hc-avto.ru", "news.sportbox.ru"]
-
-OTHER_SPORTS_SITES = [
-    "premierliga.ru", "uefa.com", "fnl.pro", "fc-ural.ru", "premierleague.com",
-    "news.sportbox.ru", "championat.com", "sports.ru", "matchtv.ru",
-    "sport-express.ru", "sport24.ru", "metaratings.ru", "laliga.com",
-    "bundesliga.com", "legaseriea.it",
-]
-SPORTS_KEYWORDS = [
-    "матч", "игра", "играет", "команда", "чемпионат", "лига", "соперник",
-    "турнир", "счёт", "футбол", "баскетбол", "теннис", "спортсмен", "спорт",
-    "рпл", "апл", "лч", "премьер-лига", "урал", "нба",
-] + NHL_KEYWORDS + FUTSAL_KEYWORDS + KHL_KEYWORDS
-
-# История разговора отдельно с каждым человеком в каждом чате
-conversation_history: dict[tuple[int, int], list[dict]] = {}
-
-
-def is_sports_question(question: str) -> bool:
-    return any(kw in question.lower() for kw in SPORTS_KEYWORDS)
-
-
-def preferred_sites(question: str) -> list[str]:
-    """Какие сайты разрешить поиску для этого вопроса."""
-    q = question.lower()
-    if any(kw in q for kw in NHL_KEYWORDS):
-        return NHL_SITES
-    if any(kw in q for kw in FUTSAL_KEYWORDS):
-        return FUTSAL_SITES
-    if any(kw in q for kw in KHL_KEYWORDS):
-        return KHL_SITES
-    return OTHER_SPORTS_SITES
-
-
-def get_history(chat_id: int, user_id: int) -> list[dict]:
-    return conversation_history.get((chat_id, user_id), [])
-
-
-def update_history(chat_id: int, user_id: int, question: str, answer: str) -> None:
-    key = (chat_id, user_id)
-    history = conversation_history.get(key, [])
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": answer})
-    conversation_history[key] = history[-MAX_HISTORY_MESSAGES:]
+logging.basicConfig(level=logging.INFO)
+# Короткий таймаут: на хостинге связь с Telegram иногда пропадает
+bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=20))
+dp = Dispatcher()
+scheduler = AsyncIOScheduler()
 
 
 # --- Статистика игроков ---------------------------------------------------
 
 def load_stats() -> dict:
-    """Статистика по чатам:
-    {chat_id: {"players": {игрок: {games, goals, assists}}, "last": [записи]}}
-    "last" — последняя внесённая игра, нужна для /отменить."""
+    """{chat_id: {"players": {игрок: {games, goals, assists}}, "last": [записи]}}"""
     if not os.path.exists(STATS_FILE):
         return {}
     try:
@@ -137,8 +84,8 @@ def save_stats(stats: dict) -> None:
 
 
 def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
-    """Разбирает «Иванов 2+1, Соломин, Петров 0+3» → [(имя, голы, передачи), ...].
-    Фамилия без цифр считается как 0+0. Вторым значением — неразобранные куски."""
+    """«Иванов 2+1, Соломин, Петров 0+3» → [(имя, голы, передачи), ...].
+    Фамилия без цифр считается как 0+0."""
     players, errors = [], []
     for chunk in text.split(","):
         chunk = chunk.strip()
@@ -155,45 +102,25 @@ def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
     return players, errors
 
 
-# Короткий таймаут: на хостинге связь с Telegram иногда пропадает, и ждать
-# ответа по минуте бессмысленно — лучше быстро упасть и повторить попытку.
-bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=20))
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
+# --- Обращение к Claude (только для проверки матчей) ----------------------
 
-
-async def ask_claude(question: str, history: list[dict] | None = None,
-                     allowed_domains: list[str] | None = None,
-                     system_extra: str = "", model: str | None = None,
-                     max_searches: int = 3) -> str:
-    """Задаёт вопрос Claude со встроенным веб-поиском.
-    allowed_domains ограничивает поиск конкретными сайтами."""
-    history = history or []
+async def ask_claude(question: str, allowed_domains: list[str] | None = None) -> str:
+    """Вопрос к Claude со встроенным веб-поиском по указанным сайтам."""
     today = datetime.date.today().strftime("%d.%m.%Y")
     system_text = (
-        f"Сегодня {today}. Ты — помощник в семейном чате, отвечай по-русски, "
-        f"кратко и по делу.\n"
-        f"Для вопросов о расписаниях, результатах и текущих событиях обязательно "
-        f"ищи в интернете, а не полагайся на свои знания — они устаревают.\n"
-        f"Не пересчитывай время между часовыми поясами: указывай его так, как "
-        f"в источнике, и уточняй, какой это пояс.\n"
-        f"Если вопрос подразумевает список (например, все матчи за день) — "
-        f"перечисли все подходящие пункты, а не только первый.\n"
-        f"Не используй markdown-разметку со звёздочками — в Telegram она "
-        f"отображается как есть."
+        f"Сегодня {today}. Отвечай по-русски, строго в запрошенном формате, "
+        f"без пояснений и markdown-разметки.\n"
+        f"Время не пересчитывай между часовыми поясами — бери как в источнике."
     )
-    if system_extra:
-        system_text += f"\n{system_extra}"
-
-    search_tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": max_searches}
+    search_tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
     if allowed_domains:
         search_tool["allowed_domains"] = allowed_domains
 
     payload = {
-        "model": model or CLAUDE_MODEL,
-        "max_tokens": 1500,
+        "model": CLAUDE_MODEL,
+        "max_tokens": 800,
         "system": system_text,
-        "messages": history + [{"role": "user", "content": question}],
+        "messages": [{"role": "user", "content": question}],
         "tools": [search_tool],
     }
     async with aiohttp.ClientSession() as session:
@@ -209,92 +136,113 @@ async def ask_claude(question: str, history: list[dict] | None = None,
         ) as resp:
             raw = await resp.text()
             if resp.status != 200:
-                print(f"[DEBUG] Claude статус={resp.status}, тело={raw[:500]!r}")
-                raise RuntimeError(f"Claude вернул статус {resp.status}: {raw[:200]}")
+                print(f"[DEBUG] Claude статус={resp.status}, тело={raw[:400]!r}")
+                raise RuntimeError(f"Claude вернул статус {resp.status}")
             data = json.loads(raw)
 
-    # Ответ состоит из блоков: текст, запросы поиска, результаты поиска
     queries = [b.get("input", {}).get("query") for b in data.get("content", [])
                if b.get("type") == "server_tool_use"]
     print(f"[DEBUG] Claude искал: {queries}")
     answer = "".join(b.get("text", "") for b in data.get("content", [])
                      if b.get("type") == "text").strip()
     if not answer:
-        raise RuntimeError(f"Claude вернул пустой ответ: {raw[:300]}")
+        raise RuntimeError("Claude вернул пустой ответ")
     return answer
 
 
-async def answer_with_retry(message: types.Message, text: str, attempts: int = 3, delay: int = 5):
-    """Отправка с повторными попытками — связь с Telegram иногда кратковременно пропадает."""
-    last_error = None
+async def send_with_retry(chat_id: int, text: str, attempts: int = 3, delay: int = 5) -> bool:
+    """Отправка с повторами — связь с Telegram иногда кратковременно пропадает."""
     for attempt in range(attempts):
         try:
-            return await message.answer(text)
+            await bot.send_message(chat_id, text)
+            return True
         except Exception as e:
-            last_error = e
-            print(f"[DEBUG] попытка {attempt + 1} отправить сообщение не удалась: {e}")
+            print(f"[DEBUG] попытка {attempt + 1} отправить не удалась: {e}")
             if attempt < attempts - 1:
                 await asyncio.sleep(delay)
-    raise last_error
+    return False
 
 
-async def handle_question(message: types.Message, question: str) -> None:
-    """Общая логика для /ии и обращения по имени."""
-    # «Думаю...» — приятный, но не обязательный шаг. Если Telegram сейчас
-    # недоступен (на хостинге бывает), не блокируемся на нём, а работаем дальше.
+# --- Опрос про тренировку -------------------------------------------------
+
+def is_poll_day(day: datetime.date) -> bool:
+    """День опроса: через каждые POLL_INTERVAL_DAYS от точки отсчёта."""
+    if day < POLL_START_DATE:
+        return False
+    return (day - POLL_START_DATE).days % POLL_INTERVAL_DAYS == 0
+
+
+def last_poll_date() -> datetime.date | None:
+    if not os.path.exists(LAST_POLL_FILE):
+        return None
     try:
-        thinking_msg = await asyncio.wait_for(message.answer("Думаю..."), timeout=15)
-    except Exception as e:
-        print(f"[DEBUG] не удалось отправить «Думаю...», продолжаю без него: {e}")
-        thinking_msg = None
-
-    history = get_history(message.chat.id, message.from_user.id)
-    domains = None
-    if is_sports_question(question):
-        domains = preferred_sites(question)
-        print(f"[DEBUG] спортивный вопрос, поиск ограничен: {domains}")
-    try:
-        answer = await ask_claude(question, history, allowed_domains=domains)
-        update_history(message.chat.id, message.from_user.id, question, answer)
-    except Exception as e:
-        print(f"[DEBUG] ошибка запроса к Claude: {e}")
-        answer = "Не получилось получить ответ, попробуйте ещё раз чуть позже."
-    try:
-        if thinking_msg is not None:
-            await thinking_msg.edit_text(answer)
-        else:
-            await answer_with_retry(message, answer)
-    except Exception as e:
-        print(f"[DEBUG] не удалось отредактировать сообщение, шлю новым: {e}")
-        await answer_with_retry(message, answer)
+        with open(LAST_POLL_FILE, "r") as f:
+            return datetime.date.fromisoformat(f.read().strip())
+    except Exception:
+        return None
 
 
-# --- Плановые задачи ------------------------------------------------------
+def remember_poll_date(day: datetime.date) -> None:
+    os.makedirs(os.path.dirname(LAST_POLL_FILE), exist_ok=True)
+    with open(LAST_POLL_FILE, "w") as f:
+        f.write(day.isoformat())
 
-async def send_reminder(chat_id: int, text: str) -> None:
-    print(f"[DEBUG] отправляю напоминание в чат {chat_id}: {text!r}")
-    await bot.send_message(chat_id, f"⏰ Напоминание: {text}")
 
-
-async def send_training_poll() -> None:
-    tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+async def send_training_poll(today: datetime.date | None = None) -> None:
+    today = today or datetime.datetime.now(YEKB_TZ).date()
+    tomorrow = today + datetime.timedelta(days=1)
     question = f"Футбол Лестех. {tomorrow.strftime('%d.%m.%y')} в {GAME_TIME.replace(':', '-')}."
-    print(f"[DEBUG] отправляю автоматический опрос: {question!r}")
-    await bot.send_poll(
-        chat_id=TRAINING_POLL_CHAT_ID,
-        question=question,
-        options=["Иду", "Не иду"],
-        is_anonymous=False,
-    )
+    print(f"[DEBUG] отправляю опрос: {question!r}")
+    try:
+        await bot.send_poll(
+            chat_id=TRAINING_POLL_CHAT_ID,
+            question=question,
+            options=["Иду", "Не иду"],
+            is_anonymous=False,
+        )
+        remember_poll_date(today)
+    except Exception as e:
+        print(f"[DEBUG] не удалось отправить опрос: {e}")
 
 
-# Клубы, по которым бот проверяет расписание каждое утро и напоминает,
-# если матч сегодня
+async def poll_job() -> None:
+    """Ежедневная проверка в 12:00: сегодня день опроса — и он ещё не был?"""
+    today = datetime.datetime.now(YEKB_TZ).date()
+    if not is_poll_day(today):
+        print(f"[DEBUG] {today} — не день опроса, пропускаю")
+        return
+    if last_poll_date() == today:
+        print(f"[DEBUG] опрос за {today} уже отправлен")
+        return
+    await send_training_poll(today)
+
+
+async def catch_up_poll() -> None:
+    """При запуске: если день опроса уже наступил, время прошло, а опроса
+    не было (например, бот перезапускался в полдень) — отправить сейчас."""
+    now = datetime.datetime.now(YEKB_TZ)
+    today = now.date()
+    if is_poll_day(today) and now.hour >= POLL_HOUR and last_poll_date() != today:
+        print("[DEBUG] опрос за сегодня пропущен — отправляю с опозданием")
+        await send_training_poll(today)
+
+
+def next_poll_date(from_day: datetime.date) -> datetime.date:
+    day = from_day
+    for _ in range(POLL_INTERVAL_DAYS + 1):
+        if is_poll_day(day) and day >= from_day:
+            return day
+        day += datetime.timedelta(days=1)
+    return day
+
+
+# --- Матчи клубов ---------------------------------------------------------
+
 TRACKED_CLUBS = [
     {
         "name": "МФК «Синара» (Екатеринбург)",
         "query": "ближайший матч МФК Синара Екатеринбург: турнир, дата, время, место, соперник",
-        "sites": FUTSAL_SITES,
+        "sites": ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru", "uefa.com"],
         "icon": "🥅",
     },
     {
@@ -306,14 +254,14 @@ TRACKED_CLUBS = [
     {
         "name": "ХК «Автомобилист» (Екатеринбург)",
         "query": "ближайший матч ХК Автомобилист Екатеринбург: турнир, дата, время, место, соперник",
-        "sites": KHL_SITES,
+        "sites": ["khl.ru", "hc-avto.ru", "news.sportbox.ru"],
         "icon": "🏒",
     },
 ]
 
 
 async def next_match_for_club(club: dict) -> str:
-    """Если клуб играет СЕГОДНЯ — возвращает текст напоминания, иначе пустую строку."""
+    """Если клуб играет СЕГОДНЯ — текст напоминания, иначе пустая строка."""
     today = datetime.date.today()
     prompt = (
         f"{club['query']}. Найди БЛИЖАЙШИЙ предстоящий матч, считая от "
@@ -329,11 +277,9 @@ async def next_match_for_club(club: dict) -> str:
         f"опубликовано, известен только диапазон дат) — последней строкой напиши НЕТ."
     )
     try:
-        answer = (await ask_claude(prompt, allowed_domains=club["sites"],
-                                   model=CLAUDE_MODEL_FAST)).strip()
+        answer = (await ask_claude(prompt, allowed_domains=club["sites"])).strip()
         print(f"[DEBUG] {club['name']}: {answer!r}")
-        # Claude часто добавляет пояснение перед ответом — берём последнюю
-        # строку с разделителями, а не весь текст целиком
+        # Claude часто добавляет пояснение — берём последнюю строку с разделителями
         data_line = None
         for line in reversed(answer.splitlines()):
             if line.count("|") >= 4:
@@ -345,11 +291,10 @@ async def next_match_for_club(club: dict) -> str:
         parts = [p.strip() for p in data_line.split("|")]
         tournament, date_str, time_str, place, rival = parts[:5]
 
-        # Напоминаем только в день матча
         try:
             game_date = datetime.datetime.strptime(date_str, "%d.%m.%Y").date()
         except ValueError:
-            print(f"[DEBUG] {club['name']}: дату {date_str!r} разобрать не смог, пропускаю")
+            print(f"[DEBUG] {club['name']}: дату {date_str!r} разобрать не смог")
             return ""
         if game_date != today:
             print(f"[DEBUG] {club['name']}: ближайший матч {game_date}, не сегодня — молчу")
@@ -366,7 +311,7 @@ async def next_match_for_club(club: dict) -> str:
 
 
 async def check_clubs_games() -> None:
-    """Каждое утро проверяет клубы и пишет в чат только о тех, кто играет сегодня."""
+    """Каждое утро проверяет клубы и пишет только о тех, кто играет сегодня."""
     print("[DEBUG] утренняя проверка матчей клубов")
     blocks = []
     for club in TRACKED_CLUBS:
@@ -376,15 +321,12 @@ async def check_clubs_games() -> None:
     if not blocks:
         print("[DEBUG] сегодня никто из клубов не играет, ничего не отправляю")
         return
-    text = "\n\n".join(blocks)
-    for attempt in range(3):
-        try:
-            await bot.send_message(TRAINING_POLL_CHAT_ID, text)
-            break
-        except Exception as e:
-            print(f"[DEBUG] попытка {attempt + 1} отправить анонсы не удалась: {e}")
-            if attempt < 2:
-                await asyncio.sleep(5)
+    await send_with_retry(TRAINING_POLL_CHAT_ID, "\n\n".join(blocks))
+
+
+async def send_reminder(chat_id: int, text: str) -> None:
+    print(f"[DEBUG] отправляю напоминание в чат {chat_id}: {text!r}")
+    await bot.send_message(chat_id, f"⏰ Напоминание: {text}")
 
 
 # --- Команды --------------------------------------------------------------
@@ -402,21 +344,20 @@ async def cmd_start(message: types.Message):
 async def cmd_help(message: types.Message):
     print("[DEBUG] сработал /help")
     await message.answer(
-        "Доступные команды:\n"
-        "/start — приветствие\n"
-        "/help — это сообщение\n"
-        "/id — узнать ID этого чата\n"
-        "/ии вопрос — спросить что-нибудь\n"
+        "Что умею:\n"
         "/опрос — создать опрос «Кто идёт на тренировку?»\n"
         "/напомнить ДД.ММ ЧЧ:ММ текст — запланировать напоминание\n"
-        "/забыть — начать разговор заново\n"
-        "\nСтатистика игр:\n"
+        "/id — узнать ID этого чата\n\n"
+        "Статистика игр:\n"
         "/матч Иванов 2+1, Петров 0+3, Соломин — записать результаты игры\n"
         "/статистика — таблица игроков\n"
         "/отменить — убрать последнюю записанную игру\n"
         "/переименовать Старое = Новое — переименовать игрока\n"
-        "/обнулить да — стереть всю статистику чата\n"
-        "\nИли просто начните сообщение с «Мяч» — например: «Мяч, когда тренировка?»"
+        "/обнулить да — стереть всю статистику чата\n\n"
+        "Сам присылаю:\n"
+        f"• опрос на тренировку в {POLL_HOUR}:00, каждые {POLL_INTERVAL_DAYS} дня\n"
+        f"• в {CLUBS_CHECK_HOUR}:00 — напоминание, если сегодня играют "
+        f"Синара, Урал или Автомобилист"
     )
 
 
@@ -424,22 +365,6 @@ async def cmd_help(message: types.Message):
 async def cmd_id(message: types.Message):
     print("[DEBUG] сработал /id")
     await message.answer(f"ID этого чата: {message.chat.id}")
-
-
-@dp.message(Command("ии"), F.chat.id.in_(ALLOWED_CHAT_IDS))
-async def cmd_ai(message: types.Message, command: CommandObject):
-    print(f"[DEBUG] сработал /ии, вопрос: {command.args!r}")
-    if not command.args:
-        await message.answer("Напишите вопрос после команды, например:\n/ии когда играет Урал")
-        return
-    await handle_question(message, command.args)
-
-
-@dp.message(Command("забыть"), F.chat.id.in_(ALLOWED_CHAT_IDS))
-async def cmd_forget(message: types.Message):
-    print("[DEBUG] сработал /забыть")
-    conversation_history.pop((message.chat.id, message.from_user.id), None)
-    await message.answer("Хорошо, забыл, о чём мы говорили. Начинаем с чистого листа.")
 
 
 @dp.message(Command("опрос"), F.chat.id.in_(ALLOWED_CHAT_IDS))
@@ -608,42 +533,32 @@ async def cmd_reset_stats(message: types.Message, command: CommandObject):
     await message.answer("Статистика чата очищена.")
 
 
-@dp.message()
-async def catch_all(message: types.Message):
-    text = message.text or ""
-    if not text.lower().startswith(BOT_NAME):
-        print(f"[DEBUG] пришло сообщение, ни одна команда не подошла: {message.text!r}")
-        return
-    if message.chat.id not in ALLOWED_CHAT_IDS:
-        print(f"[DEBUG] обращение из неразрешённого чата {message.chat.id}, игнорирую")
-        return
-    question = text[len(BOT_NAME):].lstrip(" ,:!?—-")
-    print(f"[DEBUG] обращение по имени '{BOT_NAME}', вопрос: {question!r}")
-    if not question:
-        await message.answer("Да? Спросите что-нибудь после имени.")
-        return
-    await handle_question(message, question)
-
-
 async def main():
-    logging.basicConfig(level=logging.INFO)
     scheduler.add_job(
-        send_training_poll,
-        IntervalTrigger(days=POLL_INTERVAL_DAYS, start_date=POLL_START, timezone=YEKB_TZ),
-        misfire_grace_time=1800,   # если бот был недоступен больше 30 минут — пропустить
-        coalesce=True,             # не слать несколько опросов подряд за пропущенные дни
-    )
-    print(f"[DEBUG] опрос про тренировку: старт {POLL_START:%d.%m.%Y %H:%M}, "
-          f"каждые {POLL_INTERVAL_DAYS} дня")
-    scheduler.add_job(
-        check_clubs_games,
-        CronTrigger(hour=10, minute=0, timezone=YEKB_TZ),
-        misfire_grace_time=1800,
+        poll_job,
+        CronTrigger(hour=POLL_HOUR, minute=0, timezone=YEKB_TZ),
+        misfire_grace_time=3600,
         coalesce=True,
     )
-    print("[DEBUG] проверка матчей клубов: каждый день в 10:00, напоминание только в день игры")
+    scheduler.add_job(
+        check_clubs_games,
+        CronTrigger(hour=CLUBS_CHECK_HOUR, minute=0, timezone=YEKB_TZ),
+        misfire_grace_time=3600,
+        coalesce=True,
+    )
     scheduler.start()
-    print(f"Бот запущен (Claude, {CLAUDE_MODEL}). Для остановки — Ctrl+C")
+
+    now = datetime.datetime.now(YEKB_TZ)
+    today = now.date()
+    print(f"[DEBUG] сейчас по Екатеринбургу: {now:%d.%m.%Y %H:%M}")
+    print(f"[DEBUG] сегодня день опроса: {is_poll_day(today)}, "
+          f"последний опрос: {last_poll_date()}")
+    print(f"[DEBUG] ближайший опрос: {next_poll_date(today):%d.%m.%Y} в {POLL_HOUR}:00")
+    print(f"[DEBUG] проверка матчей клубов: каждый день в {CLUBS_CHECK_HOUR}:00")
+
+    await catch_up_poll()
+
+    print("Бот запущен («Мяч»). Для остановки — Ctrl+C")
     await dp.start_polling(bot)
 
 
