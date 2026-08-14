@@ -33,6 +33,10 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 # Шаблонная задача — хватает быстрой и дешёвой модели
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
+# Кто может отдавать команды. 0 — ограничение выключено (как было раньше).
+# Свой id узнаете командой /id — впишите сюда и перезапустите бота.
+OWNER_TELEGRAM_ID = 0
+
 ALLOWED_CHAT_IDS = {-5579173684}      # где боту разрешено отвечать
 TRAINING_POLL_CHAT_ID = -5579173684   # куда постить опросы и напоминания
 GAME_TIME = "21:30"                   # время тренировки, попадает в текст опроса
@@ -53,6 +57,26 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=20))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
+
+
+@dp.message.outer_middleware()
+async def only_owner(handler, event, data):
+    """Пропускает команды только от владельца. Пока OWNER_TELEGRAM_ID = 0
+    проверка выключена — чтобы вы успели узнать свой id командой /id."""
+    if not OWNER_TELEGRAM_ID:
+        return await handler(event, data)
+    user = getattr(event, "from_user", None)
+    if user and user.id == OWNER_TELEGRAM_ID:
+        return await handler(event, data)
+
+    # Исключение: таблицу статистики может посмотреть любой в футбольном чате
+    text = (getattr(event, "text", "") or "").strip().lower()
+    chat = getattr(event, "chat", None)
+    if text.startswith("/статистика") and chat and chat.id in ALLOWED_CHAT_IDS:
+        return await handler(event, data)
+
+    print(f"[DEBUG] команда не от владельца (id {user.id if user else '?'}), игнорирую")
+    return None
 
 
 # --- Статистика игроков ---------------------------------------------------
@@ -364,7 +388,12 @@ async def cmd_help(message: types.Message):
 @dp.message(Command("id"))
 async def cmd_id(message: types.Message):
     print("[DEBUG] сработал /id")
-    await message.answer(f"ID этого чата: {message.chat.id}")
+    await message.answer(
+        f"ID этого чата: {message.chat.id}\n"
+        f"Ваш ID: {message.from_user.id}\n\n"
+        f"Чтобы бот слушался только вас — впишите ваш ID в строку "
+        f"OWNER_TELEGRAM_ID в начале файла."
+    )
 
 
 @dp.message(Command("опрос"), F.chat.id.in_(ALLOWED_CHAT_IDS))
