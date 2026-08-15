@@ -35,9 +35,9 @@ CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 # Кто может отдавать команды. 0 — ограничение выключено (как было раньше).
 # Свой id узнаете командой /id — впишите сюда и перезапустите бота.
-OWNER_TELEGRAM_ID = 8378612979
+OWNER_TELEGRAM_ID = 0
 
-ALLOWED_CHAT_IDS = {-5579173684,8378612979}      # где боту разрешено отвечать
+ALLOWED_CHAT_IDS = {-5579173684}      # где боту разрешено отвечать
 TRAINING_POLL_CHAT_ID = -5579173684   # куда постить опросы и напоминания
 GAME_TIME = "21:30"                   # время тренировки, попадает в текст опроса
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
@@ -99,6 +99,15 @@ def load_stats() -> dict:
 
 def chat_stats_of(stats: dict, chat_id: int) -> dict:
     return stats.setdefault(str(chat_id), {"players": {}, "last": []})
+
+
+def target_stats_chat_id(message: types.Message) -> int:
+    """Куда писать статистику для этой команды. Если команда пришла в личку
+    (владельцу — в общий чат её и так не пускает only_owner), результат всё
+    равно уходит в футбольный чат, а не заводит отдельную личную статистику."""
+    if message.chat.id in ALLOWED_CHAT_IDS:
+        return message.chat.id
+    return next(iter(ALLOWED_CHAT_IDS))
 
 
 def save_stats(stats: dict) -> None:
@@ -430,7 +439,7 @@ async def cmd_remind(message: types.Message, command: CommandObject):
     await message.answer(f"Хорошо, напомню {remind_dt.strftime('%d.%m в %H:%M')}: «{text}»")
 
 
-@dp.message(Command("матч"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+@dp.message(Command("матч"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
 async def cmd_match(message: types.Message, command: CommandObject):
     print(f"[DEBUG] сработал /матч, аргументы: {command.args!r}")
     usage = ("Формат: /матч Фамилия голы+передачи, Фамилия голы+передачи\n"
@@ -445,8 +454,9 @@ async def cmd_match(message: types.Message, command: CommandObject):
         await message.answer(f"Не понял ни одного игрока.\n{usage}")
         return
 
+    from_private = message.chat.id not in ALLOWED_CHAT_IDS
     stats = load_stats()
-    chat = chat_stats_of(stats, message.chat.id)
+    chat = chat_stats_of(stats, target_stats_chat_id(message))
     for name, goals, assists in players:
         rec = chat["players"].setdefault(name, {"games": 0, "goals": 0, "assists": 0})
         rec["games"] += 1
@@ -460,6 +470,8 @@ async def cmd_match(message: types.Message, command: CommandObject):
         lines.append(f"• {name}: {goals}+{assists}")
     if errors:
         lines.append(f"\nНе разобрал: {', '.join(errors)}")
+    if from_private:
+        lines.append("\n(ушло в общую статистику футбольного чата)")
     lines.append("\n/статистика — таблица, /отменить — убрать эту запись")
     await message.answer("\n".join(lines))
 
@@ -490,11 +502,11 @@ async def cmd_stats(message: types.Message):
     await message.answer("\n".join(lines))
 
 
-@dp.message(Command("отменить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+@dp.message(Command("отменить"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
 async def cmd_undo(message: types.Message):
     print("[DEBUG] сработал /отменить")
     stats = load_stats()
-    chat = chat_stats_of(stats, message.chat.id)
+    chat = chat_stats_of(stats, target_stats_chat_id(message))
     last = chat.get("last") or []
     if not last:
         await message.answer("Нечего отменять — последняя игра уже отменена или её ещё не было.")
@@ -514,7 +526,7 @@ async def cmd_undo(message: types.Message):
     await message.answer(f"Последняя игра отменена. Затронуты: {names}")
 
 
-@dp.message(Command("переименовать"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+@dp.message(Command("переименовать"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
 async def cmd_rename(message: types.Message, command: CommandObject):
     print(f"[DEBUG] сработал /переименовать, аргументы: {command.args!r}")
     usage = ("Формат: /переименовать Старое имя = Новое имя\n"
@@ -529,7 +541,7 @@ async def cmd_rename(message: types.Message, command: CommandObject):
         return
 
     stats = load_stats()
-    chat = chat_stats_of(stats, message.chat.id)
+    chat = chat_stats_of(stats, target_stats_chat_id(message))
     rec = chat["players"].pop(old_name, None)
     if rec is None:
         have = ", ".join(chat["players"].keys()) or "пока никого"
@@ -547,19 +559,19 @@ async def cmd_rename(message: types.Message, command: CommandObject):
     await message.answer(f"«{old_name}» теперь «{new_name}».{tail}")
 
 
-@dp.message(Command("обнулить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+@dp.message(Command("обнулить"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
 async def cmd_reset_stats(message: types.Message, command: CommandObject):
     print(f"[DEBUG] сработал /обнулить, аргументы: {command.args!r}")
     if (command.args or "").strip().lower() != "да":
         await message.answer(
-            "Это сотрёт всю статистику чата без возможности восстановить.\n"
+            "Это сотрёт всю статистику футбольного чата без возможности восстановить.\n"
             "Если уверены — отправьте: /обнулить да"
         )
         return
     stats = load_stats()
-    stats.pop(str(message.chat.id), None)
+    stats.pop(str(target_stats_chat_id(message)), None)
     save_stats(stats)
-    await message.answer("Статистика чата очищена.")
+    await message.answer("Статистика футбольного чата очищена.")
 
 
 async def main():
