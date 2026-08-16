@@ -88,23 +88,24 @@ def load_stats() -> dict:
     try:
         with open(STATS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        for chat_key, chat_data in list(data.items()):   # совместимость со старым форматом
+            if isinstance(chat_data, dict) and "players" not in chat_data:
+                data[chat_key] = {"players": chat_data, "last": []}
+        return data
     except Exception as e:
         print(f"[DEBUG] не удалось прочитать статистику: {e}")
         return {}
-    for chat_key, chat_data in list(data.items()):   # совместимость со старым форматом
-        if "players" not in chat_data:
-            data[chat_key] = {"players": chat_data, "last": []}
-    return data
 
 
 def chat_stats_of(stats: dict, chat_id: int) -> dict:
     return stats.setdefault(str(chat_id), {"players": {}, "last": []})
 
 
-def target_stats_chat_id(message: types.Message) -> int:
-    """Куда писать статистику для этой команды. Если команда пришла в личку
-    (владельцу — в общий чат её и так не пускает only_owner), результат всё
-    равно уходит в футбольный чат, а не заводит отдельную личную статистику."""
+def target_group_chat_id(message: types.Message) -> int:
+    """К какому чату относить эту команду. Если она пришла в личку (владельцу —
+    посторонних туда и так не пускает only_owner), результат всё равно
+    футбольный чат: статистика, опрос и т. п. общие независимо от того,
+    откуда именно их вызвали."""
     if message.chat.id in ALLOWED_CHAT_IDS:
         return message.chat.id
     return next(iter(ALLOWED_CHAT_IDS))
@@ -405,17 +406,21 @@ async def cmd_id(message: types.Message):
     )
 
 
-@dp.message(Command("опрос"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+@dp.message(Command("опрос"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
 async def cmd_poll(message: types.Message):
     print("[DEBUG] сработал /опрос")
-    await message.answer_poll(
+    target = target_group_chat_id(message)
+    await bot.send_poll(
+        chat_id=target,
         question="Кто идёт на тренировку?",
         options=["Иду", "Не иду", "Пока не знаю"],
         is_anonymous=False,
     )
+    if target != message.chat.id:
+        await message.answer("Опрос опубликован в футбольном чате.")
 
 
-@dp.message(Command("напомнить"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+@dp.message(Command("напомнить"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
 async def cmd_remind(message: types.Message, command: CommandObject):
     print(f"[DEBUG] сработал /напомнить, аргументы: {command.args!r}")
     usage = "Формат: /напомнить ДД.ММ ЧЧ:ММ текст\nНапример: /напомнить 15.08 19:00 Игра с Соколом"
@@ -456,7 +461,7 @@ async def cmd_match(message: types.Message, command: CommandObject):
 
     from_private = message.chat.id not in ALLOWED_CHAT_IDS
     stats = load_stats()
-    chat = chat_stats_of(stats, target_stats_chat_id(message))
+    chat = chat_stats_of(stats, target_group_chat_id(message))
     for name, goals, assists in players:
         rec = chat["players"].setdefault(name, {"games": 0, "goals": 0, "assists": 0})
         rec["games"] += 1
@@ -476,10 +481,10 @@ async def cmd_match(message: types.Message, command: CommandObject):
     await message.answer("\n".join(lines))
 
 
-@dp.message(Command("статистика"), F.chat.id.in_(ALLOWED_CHAT_IDS))
+@dp.message(Command("статистика"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
 async def cmd_stats(message: types.Message):
     print("[DEBUG] сработал /статистика")
-    chat_stats = load_stats().get(str(message.chat.id), {}).get("players", {})
+    chat_stats = load_stats().get(str(target_group_chat_id(message)), {}).get("players", {})
     if not chat_stats:
         await message.answer(
             "Статистики пока нет. Добавьте первую игру:\n"
@@ -506,7 +511,7 @@ async def cmd_stats(message: types.Message):
 async def cmd_undo(message: types.Message):
     print("[DEBUG] сработал /отменить")
     stats = load_stats()
-    chat = chat_stats_of(stats, target_stats_chat_id(message))
+    chat = chat_stats_of(stats, target_group_chat_id(message))
     last = chat.get("last") or []
     if not last:
         await message.answer("Нечего отменять — последняя игра уже отменена или её ещё не было.")
@@ -541,7 +546,7 @@ async def cmd_rename(message: types.Message, command: CommandObject):
         return
 
     stats = load_stats()
-    chat = chat_stats_of(stats, target_stats_chat_id(message))
+    chat = chat_stats_of(stats, target_group_chat_id(message))
     rec = chat["players"].pop(old_name, None)
     if rec is None:
         have = ", ".join(chat["players"].keys()) or "пока никого"
@@ -569,7 +574,7 @@ async def cmd_reset_stats(message: types.Message, command: CommandObject):
         )
         return
     stats = load_stats()
-    stats.pop(str(target_stats_chat_id(message)), None)
+    stats.pop(str(target_group_chat_id(message)), None)
     save_stats(stats)
     await message.answer("Статистика футбольного чата очищена.")
 
