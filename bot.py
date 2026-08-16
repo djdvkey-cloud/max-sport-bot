@@ -32,7 +32,7 @@ from aiogram.filters import Command, CommandObject
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # Flash — быстрая и бесплатная модель с включённым веб-поиском
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 # Кто может отдавать команды. 0 — ограничение выключено (как было раньше).
 # Свой id узнаете командой /id — впишите сюда и перезапустите бота.
