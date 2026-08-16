@@ -2,27 +2,32 @@
 Футбольный бот «Мяч» — опросы на тренировку, статистика игр, составы команд
 и напоминания о матчах трёх клубов.
 
-ИИ — Gemini (Google), бесплатный API со встроенным веб-поиском (5000
-поисковых запросов в месяц бесплатно на моделях линейки Flash — этого с
-большим запасом хватает и на утреннюю проверку матчей, и на вопросы в чате).
+ИИ — связка Yandex Search + GigaChat: поиск и модель отдельными вызовами,
+оба сервиса российские, работают без карты и без ограничений по региону.
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (в Amvera → «Переменные»):
-    BOT_TOKEN      — токен от @BotFather
-    GEMINI_API_KEY — ключ с aistudio.google.com (бесплатно, без карты)
+    BOT_TOKEN         — токен от @BotFather
+    GIGACHAT_AUTH_KEY  — ключ авторизации с developers.sber.ru (GigaChat API)
+    YANDEX_API_KEY     — API-ключ Yandex Cloud (Search API)
+    YANDEX_FOLDER_ID   — Folder ID каталога в Yandex Cloud
 
 ЗАПУСК:
     python bot.py
 """
 
 import asyncio
+import base64
 import datetime
 import json
 import logging
 import os
 import re
+import uuid
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from aiogram import Bot, Dispatcher, F, types
@@ -30,9 +35,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-# Flash — быстрая и бесплатная модель с включённым веб-поиском
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]
+YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
+YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
 
 # Кто может отдавать команды. 0 — ограничение выключено (как было раньше).
 # Свой id узнаете командой /id — впишите сюда и перезапустите бота.
@@ -138,46 +143,126 @@ def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
     return players, errors
 
 
-# --- Обращение к Gemini (проверка матчей и команда /ии) --------------------
+# --- Поиск (Yandex Search) и обращение к GigaChat --------------------------
 
-async def ask_gemini(question: str, site_hint: str | None = None) -> str:
-    """Вопрос к Gemini со встроенным веб-поиском (Google Search grounding —
-    поиск и модель работают внутри одного вызова, отдельный поисковик не нужен)."""
+async def yandex_search_urls(query: str) -> list[str]:
+    """Ищет через Yandex Search API, возвращает список ссылок."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://searchapi.api.cloud.yandex.net/v2/web/search",
+            headers={"Authorization": f"Api-Key {YANDEX_API_KEY}"},
+            json={
+                "query": {"searchType": "SEARCH_TYPE_RU", "queryText": query},
+                "folderId": YANDEX_FOLDER_ID,
+                "responseFormat": "FORMAT_XML",
+            },
+        ) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                print(f"[DEBUG] Yandex Search статус={resp.status}, тело={raw[:300]!r}")
+                return []
+    try:
+        data = json.loads(raw)
+        xml_text = base64.b64decode(data["rawData"]).decode("utf-8", errors="ignore")
+        root = ET.fromstring(xml_text)
+        urls = []
+        for doc in root.iter("doc"):
+            url_el = doc.find("url")
+            if url_el is not None and url_el.text:
+                urls.append(url_el.text)
+            if len(urls) >= 4:
+                break
+        return urls
+    except Exception as e:
+        print(f"[DEBUG] не удалось разобрать ответ Yandex Search: {e}")
+        return []
+
+
+async def fetch_page_text(url: str) -> str:
+    """Скачивает страницу и вытаскивает читаемый текст без HTML-тегов."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            html = await resp.text()
+    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+
+
+async def collect_web_context(query: str, preferred: str = "") -> str:
+    """Ищет и читает страницы целиком — сниппеты часто не содержат таблиц
+    (расписаний и т. п.), а сама страница обычно да. Пробует несколько ссылок,
+    страницы с предпочтительных сайтов идут первыми."""
+    urls = await yandex_search_urls(query)
+    if preferred:
+        pref_hosts = [s.strip() for s in preferred.split(",") if s.strip()]
+        urls.sort(key=lambda u: 0 if any(h in u for h in pref_hosts) else 1)
+    print(f"[DEBUG] поиск, ссылки: {urls}")
+    combined = []
+    for url in urls:
+        try:
+            text = await fetch_page_text(url)
+            if len(text) > 500:
+                print(f"[DEBUG] прочитал {url}, символов: {len(text)}")
+                combined.append(f"Источник {url}:\n{text[:6000]}")
+        except Exception as e:
+            print(f"[DEBUG] не удалось открыть {url}: {e}")
+        if len(combined) >= 2:
+            break
+    return "\n\n---\n\n".join(combined)
+
+
+async def gigachat_completion(messages: list[dict]) -> str:
+    """Низкоуровневый вызов GigaChat: получить токен, задать вопрос."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "RqUID": str(uuid.uuid4()),
+                "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
+            },
+            data={"scope": "GIGACHAT_API_PERS"},
+            ssl=False,
+        ) as token_resp:
+            raw = await token_resp.text()
+            try:
+                token_data = json.loads(raw)
+            except ValueError:
+                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {token_resp.status}): {raw[:200]}")
+            if token_resp.status != 200:
+                raise RuntimeError(token_data.get("message", f"ошибка токена, статус {token_resp.status}"))
+            access_token = token_data["access_token"]
+        async with session.post(
+            "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"model": "GigaChat", "messages": messages},
+            ssl=False,
+        ) as resp:
+            raw = await resp.text()
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {resp.status}): {raw[:200]}")
+            if resp.status != 200:
+                raise RuntimeError(data.get("message", f"ошибка запроса, статус {resp.status}"))
+            return data["choices"][0]["message"]["content"]
+
+
+async def ask_gigachat(question: str, site_hint: str | None = None) -> str:
+    """Ищет материалы в интернете (Yandex) и просит GigaChat ответить по ним."""
+    context = await collect_web_context(question, preferred=site_hint or "")
     today = datetime.date.today().strftime("%d.%m.%Y")
     system_text = (
         f"Сегодня {today}. Отвечай по-русски, строго в запрошенном формате, "
         f"без пояснений и markdown-разметки.\n"
-        f"Время не пересчитывай между часовыми поясами — бери как в источнике."
+        f"Время не пересчитывай между часовыми поясами — бери как в источнике.\n"
+        f"Если вопрос подразумевает список (например, все матчи за день) — "
+        f"перечисли ВСЕ подходящие пункты, а не только первый."
     )
-    if site_hint:
-        system_text += f"\nПри поиске отдавай предпочтение источникам: {site_hint}."
-
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_text}]},
-        "contents": [{"role": "user", "parts": [{"text": question}]}],
-        "tools": [{"google_search": {}}],
-    }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            url,
-            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as resp:
-            raw = await resp.text()
-            if resp.status != 200:
-                print(f"[DEBUG] Gemini статус={resp.status}, тело={raw[:400]!r}")
-                raise RuntimeError(f"Gemini вернул статус {resp.status}")
-            data = json.loads(raw)
-
-    candidate = data["candidates"][0]
-    queries = candidate.get("groundingMetadata", {}).get("webSearchQueries", [])
-    print(f"[DEBUG] Gemini искал: {queries}")
-    answer = "".join(p.get("text", "") for p in candidate.get("content", {}).get("parts", [])).strip()
-    if not answer:
-        raise RuntimeError("Gemini вернул пустой ответ")
-    return answer
+    if context:
+        system_text += f"\n\nМатериалы из интернета по теме вопроса:\n{context}"
+    messages = [{"role": "system", "content": system_text}, {"role": "user", "content": question}]
+    return await gigachat_completion(messages)
 
 
 async def send_with_retry(chat_id: int, text: str, attempts: int = 3, delay: int = 5) -> bool:
@@ -307,7 +392,7 @@ async def next_match_for_club(club: dict) -> str:
         f"опубликовано, известен только диапазон дат) — последней строкой напиши НЕТ."
     )
     try:
-        answer = (await ask_gemini(prompt, site_hint=", ".join(club["sites"]))).strip()
+        answer = (await ask_gigachat(prompt, site_hint=", ".join(club["sites"]))).strip()
         print(f"[DEBUG] {club['name']}: {answer!r}")
         # Модель часто добавляет пояснение — берём последнюю строку с разделителями
         data_line = None
@@ -411,9 +496,9 @@ async def cmd_ai(message: types.Message, command: CommandObject):
         await message.answer("Напишите вопрос после команды, например:\n/ии когда играет Урал")
         return
     try:
-        answer = await ask_gemini(command.args)
+        answer = await ask_gigachat(command.args)
     except Exception as e:
-        print(f"[DEBUG] ошибка запроса к Gemini: {e}")
+        print(f"[DEBUG] ошибка запроса к GigaChat: {e}")
         answer = "Не получилось получить ответ, попробуйте ещё раз чуть позже."
     await message.answer(answer)
 
