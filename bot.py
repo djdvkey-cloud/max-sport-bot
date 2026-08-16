@@ -1,13 +1,14 @@
 """
-Футбольный бот «Мяч» — опросы на тренировку, статистика игр и напоминания
-о матчах трёх клубов.
+Футбольный бот «Мяч» — опросы на тренировку, статистика игр, составы команд
+и напоминания о матчах трёх клубов.
 
-ИИ используется ТОЛЬКО для утренней проверки матчей (Синара, Урал,
-Автомобилист). Всё остальное — обычный код, без обращений к Claude.
+ИИ — Gemini (Google), бесплатный API со встроенным веб-поиском (5000
+поисковых запросов в месяц бесплатно на моделях линейки Flash — этого с
+большим запасом хватает и на утреннюю проверку матчей, и на вопросы в чате).
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (в Amvera → «Переменные»):
-    BOT_TOKEN         — токен от @BotFather
-    ANTHROPIC_API_KEY — ключ с console.anthropic.com
+    BOT_TOKEN      — токен от @BotFather
+    GEMINI_API_KEY — ключ с aistudio.google.com (бесплатно, без карты)
 
 ЗАПУСК:
     python bot.py
@@ -29,9 +30,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-# Шаблонная задача — хватает быстрой и дешёвой модели
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+# Flash — быстрая и бесплатная модель с включённым веб-поиском
+GEMINI_MODEL = "gemini-3.5-flash"
 
 # Кто может отдавать команды. 0 — ограничение выключено (как было раньше).
 # Свой id узнаете командой /id — впишите сюда и перезапустите бота.
@@ -137,51 +138,45 @@ def parse_match_line(text: str) -> tuple[list[tuple[str, int, int]], list[str]]:
     return players, errors
 
 
-# --- Обращение к Claude (только для проверки матчей) ----------------------
+# --- Обращение к Gemini (проверка матчей и команда /ии) --------------------
 
-async def ask_claude(question: str, allowed_domains: list[str] | None = None) -> str:
-    """Вопрос к Claude со встроенным веб-поиском по указанным сайтам."""
+async def ask_gemini(question: str, site_hint: str | None = None) -> str:
+    """Вопрос к Gemini со встроенным веб-поиском (Google Search grounding —
+    поиск и модель работают внутри одного вызова, отдельный поисковик не нужен)."""
     today = datetime.date.today().strftime("%d.%m.%Y")
     system_text = (
         f"Сегодня {today}. Отвечай по-русски, строго в запрошенном формате, "
         f"без пояснений и markdown-разметки.\n"
         f"Время не пересчитывай между часовыми поясами — бери как в источнике."
     )
-    search_tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
-    if allowed_domains:
-        search_tool["allowed_domains"] = allowed_domains
+    if site_hint:
+        system_text += f"\nПри поиске отдавай предпочтение источникам: {site_hint}."
 
     payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 800,
-        "system": system_text,
-        "messages": [{"role": "user", "content": question}],
-        "tools": [search_tool],
+        "systemInstruction": {"parts": [{"text": system_text}]},
+        "contents": [{"role": "user", "parts": [{"text": question}]}],
+        "tools": [{"google_search": {}}],
     }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            url,
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
             json=payload,
             timeout=aiohttp.ClientTimeout(total=120),
         ) as resp:
             raw = await resp.text()
             if resp.status != 200:
-                print(f"[DEBUG] Claude статус={resp.status}, тело={raw[:400]!r}")
-                raise RuntimeError(f"Claude вернул статус {resp.status}")
+                print(f"[DEBUG] Gemini статус={resp.status}, тело={raw[:400]!r}")
+                raise RuntimeError(f"Gemini вернул статус {resp.status}")
             data = json.loads(raw)
 
-    queries = [b.get("input", {}).get("query") for b in data.get("content", [])
-               if b.get("type") == "server_tool_use"]
-    print(f"[DEBUG] Claude искал: {queries}")
-    answer = "".join(b.get("text", "") for b in data.get("content", [])
-                     if b.get("type") == "text").strip()
+    candidate = data["candidates"][0]
+    queries = candidate.get("groundingMetadata", {}).get("webSearchQueries", [])
+    print(f"[DEBUG] Gemini искал: {queries}")
+    answer = "".join(p.get("text", "") for p in candidate.get("content", {}).get("parts", [])).strip()
     if not answer:
-        raise RuntimeError("Claude вернул пустой ответ")
+        raise RuntimeError("Gemini вернул пустой ответ")
     return answer
 
 
@@ -312,9 +307,9 @@ async def next_match_for_club(club: dict) -> str:
         f"опубликовано, известен только диапазон дат) — последней строкой напиши НЕТ."
     )
     try:
-        answer = (await ask_claude(prompt, allowed_domains=club["sites"])).strip()
+        answer = (await ask_gemini(prompt, site_hint=", ".join(club["sites"]))).strip()
         print(f"[DEBUG] {club['name']}: {answer!r}")
-        # Claude часто добавляет пояснение — берём последнюю строку с разделителями
+        # Модель часто добавляет пояснение — берём последнюю строку с разделителями
         data_line = None
         for line in reversed(answer.splitlines()):
             if line.count("|") >= 4:
@@ -382,7 +377,8 @@ async def cmd_help(message: types.Message):
         "Что умею:\n"
         "/опрос — создать опрос «Кто идёт на тренировку?»\n"
         "/напомнить ДД.ММ ЧЧ:ММ текст — запланировать напоминание\n"
-        "/id — узнать ID этого чата\n\n"
+        "/id — узнать ID этого чата\n"
+        "/ии вопрос — спросить что-нибудь\n\n"
         "Статистика игр:\n"
         "/матч Иванов 2+1, Петров 0+3, Соломин — записать результаты игры\n"
         "/статистика — таблица игроков\n"
@@ -406,6 +402,20 @@ async def cmd_id(message: types.Message):
         f"Чтобы бот слушался только вас — впишите ваш ID в строку "
         f"OWNER_TELEGRAM_ID в начале файла."
     )
+
+
+@dp.message(Command("ии"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
+async def cmd_ai(message: types.Message, command: CommandObject):
+    print(f"[DEBUG] сработал /ии, вопрос: {command.args!r}")
+    if not command.args:
+        await message.answer("Напишите вопрос после команды, например:\n/ии когда играет Урал")
+        return
+    try:
+        answer = await ask_gemini(command.args)
+    except Exception as e:
+        print(f"[DEBUG] ошибка запроса к Gemini: {e}")
+        answer = "Не получилось получить ответ, попробуйте ещё раз чуть позже."
+    await message.answer(answer)
 
 
 @dp.message(Command("опрос"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
