@@ -37,8 +37,8 @@ CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 # Свой id узнаете командой /id — впишите сюда и перезапустите бота.
 OWNER_TELEGRAM_ID = 0
 
-ALLOWED_CHAT_IDS = {-5579173684}      # где боту разрешено отвечать
-TRAINING_POLL_CHAT_ID = -5579173684   # куда постить опросы и напоминания
+ALLOWED_CHAT_IDS = {-1003857417996}      # где боту разрешено отвечать
+TRAINING_POLL_CHAT_ID = -1003857417996   # куда постить опросы и напоминания
 GAME_TIME = "21:30"                   # время тренировки, попадает в текст опроса
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 
