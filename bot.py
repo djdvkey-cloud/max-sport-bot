@@ -37,8 +37,8 @@ CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 # Свой id узнаете командой /id — впишите сюда и перезапустите бота.
 OWNER_TELEGRAM_ID = 0
 
-ALLOWED_CHAT_IDS = {-1003857417996}      # где боту разрешено отвечать
-TRAINING_POLL_CHAT_ID = -1003857417996   # куда постить опросы и напоминания
+ALLOWED_CHAT_IDS = {-5579173684}      # где боту разрешено отвечать
+TRAINING_POLL_CHAT_ID = -5579173684   # куда постить опросы и напоминания
 GAME_TIME = "21:30"                   # время тренировки, попадает в текст опроса
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 
@@ -69,10 +69,11 @@ async def only_owner(handler, event, data):
     if user and user.id == OWNER_TELEGRAM_ID:
         return await handler(event, data)
 
-    # Исключение: таблицу статистики может посмотреть любой в футбольном чате
+    # Исключение: статистику и составы в футбольном чате может смотреть
+    # и запускать любой участник, не только владелец
     text = (getattr(event, "text", "") or "").strip().lower()
     chat = getattr(event, "chat", None)
-    if text.startswith("/статистика") and chat and chat.id in ALLOWED_CHAT_IDS:
+    if text.startswith(("/статистика", "/составы")) and chat and chat.id in ALLOWED_CHAT_IDS:
         return await handler(event, data)
 
     print(f"[DEBUG] команда не от владельца (id {user.id if user else '?'}), игнорирую")
@@ -385,6 +386,7 @@ async def cmd_help(message: types.Message):
         "Статистика игр:\n"
         "/матч Иванов 2+1, Петров 0+3, Соломин — записать результаты игры\n"
         "/статистика — таблица игроков\n"
+        "/составы Иванов, Петров, ... — разбить на равные по силе команды\n"
         "/отменить — убрать последнюю записанную игру\n"
         "/переименовать Старое = Новое — переименовать игрока\n"
         "/обнулить да — стереть всю статистику чата\n\n"
@@ -498,7 +500,7 @@ async def cmd_stats(message: types.Message):
         rows.append((koef, points, name, r))
     rows.sort(reverse=True)
 
-    lines = ["📊 Статистика (И — игры, Г — голы, П — передачи, К — очки за игру)\n"]
+    lines = ["📊 Статистика (И — игры, Г — голы, П — передачи, К — коэффициент)\n"]
     for i, (koef, points, name, r) in enumerate(rows, 1):
         lines.append(
             f"{i}. {name} — И:{r['games']} Г:{r['goals']} П:{r['assists']} "
@@ -577,6 +579,95 @@ async def cmd_reset_stats(message: types.Message, command: CommandObject):
     stats.pop(str(target_group_chat_id(message)), None)
     save_stats(stats)
     await message.answer("Статистика футбольного чата очищена.")
+
+
+def snake_teams(players: list[tuple[str, float]], team_count: int) -> list[list[tuple[str, float]]]:
+    """Раскладывает players (уже отсортированы по убыванию коэффициента) по
+    командам «змейкой»: 0,1,..,K-1,K-1,..,1,0,0,1,... — стандартный приём для
+    честного разбора по силе (как в фэнтези-драфтах)."""
+    teams: list[list[tuple[str, float]]] = [[] for _ in range(team_count)]
+    i, forward = 0, True
+    for p in players:
+        teams[i].append(p)
+        if forward:
+            if i == team_count - 1:
+                forward = False
+            else:
+                i += 1
+        else:
+            if i == 0:
+                forward = True
+            else:
+                i -= 1
+    return teams
+
+
+def teams_and_bench_size(n: int) -> tuple[int, int]:
+    """По числу игроков — (число команд по 5, число запасных).
+    10→2 команды, 15→3 команды, между ними и после — с запасными.
+    Меньше 10 — тоже 2 команды, просто неполные, без запасных."""
+    if n == 10:
+        return 2, 0
+    if n == 15:
+        return 3, 0
+    if 10 < n < 15:
+        return 2, n - 10
+    if n > 15:
+        return 3, n - 15
+    return 2, 0
+
+
+@dp.message(Command("составы"), F.chat.id.in_(ALLOWED_CHAT_IDS) | (F.chat.type == "private"))
+async def cmd_lineups(message: types.Message, command: CommandObject):
+    print(f"[DEBUG] сработал /составы, аргументы: {command.args!r}")
+    usage = (
+        "Формат: /составы Фамилия, Фамилия, Фамилия...\n"
+        "Например: /составы Иванов, Петров, Сидоров, Козлов, Смирнов, "
+        "Волков, Лебедев, Соколов, Новиков, Морозов\n\n"
+        "10 игроков → 2 команды, 15 → 3 команды. Другое количество между "
+        "10 и 15 или больше 15 — часть игроков идёт в запасные.\n"
+        "Команды собираются по коэффициенту из /статистика (у кого не было "
+        "игр — коэффициент 0)."
+    )
+    if not command.args:
+        await message.answer(usage)
+        return
+    names = [chunk.strip().title() for chunk in command.args.split(",") if chunk.strip()]
+    if not names:
+        await message.answer(usage)
+        return
+
+    chat_players = load_stats().get(str(target_group_chat_id(message)), {}).get("players", {})
+    players = []
+    unknown = []
+    for name in names:
+        rec = chat_players.get(name)
+        if rec and rec.get("games"):
+            koef = (rec["goals"] + rec["assists"]) / rec["games"]
+        else:
+            koef = 0.0
+            unknown.append(name)
+        players.append((name, koef))
+    players.sort(key=lambda p: -p[1])
+
+    team_count, bench_size = teams_and_bench_size(len(players))
+    bench = players[len(players) - bench_size:] if bench_size else []
+    playing = players[:len(players) - bench_size] if bench_size else players
+    teams = snake_teams(playing, team_count)
+
+    lines = [f"⚖️ Составы — игроков {len(players)}, команд {team_count}\n"]
+    for i, team in enumerate(teams, 1):
+        avg = sum(k for _, k in team) / len(team) if team else 0
+        lines.append(f"Команда {i} (средний коэф. {avg:.2f}):")
+        lines += [f"• {name} — {koef:.2f}" for name, koef in team]
+        lines.append("")
+    if bench:
+        lines.append("Запасные:")
+        lines += [f"• {name} — {koef:.2f}" for name, koef in bench]
+        lines.append("")
+    if unknown:
+        lines.append(f"Не было в статистике (коэффициент принят за 0): {', '.join(unknown)}")
+    await message.answer("\n".join(lines).strip())
 
 
 async def main():
