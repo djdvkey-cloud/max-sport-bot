@@ -88,6 +88,26 @@ async def only_owner(handler, event, data):
 
 # --- Статистика игроков ---------------------------------------------------
 
+# Сколько очков даёт результативное действие
+GOAL_POINTS = 1.0
+ASSIST_POINTS = 0.5
+
+
+def points_of(rec: dict) -> float:
+    """Очки игрока: гол — 1, передача — 0,5."""
+    return rec["goals"] * GOAL_POINTS + rec["assists"] * ASSIST_POINTS
+
+
+def koef_of(rec: dict) -> float:
+    """Коэффициент: очки, делённые на сыгранные игры."""
+    return points_of(rec) / rec["games"] if rec.get("games") else 0.0
+
+
+def fmt_num(value: float) -> str:
+    """9.5 → «9.5», 11.0 → «11» — чтобы в таблице не было лишних нулей."""
+    return f"{value:g}"
+
+
 def load_stats() -> dict:
     """{chat_id: {"players": {игрок: {games, goals, assists}}, "last": [записи]}}"""
     if not os.path.exists(STATS_FILE):
@@ -590,16 +610,15 @@ async def cmd_stats(message: types.Message):
         return
     rows = []
     for name, r in chat_stats.items():
-        points = r["goals"] + r["assists"]
-        koef = points / r["games"] if r["games"] else 0
-        rows.append((koef, points, name, r))
+        rows.append((koef_of(r), points_of(r), name, r))
     rows.sort(reverse=True)
 
-    lines = ["📊 Статистика (И — игры, Г — голы, П — передачи, К — коэффициент)\n"]
+    lines = ["📊 Статистика (И — игры, Г — голы, П — передачи, О — очки, К — коэффициент)",
+             "Гол — 1 очко, передача — 0,5\n"]
     for i, (koef, points, name, r) in enumerate(rows, 1):
         lines.append(
             f"{i}. {name} — И:{r['games']} Г:{r['goals']} П:{r['assists']} "
-            f"О:{points} К:{koef:.2f}"
+            f"О:{fmt_num(points)} К:{koef:.2f}"
         )
     await message.answer("\n".join(lines))
 
@@ -721,7 +740,8 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
         "Волков, Лебедев, Соколов, Новиков, Морозов\n\n"
         "10 игроков → 2 команды, 15 → 3 команды. Другое количество между "
         "10 и 15 или больше 15 — часть игроков идёт в запасные.\n"
-        "Команды собираются по коэффициенту из /статистика (у кого не было "
+        "Команды собираются по коэффициенту из /статистика — гол 1 очко, "
+        "передача 0,5 (у кого не было "
         "игр — коэффициент 0)."
     )
     if not command.args:
@@ -738,7 +758,7 @@ async def cmd_lineups(message: types.Message, command: CommandObject):
     for name in names:
         rec = chat_players.get(name)
         if rec and rec.get("games"):
-            koef = (rec["goals"] + rec["assists"]) / rec["games"]
+            koef = koef_of(rec)
         else:
             koef = 0.0
             unknown.append(name)
