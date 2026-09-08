@@ -1,0 +1,3 @@
+maxapi
+aiohttp
+beautifulsoup4
