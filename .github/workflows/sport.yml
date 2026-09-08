@@ -1,0 +1,46 @@
+name: Спортивные оповещения
+
+on:
+  schedule:
+    # 5:00 UTC = 10:00 по Екатеринбургу — расписание на сегодня
+    - cron: '0 5 * * *'
+    # 18:30 UTC = 23:30 по Екатеринбургу — результаты за сегодня
+    - cron: '30 18 * * *'
+  workflow_dispatch:   # кнопка ручного запуска, для проверки
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Забрать файлы репозитория
+        uses: actions/checkout@v6
+
+      - name: Поставить Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Установить библиотеки
+        run: pip install maxapi aiohttp beautifulsoup4
+
+      - name: Проверить матчи и отправить оповещения
+        env:
+          MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+          MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
+          GIGACHAT_AUTH_KEY: ${{ secrets.GIGACHAT_AUTH_KEY }}
+          YANDEX_API_KEY: ${{ secrets.YANDEX_API_KEY }}
+          YANDEX_FOLDER_ID: ${{ secrets.YANDEX_FOLDER_ID }}
+        run: python sport_bot.py
+
+      # Нужно, чтобы GitHub не отключил расписание за 60 дней бездействия
+      - name: Отметить, что бот отработал
+        run: |
+          date -u +"Последний запуск: %Y-%m-%d %H:%M UTC" > last_run.txt
+          git config user.name "Спортбот"
+          git config user.email "actions@github.com"
+          git add last_run.txt
+          git commit -m "Проверка $(date -u +%d.%m.%Y_%H:%M)" || echo "изменений нет"
+          git push || echo "запушить не вышло — не страшно"
