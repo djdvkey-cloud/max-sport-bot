@@ -266,6 +266,25 @@ def looks_like_score(text: str) -> bool:
     return bool(re.search(r"\d+\s*[:\-]\s*\d+", text))
 
 
+def find_data_line(answer: str) -> str | None:
+    """Ищет строку с данными («A|B|C|D»), идя с конца ответа.
+    GigaChat иногда вместо чистого «НЕТ» оформляет отказ таблицей —
+    шапка «Турнир|Время|Место|Соперник», разделитель «---|---|---|---»
+    и только потом «НЕТ» последней строкой. У шапки и разделителя тоже
+    3+ символа «|», поэтому как только по пути снизу вверх встречается
+    строка «НЕТ» — останавливаемся и считаем ответ отрицательным, а не
+    продолжаем искать более раннюю строку с «|»."""
+    for line in reversed(answer.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        if line.upper().startswith("НЕТ"):
+            return None
+        if line.count("|") >= 3:
+            return line
+    return None
+
+
 async def club_schedule_today(club: dict) -> str:
     """Если клуб играет СЕГОДНЯ — текст анонса, иначе пустая строка."""
     today = datetime.date.today()
@@ -280,12 +299,8 @@ async def club_schedule_today(club: dict) -> str:
     try:
         answer = (await ask_gigachat(prompt, club["sites"])).strip()
         print(f"[DEBUG] {club['name']} (утро): {answer!r}")
-        data_line = None
-        for line in reversed(answer.splitlines()):
-            if line.count("|") >= 3:
-                data_line = line.strip()
-                break
-        if data_line is None or data_line.upper().startswith("НЕТ"):
+        data_line = find_data_line(answer)
+        if data_line is None:
             return ""
         parts = [p.strip() for p in data_line.split("|")]
         tournament, time_str, place, rival = parts[:4]
@@ -314,12 +329,8 @@ async def club_result_today(club: dict) -> str:
     try:
         answer = (await ask_gigachat(prompt, club["sites"])).strip()
         print(f"[DEBUG] {club['name']} (вечер): {answer!r}")
-        data_line = None
-        for line in reversed(answer.splitlines()):
-            if line.count("|") >= 3:
-                data_line = line.strip()
-                break
-        if data_line is None or data_line.upper().startswith("НЕТ"):
+        data_line = find_data_line(answer)
+        if data_line is None:
             return ""
         parts = [p.strip() for p in data_line.split("|")]
         rival, score, place, points = parts[:4]
