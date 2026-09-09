@@ -239,12 +239,12 @@ async def gigachat_completion(messages: list[dict]) -> str:
         raise RuntimeError("GigaChat: превышены попытки после Too Many Requests")
 
 
-async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") -> tuple[str, str]:
-    """Ищет материалы в интернете (Yandex) и просит GigaChat ответить по ним.
-    Возвращает (ответ, собранный веб-контекст) — контекст нужен вызывающей
-    стороне, чтобы потом проверить, не придумала ли модель факты, которых
-    в материалах не было."""
-    context = await collect_web_context(question, sites)
+async def ask_gigachat_with_context(question: str, context: str, system_extra: str = "") -> str:
+    """Спрашивает GigaChat по уже готовому контексту, без нового похода в
+    Yandex Search — для повторных попыток: там question — это ДЛИННАЯ
+    инструкция с цитатой прошлого плохого ответа, а Yandex Search принимает
+    query_text не длиннее 400 символов, так что через collect_web_context
+    такой текст не пройдёт."""
     today = datetime.datetime.now(YEKB_TZ).strftime("%d.%m.%Y")
     system_text = (
         f"Сегодня {today}. Отвечай по-русски, строго в запрошенном формате, "
@@ -262,7 +262,16 @@ async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") 
     else:
         system_text += "\n\nВ интернете ничего найти не удалось."
     messages = [{"role": "system", "content": system_text}, {"role": "user", "content": question}]
-    answer = await gigachat_completion(messages)
+    return await gigachat_completion(messages)
+
+
+async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") -> tuple[str, str]:
+    """Ищет материалы в интернете (Yandex) и просит GigaChat ответить по ним.
+    Возвращает (ответ, собранный веб-контекст) — контекст нужен вызывающей
+    стороне, чтобы потом проверить, не придумала ли модель факты, которых
+    в материалах не было, и чтобы можно было переспросить без нового поиска."""
+    context = await collect_web_context(question, sites)
+    answer = await ask_gigachat_with_context(question, context, system_extra)
     return answer, context
 
 
@@ -368,24 +377,21 @@ async def club_schedule_today(club: dict) -> str:
             # причина: страница-сводка со множеством матчей за день, модель
             # перепутала, какая строка — про этот клуб). Переспрашиваем один
             # раз более жёстко.
-            print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз")
-            retry_prompt = (
-                f"{prompt}\n\n"
+            print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз (тот же контекст, без нового поиска)")
+            retry_extra = (
                 f"Твой предыдущий ответ был в неправильном формате, называл "
-                f"соперника, которого нет в найденных материалах, или в поле "
+                f"соперника, которого нет в материалах выше, или в поле "
                 f"«Турнир» указал название самого клуба вместо названия "
-                f"соревнования — не годится:\n{answer}\n\n"
-                f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений и без "
-                f"повторения текста задания, строго в виде:\n"
-                f"Турнир|Время|Место|Соперник\n"
-                f"«Турнир» — это название соревнования (например «Лига "
-                f"чемпионов», «Ла Лига»), а НЕ название клуба и не пара "
-                f"«команда — соперник». Указывай только то, что явно и "
-                f"однозначно написано в материалах именно про {club['name']}. "
-                f"Если нет уверенности — одним словом НЕТ."
+                f"соревнования — не годится: {answer!r}.\n"
+                f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений, строго "
+                f"в виде «Турнир|Время|Место|Соперник». «Турнир» — это "
+                f"название соревнования (например «Лига чемпионов», «Ла "
+                f"Лига»), а НЕ название клуба и не пара «команда — соперник». "
+                f"Указывай только то, что явно и однозначно написано в "
+                f"материалах выше именно про {club['name']}. Если нет "
+                f"уверенности — одним словом НЕТ."
             )
-            answer, context = await ask_gigachat(retry_prompt, club["sites"])
-            answer = answer.strip()
+            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (утро, повтор): {answer!r}")
             try:
                 parsed = parse_schedule_line(answer, context, club["name"])
@@ -450,22 +456,19 @@ async def club_result_today(club: dict) -> str:
             # вместо ответа, или приписал результат чужого матча). Переспра-
             # шиваем один раз более жёстко, прежде чем молча признать, что
             # результата нет — иначе реальные результаты теряются без следа.
-            print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз")
-            retry_prompt = (
-                f"{prompt}\n\n"
+            print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз (тот же контекст, без нового поиска)")
+            retry_extra = (
                 f"Твой предыдущий ответ был в неправильном формате или "
-                f"называл соперника, которого нет в найденных материалах, и "
-                f"не годится:\n{answer}\n\n"
-                f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений и без "
-                f"повторения текста задания, строго в виде:\n"
-                f"Соперник|Счёт|Место в таблице|Очки\n"
-                f"В поле «Счёт» — именно счёт цифрами (например 2:1), а не "
-                f"слово. Указывай только то, что явно и однозначно написано "
-                f"в материалах именно про {club['name']}. Если матча не было "
-                f"или нет уверенности — ответь одним словом НЕТ."
+                f"называл соперника, которого нет в материалах выше, — не "
+                f"годится: {answer!r}.\n"
+                f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений, строго "
+                f"в виде «Соперник|Счёт|Место в таблице|Очки». В поле «Счёт» "
+                f"— именно счёт цифрами (например 2:1), а не слово. Указывай "
+                f"только то, что явно и однозначно написано в материалах выше "
+                f"именно про {club['name']}. Если матча не было или нет "
+                f"уверенности — ответь одним словом НЕТ."
             )
-            answer, context = await ask_gigachat(retry_prompt, club["sites"])
-            answer = answer.strip()
+            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (вечер, повтор): {answer!r}")
             try:
                 parsed = parse_result_line(answer, context)
