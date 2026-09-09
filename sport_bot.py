@@ -314,6 +314,24 @@ async def club_schedule_today(club: dict) -> str:
         return ""
 
 
+def parse_result_line(answer: str) -> tuple[str, str, str, str] | None:
+    """Возвращает (Соперник, Счёт, Место, Очки) из ответа.
+    None — ответ искренне «НЕТ» (данных нет и не будет, переспрашивать
+    незачем). Бросает ValueError, если строка с данными нашлась, но её не
+    удалось разобрать как результат (не хватает полей или поле счёта не
+    похоже на счёт) — такое стоит переспросить у модели ещё раз."""
+    data_line = find_data_line(answer)
+    if data_line is None:
+        return None
+    parts = [p.strip() for p in data_line.split("|")]
+    if len(parts) < 4:
+        raise ValueError(f"меньше 4 полей: {parts!r}")
+    rival, score, place, points = parts[:4]
+    if not looks_like_score(score):
+        raise ValueError(f"поле счёта не похоже на счёт: {score!r}")
+    return rival, score, place, points
+
+
 async def club_result_today(club: dict) -> str:
     """Если у клуба СЕГОДНЯ был матч — счёт и место в таблице, иначе пусто."""
     today = datetime.date.today()
@@ -329,14 +347,36 @@ async def club_result_today(club: dict) -> str:
     try:
         answer = (await ask_gigachat(prompt, club["sites"])).strip()
         print(f"[DEBUG] {club['name']} (вечер): {answer!r}")
-        data_line = find_data_line(answer)
-        if data_line is None:
+        try:
+            parsed = parse_result_line(answer)
+        except ValueError as e:
+            # Строка с данными нашлась, но её не разобрать (частая причина:
+            # GigaChat перепутал порядок полей или процитировал кусок
+            # промпта вместо ответа). Переспрашиваем один раз более жёстко,
+            # прежде чем молча признать, что результата нет — иначе реальные
+            # результаты матчей теряются без следа.
+            print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз")
+            retry_prompt = (
+                f"{prompt}\n\n"
+                f"Твой предыдущий ответ был в неправильном формате и не "
+                f"годится:\n{answer}\n\n"
+                f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений и без "
+                f"повторения текста задания, строго в виде:\n"
+                f"Соперник|Счёт|Место в таблице|Очки\n"
+                f"В поле «Счёт» — именно счёт цифрами (например 2:1), а не "
+                f"слово. Если матча не было или он ещё не закончился — "
+                f"ответь одним словом НЕТ."
+            )
+            answer = (await ask_gigachat(retry_prompt, club["sites"])).strip()
+            print(f"[DEBUG] {club['name']} (вечер, повтор): {answer!r}")
+            try:
+                parsed = parse_result_line(answer)
+            except ValueError as e2:
+                print(f"[DEBUG] {club['name']}: после повтора всё ещё не разобралось ({e2}), пропускаю")
+                return ""
+        if parsed is None:
             return ""
-        parts = [p.strip() for p in data_line.split("|")]
-        rival, score, place, points = parts[:4]
-        if not looks_like_score(score):
-            print(f"[DEBUG] {club['name']}: поле счёта не похоже на счёт ({score!r}), пропускаю")
-            return ""
+        rival, score, place, points = parsed
         return (f"✅ {club['name']} {score} {rival}\n"
                 f"Место в таблице: {place} ({points} очков)")
     except Exception as e:
