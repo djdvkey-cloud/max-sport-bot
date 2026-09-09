@@ -265,12 +265,16 @@ async def ask_gigachat_with_context(question: str, context: str, system_extra: s
     return await gigachat_completion(messages)
 
 
-async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") -> tuple[str, str]:
+async def ask_gigachat(question: str, sites: list[str], system_extra: str = "",
+                        search_query: str | None = None) -> tuple[str, str]:
     """Ищет материалы в интернете (Yandex) и просит GigaChat ответить по ним.
     Возвращает (ответ, собранный веб-контекст) — контекст нужен вызывающей
     стороне, чтобы потом проверить, не придумала ли модель факты, которых
-    в материалах не было, и чтобы можно было переспросить без нового поиска."""
-    context = await collect_web_context(question, sites)
+    в материалах не было, и чтобы можно было переспросить без нового поиска.
+    search_query — отдельный, короткий текст для Yandex Search (у него лимит
+    в 400 символов на query_text); если не задан, используется question, но
+    у длинных многострочных question это может превысить лимит."""
+    context = await collect_web_context(search_query or question, sites)
     answer = await ask_gigachat_with_context(question, context, system_extra)
     return answer, context
 
@@ -503,7 +507,8 @@ async def khl_group_schedule() -> str:
         f"Если сегодня, кроме Автомобилиста, игр КХЛ нет — напиши НЕТ."
     )
     try:
-        answer, _ = await ask_gigachat(prompt, KHL_GROUP_SITES)
+        search_query = f"расписание матчей КХЛ на {today:%d.%m.%Y}"
+        answer, _ = await ask_gigachat(prompt, KHL_GROUP_SITES, search_query=search_query)
         answer = answer.strip()
         print(f"[DEBUG] КХЛ (утро): {answer!r}")
         if not answer or answer.upper().startswith("НЕТ") or "НЕТ" == answer.strip().upper():
@@ -528,7 +533,8 @@ async def khl_group_results() -> str:
         f"Если сегодня, кроме Автомобилиста, игр не было — напиши НЕТ."
     )
     try:
-        answer, _ = await ask_gigachat(prompt, KHL_GROUP_SITES)
+        search_query = f"результаты матчей КХЛ {today:%d.%m.%Y}"
+        answer, _ = await ask_gigachat(prompt, KHL_GROUP_SITES, search_query=search_query)
         answer = answer.strip()
         print(f"[DEBUG] КХЛ (вечер): {answer!r}")
         if not answer or answer.upper().startswith("НЕТ") or "НЕТ" == answer.strip().upper():
