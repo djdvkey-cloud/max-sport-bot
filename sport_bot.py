@@ -239,15 +239,21 @@ async def gigachat_completion(messages: list[dict]) -> str:
         raise RuntimeError("GigaChat: превышены попытки после Too Many Requests")
 
 
-async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") -> str:
-    """Ищет материалы в интернете (Yandex) и просит GigaChat ответить по ним."""
+async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") -> tuple[str, str]:
+    """Ищет материалы в интернете (Yandex) и просит GigaChat ответить по ним.
+    Возвращает (ответ, собранный веб-контекст) — контекст нужен вызывающей
+    стороне, чтобы потом проверить, не придумала ли модель факты, которых
+    в материалах не было."""
     context = await collect_web_context(question, sites)
     today = datetime.datetime.now(YEKB_TZ).strftime("%d.%m.%Y")
     system_text = (
         f"Сегодня {today}. Отвечай по-русски, строго в запрошенном формате, "
         f"без пояснений и markdown-разметки.\n"
         f"Время не пересчитывай между часовыми поясами — бери как в источнике, "
-        f"но обязательно указывай пояс (мск, ЕКБ и т. п.)."
+        f"но обязательно указывай пояс (мск, ЕКБ и т. п.).\n"
+        f"Никогда не придумывай факты, которых нет в материалах ниже. Если по "
+        f"материалам нельзя точно и однозначно установить ответ — считай, что "
+        f"события нет, и отвечай «НЕТ», а не давай предположительный ответ."
     )
     if system_extra:
         system_text += f"\n{system_extra}"
@@ -256,7 +262,8 @@ async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") 
     else:
         system_text += "\n\nВ интернете ничего найти не удалось."
     messages = [{"role": "system", "content": system_text}, {"role": "user", "content": question}]
-    return await gigachat_completion(messages)
+    answer = await gigachat_completion(messages)
+    return answer, context
 
 
 # --- Отдельные клубы ---------------------------------------------------
@@ -264,6 +271,27 @@ async def ask_gigachat(question: str, sites: list[str], system_extra: str = "") 
 def looks_like_score(text: str) -> bool:
     """«2:1», «3-2 ОТ» — похоже на счёт. «нет», «не указан» — нет."""
     return bool(re.search(r"\d+\s*[:\-]\s*\d+", text))
+
+
+def rival_mentioned(rival: str, context: str) -> bool:
+    """Грубая проверка-страховка: хотя бы одно характерное слово из имени
+    соперника должно встречаться в собранном веб-контексте (по стему, без
+    учёта падежных окончаний вроде «-ом»/«-ой»/«-ы») — иначе похоже, что
+    модель прочитала общую сводку с кучей других матчей и приписала клубу
+    чужого соперника. Пустой контекст считается неподтверждённым — раз
+    страницы не читались, сверять не с чем."""
+    if not context:
+        return False
+    words = re.findall(r"[А-Яа-яЁёA-Za-z]+", rival)
+    candidates = [w for w in words if len(w) >= 4] or words
+    if not candidates:
+        return False
+    context_lower = context.lower()
+    for word in candidates:
+        stem = word[:max(4, len(word) - 3)].lower()
+        if stem in context_lower:
+            return True
+    return False
 
 
 def find_data_line(answer: str) -> str | None:
@@ -285,6 +313,38 @@ def find_data_line(answer: str) -> str | None:
     return None
 
 
+def looks_like_own_name(tournament: str, club_name: str) -> bool:
+    """«Турнир: Манчестер Сити» или «Манчестер Юнайтед — Бавария» вместо
+    названия турнира («Лига чемпионов») — модель по ошибке подставила в
+    поле «Турнир» название самого клуба (иногда вместе с соперником через
+    тире). Название турнира не может состоять из имени своего участника."""
+    club_core = re.sub(r'[«»"()]', '', club_name).strip().lower()
+    tournament_core = re.sub(r'[«»"()]', '', tournament).strip().lower()
+    if not club_core or not tournament_core:
+        return False
+    return club_core in tournament_core or tournament_core in club_core
+
+
+def parse_schedule_line(answer: str, context: str, club_name: str) -> tuple[str, str, str, str] | None:
+    """Возвращает (Турнир, Время, Место, Соперник) из ответа.
+    None — ответ искренне «НЕТ». Бросает ValueError, если строка нашлась,
+    но не разобралась, поле «Турнир» на самом деле оказалось именем клуба,
+    или соперник не подтверждается собранным веб-контекстом (похоже на
+    галлюцинацию по чужой сводке)."""
+    data_line = find_data_line(answer)
+    if data_line is None:
+        return None
+    parts = [p.strip() for p in data_line.split("|")]
+    if len(parts) < 4:
+        raise ValueError(f"меньше 4 полей: {parts!r}")
+    tournament, time_str, place, rival = parts[:4]
+    if looks_like_own_name(tournament, club_name):
+        raise ValueError(f"поле «Турнир» похоже на имя клуба/матча, не турнира: {tournament!r}")
+    if not rival_mentioned(rival, context):
+        raise ValueError(f"соперник '{rival}' не подтверждается материалами")
+    return tournament, time_str, place, rival
+
+
 async def club_schedule_today(club: dict) -> str:
     """Если клуб играет СЕГОДНЯ — текст анонса, иначе пустая строка."""
     today = datetime.date.today()
@@ -297,13 +357,44 @@ async def club_schedule_today(club: dict) -> str:
         f"Если сегодня матча нет — последней строкой напиши НЕТ."
     )
     try:
-        answer = (await ask_gigachat(prompt, club["sites"])).strip()
+        answer, context = await ask_gigachat(prompt, club["sites"])
+        answer = answer.strip()
         print(f"[DEBUG] {club['name']} (утро): {answer!r}")
-        data_line = find_data_line(answer)
-        if data_line is None:
+        try:
+            parsed = parse_schedule_line(answer, context, club["name"])
+        except ValueError as e:
+            # Строка нашлась, но не разобралась, поле «Турнир» оказалось
+            # именем клуба, или соперник не подтверждён материалами (частая
+            # причина: страница-сводка со множеством матчей за день, модель
+            # перепутала, какая строка — про этот клуб). Переспрашиваем один
+            # раз более жёстко.
+            print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз")
+            retry_prompt = (
+                f"{prompt}\n\n"
+                f"Твой предыдущий ответ был в неправильном формате, называл "
+                f"соперника, которого нет в найденных материалах, или в поле "
+                f"«Турнир» указал название самого клуба вместо названия "
+                f"соревнования — не годится:\n{answer}\n\n"
+                f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений и без "
+                f"повторения текста задания, строго в виде:\n"
+                f"Турнир|Время|Место|Соперник\n"
+                f"«Турнир» — это название соревнования (например «Лига "
+                f"чемпионов», «Ла Лига»), а НЕ название клуба и не пара "
+                f"«команда — соперник». Указывай только то, что явно и "
+                f"однозначно написано в материалах именно про {club['name']}. "
+                f"Если нет уверенности — одним словом НЕТ."
+            )
+            answer, context = await ask_gigachat(retry_prompt, club["sites"])
+            answer = answer.strip()
+            print(f"[DEBUG] {club['name']} (утро, повтор): {answer!r}")
+            try:
+                parsed = parse_schedule_line(answer, context, club["name"])
+            except ValueError as e2:
+                print(f"[DEBUG] {club['name']}: после повтора всё ещё не разобралось ({e2}), пропускаю")
+                return ""
+        if parsed is None:
             return ""
-        parts = [p.strip() for p in data_line.split("|")]
-        tournament, time_str, place, rival = parts[:4]
+        tournament, time_str, place, rival = parsed
         return (f"{club['icon']} Сегодня играет {club['name']}\n"
                 f"Турнир: {tournament}\n"
                 f"Время: {time_str}\n"
@@ -314,12 +405,13 @@ async def club_schedule_today(club: dict) -> str:
         return ""
 
 
-def parse_result_line(answer: str) -> tuple[str, str, str, str] | None:
+def parse_result_line(answer: str, context: str) -> tuple[str, str, str, str] | None:
     """Возвращает (Соперник, Счёт, Место, Очки) из ответа.
     None — ответ искренне «НЕТ» (данных нет и не будет, переспрашивать
     незачем). Бросает ValueError, если строка с данными нашлась, но её не
-    удалось разобрать как результат (не хватает полей или поле счёта не
-    похоже на счёт) — такое стоит переспросить у модели ещё раз."""
+    удалось разобрать как результат (не хватает полей, поле счёта не похоже
+    на счёт, или соперник не подтверждается собранным веб-контекстом) —
+    такое стоит переспросить у модели ещё раз."""
     data_line = find_data_line(answer)
     if data_line is None:
         return None
@@ -329,6 +421,8 @@ def parse_result_line(answer: str) -> tuple[str, str, str, str] | None:
     rival, score, place, points = parts[:4]
     if not looks_like_score(score):
         raise ValueError(f"поле счёта не похоже на счёт: {score!r}")
+    if not rival_mentioned(rival, context):
+        raise ValueError(f"соперник '{rival}' не подтверждается материалами")
     return rival, score, place, points
 
 
@@ -345,32 +439,36 @@ async def club_result_today(club: dict) -> str:
         f"напиши НЕТ."
     )
     try:
-        answer = (await ask_gigachat(prompt, club["sites"])).strip()
+        answer, context = await ask_gigachat(prompt, club["sites"])
+        answer = answer.strip()
         print(f"[DEBUG] {club['name']} (вечер): {answer!r}")
         try:
-            parsed = parse_result_line(answer)
+            parsed = parse_result_line(answer, context)
         except ValueError as e:
             # Строка с данными нашлась, но её не разобрать (частая причина:
-            # GigaChat перепутал порядок полей или процитировал кусок
-            # промпта вместо ответа). Переспрашиваем один раз более жёстко,
-            # прежде чем молча признать, что результата нет — иначе реальные
-            # результаты матчей теряются без следа.
+            # GigaChat перепутал порядок полей, процитировал кусок промпта
+            # вместо ответа, или приписал результат чужого матча). Переспра-
+            # шиваем один раз более жёстко, прежде чем молча признать, что
+            # результата нет — иначе реальные результаты теряются без следа.
             print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз")
             retry_prompt = (
                 f"{prompt}\n\n"
-                f"Твой предыдущий ответ был в неправильном формате и не "
-                f"годится:\n{answer}\n\n"
+                f"Твой предыдущий ответ был в неправильном формате или "
+                f"называл соперника, которого нет в найденных материалах, и "
+                f"не годится:\n{answer}\n\n"
                 f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений и без "
                 f"повторения текста задания, строго в виде:\n"
                 f"Соперник|Счёт|Место в таблице|Очки\n"
                 f"В поле «Счёт» — именно счёт цифрами (например 2:1), а не "
-                f"слово. Если матча не было или он ещё не закончился — "
-                f"ответь одним словом НЕТ."
+                f"слово. Указывай только то, что явно и однозначно написано "
+                f"в материалах именно про {club['name']}. Если матча не было "
+                f"или нет уверенности — ответь одним словом НЕТ."
             )
-            answer = (await ask_gigachat(retry_prompt, club["sites"])).strip()
+            answer, context = await ask_gigachat(retry_prompt, club["sites"])
+            answer = answer.strip()
             print(f"[DEBUG] {club['name']} (вечер, повтор): {answer!r}")
             try:
-                parsed = parse_result_line(answer)
+                parsed = parse_result_line(answer, context)
             except ValueError as e2:
                 print(f"[DEBUG] {club['name']}: после повтора всё ещё не разобралось ({e2}), пропускаю")
                 return ""
@@ -389,16 +487,21 @@ async def club_result_today(club: dict) -> str:
 async def khl_group_schedule() -> str:
     today = datetime.date.today()
     prompt = (
-        f"Найди полное расписание матчей КХЛ на сегодня, {today:%d.%m.%Y}, "
+        f"Найди полное расписание матчей именно КХЛ (Континентальная "
+        f"хоккейная лига, топ-дивизион) на сегодня, {today:%d.%m.%Y}, "
         f"КРОМЕ игры «Автомобилиста» — её не включай, она идёт отдельным "
         f"сообщением.\n"
+        f"НЕ включай игры ВХЛ, МХЛ, чемпионата Беларуси или любых других "
+        f"лиг — только КХЛ. Если сомневаешься, что команда играет именно в "
+        f"КХЛ — не включай эту игру.\n"
         f"Ответь построчно, каждая игра — время (как в источнике, с поясом) "
         f"и через тире команды: «19:00 мск — СКА — ЦСКА». Только сами строки "
         f"с играми, без пояснений и заголовков.\n"
         f"Если сегодня, кроме Автомобилиста, игр КХЛ нет — напиши НЕТ."
     )
     try:
-        answer = (await ask_gigachat(prompt, KHL_GROUP_SITES)).strip()
+        answer, _ = await ask_gigachat(prompt, KHL_GROUP_SITES)
+        answer = answer.strip()
         print(f"[DEBUG] КХЛ (утро): {answer!r}")
         if not answer or answer.upper().startswith("НЕТ") or "НЕТ" == answer.strip().upper():
             return ""
@@ -412,14 +515,18 @@ async def khl_group_results() -> str:
     today = datetime.date.today()
     prompt = (
         f"Найди результаты всех завершившихся сегодня, {today:%d.%m.%Y}, "
-        f"матчей КХЛ, КРОМЕ игры «Автомобилиста» — она идёт отдельным "
-        f"сообщением.\n"
+        f"матчей именно КХЛ (Континентальная хоккейная лига, топ-дивизион), "
+        f"КРОМЕ игры «Автомобилиста» — она идёт отдельным сообщением.\n"
+        f"НЕ включай игры ВХЛ, МХЛ, чемпионата Беларуси или любых других "
+        f"лиг — только КХЛ. Если сомневаешься, что команда играет именно в "
+        f"КХЛ — не включай эту игру.\n"
         f"Ответь построчно, каждая игра — команды и счёт: «СКА 3:1 ЦСКА». "
         f"Только сами строки с результатами, без пояснений и заголовков.\n"
         f"Если сегодня, кроме Автомобилиста, игр не было — напиши НЕТ."
     )
     try:
-        answer = (await ask_gigachat(prompt, KHL_GROUP_SITES)).strip()
+        answer, _ = await ask_gigachat(prompt, KHL_GROUP_SITES)
+        answer = answer.strip()
         print(f"[DEBUG] КХЛ (вечер): {answer!r}")
         if not answer or answer.upper().startswith("НЕТ") or "НЕТ" == answer.strip().upper():
             return ""
