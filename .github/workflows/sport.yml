@@ -4,8 +4,9 @@ on:
   schedule:
     # 5:00 UTC = 10:00 по Екатеринбургу — расписание на сегодня
     - cron: '0 5 * * *'
-    # 18:30 UTC = 23:30 по Екатеринбургу — результаты за сегодня
-    - cron: '30 18 * * *'
+    # Каждые 20 минут, 13:00-22:00 UTC — проверка результатов (RESULT_DELAY_HOURS
+    # после начала сохранённого матча, окно покрывает и поздние вечерние игры)
+    - cron: '*/20 13-22 * * *'
   workflow_dispatch:   # кнопка ручного запуска, для проверки
 
 permissions:
@@ -35,12 +36,12 @@ jobs:
           YANDEX_FOLDER_ID: ${{ secrets.YANDEX_FOLDER_ID }}
         run: python sport_bot.py
 
-      # Нужно, чтобы GitHub не отключил расписание за 60 дней бездействия
-      - name: Отметить, что бот отработал
+      # Сохраняем state (что сегодня играет, отправлен ли результат) между
+      # запусками — без этого коммита следующий тик ничего бы не помнил.
+      - name: Сохранить состояние матчей дня
         run: |
-          date -u +"Последний запуск: %Y-%m-%d %H:%M UTC" > last_run.txt
           git config user.name "Спортбот"
           git config user.email "actions@github.com"
-          git add last_run.txt
-          git commit -m "Проверка $(date -u +%d.%m.%Y_%H:%M)" || echo "изменений нет"
+          git add data/today_matches.json 2>/dev/null || true
+          git commit -m "Состояние на $(date -u +%d.%m.%Y_%H:%M)" || echo "изменений нет"
           git push || echo "запушить не вышло — не страшно"
