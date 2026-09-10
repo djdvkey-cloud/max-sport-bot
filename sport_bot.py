@@ -163,7 +163,13 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
             },
             json={
                 "query": query,
-                "search_depth": "basic",
+                # advanced вместо basic — 2 кредита вместо 1, но живой тест
+                # показал, что basic плохо ранжирует официальный сайт клуба
+                # среди похожих страниц (пропустил кубковый матч Урала,
+                # хотя fc-ural.ru был в белом списке). При 6 клубах и
+                # редких проверках результата это остаётся далеко в рамках
+                # бесплатного лимита Tavily.
+                "search_depth": "advanced",
                 "max_results": 8,
                 "include_domains": TAVILY_INCLUDE_DOMAINS,
             },
