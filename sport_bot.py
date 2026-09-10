@@ -654,9 +654,23 @@ async def main():
     now = datetime.datetime.now(YEKB_TZ)
     print(f"[DEBUG] сейчас по Екатеринбургу: {now:%d.%m.%Y %H:%M}")
 
+    # FORCE_MODE — только для ручного запуска (workflow_dispatch input
+    # mode=morning/results), чтобы можно было проверить конкретную ветку
+    # не дожидаясь нужного часа. На расписании (schedule) эта переменная
+    # всегда пустая, и режим определяется как обычно, по текущему часу.
+    force_mode = os.environ.get("FORCE_MODE", "").strip().lower()
+    if force_mode == "morning":
+        run_morning = True
+        print("[DEBUG] режим принудительно установлен: morning (ручная проверка)")
+    elif force_mode == "results":
+        run_morning = False
+        print("[DEBUG] режим принудительно установлен: results (ручная проверка)")
+    else:
+        run_morning = now.hour == MORNING_HOUR
+
     bot = Bot(MAX_BOT_TOKEN)
     try:
-        if now.hour == MORNING_HOUR:
+        if run_morning:
             await job_morning(bot)
         else:
             await job_check_results(bot)
