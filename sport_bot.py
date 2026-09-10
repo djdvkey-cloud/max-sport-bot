@@ -89,7 +89,7 @@ def load_state() -> dict:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"[DEBUG] не удалось прочитать {DATA_FILE}: {e}")
+        print(f"[DEBUG] не удалось прочитать {DATA_FILE}: {type(e).__name__}: {e}")
         return {}
     saved_at_raw = data.get("saved_at")
     if not saved_at_raw:
@@ -142,7 +142,7 @@ async def yandex_search_urls(query: str) -> list[str]:
                 break
         return urls
     except Exception as e:
-        print(f"[DEBUG] не удалось разобрать ответ Yandex Search: {e}")
+        print(f"[DEBUG] не удалось разобрать ответ Yandex Search: {type(e).__name__}: {e}")
         return []
 
 
@@ -166,7 +166,7 @@ async def collect_web_context(query: str, preferred: list[str]) -> str:
                 print(f"[DEBUG] прочитал {url}, символов: {len(text)}")
                 combined.append(f"Источник {url}:\n{text[:6000]}")
         except Exception as e:
-            print(f"[DEBUG] не удалось открыть {url}: {e}")
+            print(f"[DEBUG] не удалось открыть {url}: {type(e).__name__}: {e}")
         if len(combined) >= 2:
             break
     return "\n\n---\n\n".join(combined)
@@ -209,33 +209,47 @@ async def get_gigachat_token() -> str:
 
 
 async def gigachat_completion(messages: list[dict]) -> str:
+    """До 3 попыток — не только при HTTP 429/401, но и при голом сетевом
+    сбое (таймаут, обрыв соединения) на самом запросе к GigaChat. Раньше
+    такой сбой не ловился здесь вообще и вылетал наверх пустым
+    исключением (str(TimeoutError()) == '') — с виду необъяснимой
+    ошибкой без единой зацепки в логе."""
     async with _gigachat_semaphore:
         for attempt in range(3):
             access_token = await get_gigachat_token()
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                    json={"model": "GigaChat", "messages": messages},
-                    ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    raw = await resp.text()
-                    try:
-                        data = json.loads(raw)
-                    except ValueError:
-                        raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {resp.status}): {raw[:200]}")
-                    if resp.status == 429 and attempt < 2:
-                        print(f"[DEBUG] GigaChat: Too Many Requests, пауза и повтор ({attempt + 1}/3)")
-                        await asyncio.sleep(5 * (attempt + 1))
-                        continue
-                    if resp.status == 401:
-                        _gigachat_token["value"] = None
-                        if attempt < 2:
-                            continue
-                    if resp.status != 200:
-                        raise RuntimeError(data.get("message", f"ошибка запроса, статус {resp.status}"))
-                    return data["choices"][0]["message"]["content"]
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                        json={"model": "GigaChat", "messages": messages},
+                        ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        raw = await resp.text()
+                        status = resp.status
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                print(f"[DEBUG] GigaChat: сетевая ошибка {type(e).__name__}: {e}, попытка {attempt + 1}/3")
+                if attempt < 2:
+                    await asyncio.sleep(5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"GigaChat: сетевая ошибка после 3 попыток: {type(e).__name__}: {e}")
+
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {status}): {raw[:200]}")
+            if status == 429 and attempt < 2:
+                print(f"[DEBUG] GigaChat: Too Many Requests, пауза и повтор ({attempt + 1}/3)")
+                await asyncio.sleep(5 * (attempt + 1))
+                continue
+            if status == 401:
+                _gigachat_token["value"] = None
+                if attempt < 2:
+                    continue
+            if status != 200:
+                raise RuntimeError(data.get("message", f"ошибка запроса, статус {status}"))
+            return data["choices"][0]["message"]["content"]
         raise RuntimeError("GigaChat: превышены попытки после Too Many Requests")
 
 
@@ -421,7 +435,7 @@ async def check_morning(club: dict) -> dict | None:
             "result_sent": False,
         }
     except Exception as e:
-        print(f"[DEBUG] ошибка при утренней проверке {club['name']}: {e}")
+        print(f"[DEBUG] ошибка при утренней проверке {club['name']}: {type(e).__name__}: {e}")
         return None
 
 
@@ -505,7 +519,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         score, outcome = parsed
         return format_result_football(club, score, outcome, rival_hint)
     except Exception as e:
-        print(f"[DEBUG] ошибка при проверке результата {club['name']}: {e}")
+        print(f"[DEBUG] ошибка при проверке результата {club['name']}: {type(e).__name__}: {e}")
         return None
 
 
@@ -577,7 +591,7 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         score, outcome, method = parsed
         return format_result_hockey(club, score, outcome, method, rival_hint)
     except Exception as e:
-        print(f"[DEBUG] ошибка при проверке результата {club['name']}: {e}")
+        print(f"[DEBUG] ошибка при проверке результата {club['name']}: {type(e).__name__}: {e}")
         return None
 
 
@@ -642,7 +656,7 @@ async def send_to_group(bot: Bot, text: str) -> None:
             await bot.send_message(chat_id=MAX_CHAT_ID, text=text)
             return
         except Exception as e:
-            print(f"[DEBUG] попытка {attempt + 1} отправить не удалась: {e}")
+            print(f"[DEBUG] попытка {attempt + 1} отправить не удалась: {type(e).__name__}: {e}")
             if attempt < 2:
                 await asyncio.sleep(10)
     print("[DEBUG] отправить не удалось ни с одной попытки")
