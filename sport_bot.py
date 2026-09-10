@@ -13,14 +13,18 @@
 Хоккей (Автомобилист): ничьих не бывает, отдельно отмечаем победу/
 поражение в овертайме или по буллитам — это важно из-за очков.
 
-ИИ — связка Tavily Search + GigaChat. Раньше здесь был Yandex Search +
+ИИ — связка Tavily Search + Google Gemini. Раньше здесь был Yandex Search +
 собственное скачивание страниц через BeautifulSoup — сравнительный тест
 показал, что Tavily даёт заметно более чистые и точные результаты (Yandex
 как-то отдал ссылку на федерацию настольного тенниса вместо футбольного
 «Арсенала»), плюс сама возвращает очищенный текст, без ручного парсинга
 HTML. Поле "answer" из ответа Tavily НЕ используется — в тесте оно дважды
 путало часовой пояс (мск вместо екб, московское вместо местного) — весь
-разбор по-прежнему делает GigaChat по сырым "content" из источников.
+разбор по-прежнему делает LLM по сырым "content" из источников.
+GigaChat заменён на Gemini: регулярно падал по сетевым таймаутам на
+стороне Sber (наблюдали вживую несколько раз подряд на Урале), а раннер
+GitHub Actions физически не в России — бесплатный внешний API доступен
+без VPN и оказался стабильнее.
 Защита от галлюцинаций (проверено на реальных инцидентах в соседнем
 боте того же стека): поле «Турнир» не может совпадать с именем самого
 клуба, а заявленный соперник должен реально встречаться в собранных
@@ -29,7 +33,7 @@ HTML. Поле "answer" из ответа Tavily НЕ используется �
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
-    GIGACHAT_AUTH_KEY, TAVILY_API_KEY
+    GEMINI_API_KEY, TAVILY_API_KEY
 
 ЗАПУСК:
     python sport_bot.py
@@ -40,7 +44,6 @@ import datetime
 import json
 import os
 import re
-import uuid
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -48,8 +51,9 @@ from maxapi import Bot
 
 MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 MAX_CHAT_ID = int(os.environ["MAX_CHAT_ID"])
-GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
+GEMINI_MODEL = "gemini-2.5-flash"
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 MORNING_HOUR = 10
@@ -135,13 +139,13 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-# --- Поиск (Tavily) и обращение к GigaChat ----------------------------------
+# --- Поиск (Tavily) и обращение к Gemini ------------------------------------
 
 async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     """Поиск через Tavily — сразу очищенный текст, без ручного
     скачивания страниц и парсинга HTML. НЕ используем поле answer —
     оно иногда путает часовые пояса, полагаемся только на content
-    из результатов и отдаём это на разбор GigaChat, как раньше.
+    из результатов и отдаём это на разбор Gemini, как раньше.
 
     include_domains — глобальный TAVILY_INCLUDE_DOMAINS, а не per-club
     sites (последний параметр сейчас не используется внутри функции,
@@ -189,89 +193,63 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     return "\n\n---\n\n".join(combined)
 
 
-_gigachat_token: dict = {"value": None, "expires_at": 0.0}
-_gigachat_token_lock = asyncio.Lock()
-_gigachat_semaphore = asyncio.Semaphore(1)
+_gemini_semaphore = asyncio.Semaphore(1)
 
 
-async def get_gigachat_token() -> str:
-    async with _gigachat_token_lock:
-        now = asyncio.get_event_loop().time()
-        if _gigachat_token["value"] and now < _gigachat_token["expires_at"]:
-            return _gigachat_token["value"]
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                    "RqUID": str(uuid.uuid4()),
-                    "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
-                },
-                data={"scope": "GIGACHAT_API_PERS"},
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                raw = await resp.text()
-                try:
-                    data = json.loads(raw)
-                except ValueError:
-                    raise RuntimeError(f"GigaChat вернул не-JSON ответ на токен (статус {resp.status}): {raw[:200]}")
-                if resp.status != 200:
-                    raise RuntimeError(data.get("message", f"ошибка токена, статус {resp.status}"))
-        _gigachat_token["value"] = data["access_token"]
-        _gigachat_token["expires_at"] = now + 25 * 60
-        print("[DEBUG] получен новый токен GigaChat")
-        return _gigachat_token["value"]
+async def gemini_completion(messages: list[dict]) -> str:
+    """До 3 попыток при сетевом сбое (таймаут, обрыв соединения) или
+    HTTP 429/5xx — тот же паттерн ретраев, что раньше защищал от голого
+    исключения без текста (str(TimeoutError()) == '') при обращении к
+    GigaChat, применяем и здесь на случай нестабильности бесплатного
+    тарифа Gemini.
 
+    messages — тот же псевдо-OpenAI формат (role: system/user), что
+    использовался для GigaChat, чтобы не переписывать вызывающий код;
+    здесь он переводится в формат Gemini (systemInstruction + contents)."""
+    system_text = next((m["content"] for m in messages if m["role"] == "system"), None)
+    contents = [{"role": "user", "parts": [{"text": m["content"]}]} for m in messages if m["role"] != "system"]
+    body = {"contents": contents}
+    if system_text:
+        body["systemInstruction"] = {"parts": [{"text": system_text}]}
 
-async def gigachat_completion(messages: list[dict]) -> str:
-    """До 3 попыток — не только при HTTP 429/401, но и при голом сетевом
-    сбое (таймаут, обрыв соединения) на самом запросе к GigaChat. Раньше
-    такой сбой не ловился здесь вообще и вылетал наверх пустым
-    исключением (str(TimeoutError()) == '') — с виду необъяснимой
-    ошибкой без единой зацепки в логе."""
-    async with _gigachat_semaphore:
+    async with _gemini_semaphore:
         for attempt in range(3):
-            access_token = await get_gigachat_token()
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        json={"model": "GigaChat", "messages": messages},
-                        ssl=False,
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                        headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+                        json=body,
                         timeout=aiohttp.ClientTimeout(total=30),
                     ) as resp:
                         raw = await resp.text()
                         status = resp.status
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                print(f"[DEBUG] GigaChat: сетевая ошибка {type(e).__name__}: {e}, попытка {attempt + 1}/3")
+                print(f"[DEBUG] Gemini: сетевая ошибка {type(e).__name__}: {e}, попытка {attempt + 1}/3")
                 if attempt < 2:
                     await asyncio.sleep(5 * (attempt + 1))
                     continue
-                raise RuntimeError(f"GigaChat: сетевая ошибка после 3 попыток: {type(e).__name__}: {e}")
+                raise RuntimeError(f"Gemini: сетевая ошибка после 3 попыток: {type(e).__name__}: {e}")
 
             try:
                 data = json.loads(raw)
             except ValueError:
-                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {status}): {raw[:200]}")
-            if status == 429 and attempt < 2:
-                print(f"[DEBUG] GigaChat: Too Many Requests, пауза и повтор ({attempt + 1}/3)")
+                raise RuntimeError(f"Gemini вернул не-JSON ответ (статус {status}): {raw[:200]}")
+            if status in (429, 503) and attempt < 2:
+                print(f"[DEBUG] Gemini: статус {status}, пауза и повтор ({attempt + 1}/3)")
                 await asyncio.sleep(5 * (attempt + 1))
                 continue
-            if status == 401:
-                _gigachat_token["value"] = None
-                if attempt < 2:
-                    continue
             if status != 200:
-                raise RuntimeError(data.get("message", f"ошибка запроса, статус {status}"))
-            return data["choices"][0]["message"]["content"]
-        raise RuntimeError("GigaChat: превышены попытки после Too Many Requests")
+                raise RuntimeError(data.get("error", {}).get("message", f"ошибка запроса, статус {status}"))
+            try:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError):
+                raise RuntimeError(f"Gemini вернул ответ без текста (статус {status}): {raw[:300]}")
+        raise RuntimeError("Gemini: превышены попытки после 429/503")
 
 
-async def ask_gigachat_with_context(question: str, context: str, system_extra: str = "") -> str:
-    """Спрашивает GigaChat по уже готовому контексту, без нового похода в
+async def ask_gemini_with_context(question: str, context: str, system_extra: str = "") -> str:
+    """Спрашивает Gemini по уже готовому контексту, без нового похода в
     поиск — используется для повторных попыток: не тратим лишний запрос
     к Tavily на то же самое, раз материалы уже собраны, и вопрос-уточнение
     может быть длинной инструкцией с цитатой прошлого плохого ответа."""
@@ -292,21 +270,21 @@ async def ask_gigachat_with_context(question: str, context: str, system_extra: s
     else:
         system_text += "\n\nВ интернете ничего найти не удалось."
     messages = [{"role": "system", "content": system_text}, {"role": "user", "content": question}]
-    return await gigachat_completion(messages)
+    return await gemini_completion(messages)
 
 
-async def ask_gigachat(question: str, sites: list[str], search_query: str | None = None) -> tuple[str, str]:
-    """Ищет материалы в интернете и спрашивает GigaChat. Возвращает
+async def ask_gemini(question: str, sites: list[str], search_query: str | None = None) -> tuple[str, str]:
+    """Ищет материалы в интернете и спрашивает Gemini. Возвращает
     (ответ, собранный контекст) — контекст нужен, чтобы потом проверить,
     не придумала ли модель факты, и чтобы можно было переспросить без
     нового поиска."""
     context = await collect_web_context_tavily(search_query or question, sites)
-    answer = await ask_gigachat_with_context(question, context)
+    answer = await ask_gemini_with_context(question, context)
     return answer, context
 
 
 def find_data_line(answer: str, min_pipes: int = 2) -> str | None:
-    """GigaChat иногда оформляет ответ markdown-таблицей (шапка + разделитель +
+    """Gemini иногда оформляет ответ markdown-таблицей (шапка + разделитель +
     данные, или наоборот — сначала пояснение, потом НЕТ). Поэтому: сначала
     ищем НЕТ по всему ответу целиком — если есть где угодно, данных нет,
     и не важно, что стоит рядом с шапкой таблицы. Только если НЕТ нигде
@@ -414,7 +392,7 @@ async def check_morning(club: dict) -> dict | None:
         f"Если сегодня матча нет — последней строкой напиши НЕТ."
     )
     try:
-        answer, context = await ask_gigachat(prompt, club["sites"])
+        answer, context = await ask_gemini(prompt, club["sites"])
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (утро): {answer!r}")
         try:
@@ -434,7 +412,7 @@ async def check_morning(club: dict) -> dict | None:
                 f"именно про {club['name']}. Если нет уверенности — одним "
                 f"словом НЕТ."
             )
-            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
+            answer = (await ask_gemini_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (утро, повтор): {answer!r}")
             try:
                 parsed = parse_morning_line(answer, club["name"], context)
@@ -509,7 +487,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
     )
     try:
-        answer, context = await ask_gigachat(prompt, club["sites"])
+        answer, context = await ask_gemini(prompt, club["sites"])
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
@@ -524,7 +502,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
                 f"{club['name']}), а не слово. Если матч ещё не завершился — "
                 f"ответь одним словом НЕТ."
             )
-            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
+            answer = (await ask_gemini_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (результат, повтор): {answer!r}")
             try:
                 parsed = parse_result_line_football(answer)
@@ -581,7 +559,7 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
     )
     try:
-        answer, context = await ask_gigachat(prompt, club["sites"])
+        answer, context = await ask_gemini(prompt, club["sites"])
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
@@ -596,7 +574,7 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
                 f"(сначала {club['name']}), а не слово. Если матч ещё не "
                 f"завершился — ответь одним словом НЕТ."
             )
-            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
+            answer = (await ask_gemini_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (результат, повтор): {answer!r}")
             try:
                 parsed = parse_result_line_hockey(answer)
