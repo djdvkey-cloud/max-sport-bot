@@ -25,15 +25,14 @@ jobs:
           python-version: '3.12'
 
       - name: Установить библиотеки
-        run: pip install maxapi aiohttp beautifulsoup4
+        run: pip install maxapi aiohttp
 
       - name: Проверить матчи и отправить оповещения
         env:
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
           MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
           GIGACHAT_AUTH_KEY: ${{ secrets.GIGACHAT_AUTH_KEY }}
-          YANDEX_API_KEY: ${{ secrets.YANDEX_API_KEY }}
-          YANDEX_FOLDER_ID: ${{ secrets.YANDEX_FOLDER_ID }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
         run: python sport_bot.py
 
       # Сохраняем state (что сегодня играет, отправлен ли результат) между

@@ -13,7 +13,14 @@
 Хоккей (Автомобилист): ничьих не бывает, отдельно отмечаем победу/
 поражение в овертайме или по буллитам — это важно из-за очков.
 
-ИИ — связка Yandex Search + GigaChat, та же, что у остальных ботов.
+ИИ — связка Tavily Search + GigaChat. Раньше здесь был Yandex Search +
+собственное скачивание страниц через BeautifulSoup — сравнительный тест
+показал, что Tavily даёт заметно более чистые и точные результаты (Yandex
+как-то отдал ссылку на федерацию настольного тенниса вместо футбольного
+«Арсенала»), плюс сама возвращает очищенный текст, без ручного парсинга
+HTML. Поле "answer" из ответа Tavily НЕ используется — в тесте оно дважды
+путало часовой пояс (мск вместо екб, московское вместо местного) — весь
+разбор по-прежнему делает GigaChat по сырым "content" из источников.
 Защита от галлюцинаций (проверено на реальных инцидентах в соседнем
 боте того же стека): поле «Турнир» не может совпадать с именем самого
 клуба, а заявленный соперник должен реально встречаться в собранных
@@ -22,31 +29,27 @@
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
-    GIGACHAT_AUTH_KEY, YANDEX_API_KEY, YANDEX_FOLDER_ID
+    GIGACHAT_AUTH_KEY, TAVILY_API_KEY
 
 ЗАПУСК:
     python sport_bot.py
 """
 
 import asyncio
-import base64
 import datetime
 import json
 import os
 import re
 import uuid
-import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from bs4 import BeautifulSoup
 from maxapi import Bot
 
 MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 MAX_CHAT_ID = int(os.environ["MAX_CHAT_ID"])
 GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]
-YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
-YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
+TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 MORNING_HOUR = 10
@@ -111,63 +114,48 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-# --- Поиск (Yandex Search) и обращение к GigaChat --------------------------
+# --- Поиск (Tavily) и обращение к GigaChat ----------------------------------
 
-async def yandex_search_urls(query: str) -> list[str]:
+async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
+    """Поиск через Tavily — сразу очищенный текст, без ручного
+    скачивания страниц и парсинга HTML. НЕ используем поле answer —
+    оно иногда путает часовые пояса, полагаемся только на content
+    из результатов и отдаём это на разбор GigaChat, как раньше."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "https://searchapi.api.cloud.yandex.net/v2/web/search",
-            headers={"Authorization": f"Api-Key {YANDEX_API_KEY}"},
+            "https://api.tavily.com/search",
+            headers={
+                "Authorization": f"Bearer {TAVILY_API_KEY}",
+                "Content-Type": "application/json",
+            },
             json={
-                "query": {"searchType": "SEARCH_TYPE_RU", "queryText": query},
-                "folderId": YANDEX_FOLDER_ID,
-                "responseFormat": "FORMAT_XML",
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 5,
+                "include_domains": sites,
             },
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             raw = await resp.text()
             if resp.status != 200:
-                print(f"[DEBUG] Yandex Search статус={resp.status}, тело={raw[:300]!r}")
-                return []
-    try:
-        data = json.loads(raw)
-        xml_text = base64.b64decode(data["rawData"]).decode("utf-8", errors="ignore")
-        root = ET.fromstring(xml_text)
-        urls = []
-        for doc in root.iter("doc"):
-            url_el = doc.find("url")
-            if url_el is not None and url_el.text:
-                urls.append(url_el.text)
-            if len(urls) >= 4:
-                break
-        return urls
-    except Exception as e:
-        print(f"[DEBUG] не удалось разобрать ответ Yandex Search: {type(e).__name__}: {e}")
-        return []
+                print(f"[DEBUG] Tavily статус={resp.status}, тело={raw[:300]!r}")
+                return ""
+            try:
+                data = json.loads(raw)
+            except ValueError as e:
+                print(f"[DEBUG] не удалось разобрать ответ Tavily: {type(e).__name__}: {e}")
+                return ""
 
-
-async def fetch_page_text(url: str) -> str:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"},
-                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            html = await resp.text()
-    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
-
-
-async def collect_web_context(query: str, preferred: list[str]) -> str:
-    urls = await yandex_search_urls(query)
-    urls.sort(key=lambda u: 0 if any(h in u for h in preferred) else 1)
-    print(f"[DEBUG] поиск «{query}», ссылки: {urls}")
+    results = data.get("results", [])
+    print(f"[DEBUG] Tavily нашёл {len(results)} источников по «{query}»")
     combined = []
-    for url in urls:
-        try:
-            text = await fetch_page_text(url)
-            if len(text) > 500:
-                print(f"[DEBUG] прочитал {url}, символов: {len(text)}")
-                combined.append(f"Источник {url}:\n{text[:6000]}")
-        except Exception as e:
-            print(f"[DEBUG] не удалось открыть {url}: {type(e).__name__}: {e}")
-        if len(combined) >= 2:
+    for r in results[:4]:
+        content = r.get("content", "")
+        url = r.get("url", "")
+        if len(content) > 150:
+            print(f"[DEBUG] источник {url}, символов: {len(content)}")
+            combined.append(f"Источник {url}:\n{content}")
+        if len(combined) >= 3:
             break
     return "\n\n---\n\n".join(combined)
 
@@ -255,9 +243,9 @@ async def gigachat_completion(messages: list[dict]) -> str:
 
 async def ask_gigachat_with_context(question: str, context: str, system_extra: str = "") -> str:
     """Спрашивает GigaChat по уже готовому контексту, без нового похода в
-    Yandex Search — используется для повторных попыток: question там может
-    быть длинной инструкцией с цитатой прошлого плохого ответа, а Yandex
-    Search принимает query_text не длиннее 400 символов."""
+    поиск — используется для повторных попыток: не тратим лишний запрос
+    к Tavily на то же самое, раз материалы уже собраны, и вопрос-уточнение
+    может быть длинной инструкцией с цитатой прошлого плохого ответа."""
     today = datetime.datetime.now(YEKB_TZ).strftime("%d.%m.%Y")
     system_text = (
         f"Сегодня {today}. Отвечай по-русски, строго в запрошенном формате, "
@@ -283,7 +271,7 @@ async def ask_gigachat(question: str, sites: list[str], search_query: str | None
     (ответ, собранный контекст) — контекст нужен, чтобы потом проверить,
     не придумала ли модель факты, и чтобы можно было переспросить без
     нового поиска."""
-    context = await collect_web_context(search_query or question, sites)
+    context = await collect_web_context_tavily(search_query or question, sites)
     answer = await ask_gigachat_with_context(question, context)
     return answer, context
 

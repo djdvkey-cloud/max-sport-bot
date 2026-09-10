@@ -1,3 +1,2 @@
 maxapi
 aiohttp
-beautifulsoup4
