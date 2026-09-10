@@ -82,6 +82,20 @@ CLUBS = [
      "sites": ["acmilan.com", "championat.com", "soccer.ru"]},
 ]
 
+# Глобальный (не per-club) список доменов для Tavily include_domains — по
+# выбору пользователя, вместо неограниченного поиска: тот показал точность
+# выше, чем старые узкие per-club sites, но иногда всё равно промахивался
+# на нерелевантные источники (например, UFC/MMA для Автомобилиста). Список
+# осознанно с запасом на будущее — под расширение числа клубов и добавление
+# КХЛ/НХЛ, поэтому включает источники сверх текущих 6 клубов.
+TAVILY_INCLUDE_DOMAINS = [
+    "hc-avto.ru", "khl.ru", "news.sportbox.ru", "championat.com", "sports.ru",
+    "mfkviz.ru", "superliga.rfs.ru", "rfs.ru", "fnl.pro", "fc-ural.ru",
+    "fapl.ru", "arsenal.com", "legaseriea.it", "realmadrid.com", "acmilan.com",
+    "laliga.com", "sport-express.ru", "ria.ru", "bundesliga.com", "bvb.de",
+    "nhl.ru", "nhl.com", "allhockey.ru", "nhl-news.ru",
+]
+
 
 # --- Хранилище состояния (что сегодня играет) ------------------------------
 
@@ -122,12 +136,13 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     оно иногда путает часовые пояса, полагаемся только на content
     из результатов и отдаём это на разбор GigaChat, как раньше.
 
-    sites (club["sites"]) сюда намеренно НЕ идёт как include_domains:
-    в живом тесте это ограничение резко ухудшало результаты — Tavily
-    находил только устаревшие/нерелевантные страницы внутри трёх старых
-    доменов (подобранных ещё под Yandex), вместо действительно лучших
-    источников (официальные сайты клубов, sofascore, sports.ru и т.п.),
-    которые и показали Tavily с лучшей стороны в исходном сравнении."""
+    include_domains — глобальный TAVILY_INCLUDE_DOMAINS, а не per-club
+    sites (последний параметр сейчас не используется внутри функции,
+    но сохранён в сигнатуре — вызывающий код по-прежнему передаёт
+    club["sites"]). Полностью неограниченный поиск в живом тесте иногда
+    приносил нерелевантные источники (например, UFC/MMA для Автомобилиста);
+    старые узкие per-club sites — наоборот, резко ухудшали результаты.
+    Этот список — осознанный выбор пользователя как компромисс."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://api.tavily.com/search",
@@ -139,6 +154,7 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
                 "query": query,
                 "search_depth": "basic",
                 "max_results": 5,
+                "include_domains": TAVILY_INCLUDE_DOMAINS,
             },
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
