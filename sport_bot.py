@@ -181,12 +181,13 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
 
     results = data.get("results", [])
     print(f"[DEBUG] Tavily нашёл {len(results)} источников по «{query}»")
+    print(f"[DEBUG] все URL от Tavily: {[r.get('url', '') for r in results]}")
     combined = []
     for r in results[:4]:
         content = r.get("content", "")
         url = r.get("url", "")
         if len(content) > 150:
-            print(f"[DEBUG] источник {url}, символов: {len(content)}")
+            print(f"[DEBUG] источник {url}, символов: {len(content)}, фрагмент: {content[:200]!r}")
             combined.append(f"Источник {url}:\n{content}")
         if len(combined) >= 3:
             break
