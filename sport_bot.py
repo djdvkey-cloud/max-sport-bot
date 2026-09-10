@@ -88,8 +88,15 @@ CLUBS = [
 # на нерелевантные источники (например, UFC/MMA для Автомобилиста). Список
 # осознанно с запасом на будущее — под расширение числа клубов и добавление
 # КХЛ/НХЛ, поэтому включает источники сверх текущих 6 клубов.
+#
+# championat.com сюда намеренно НЕ входит: include_domains у Tavily —
+# фильтр по домену целиком, без путей (нет способа ограничить его только
+# разделами /football/ и /hockey/), а в живом тесте этот домен несколько
+# раз приносил статьи не по теме (бокс, теннис, шахматы) для Арсенала
+# и Милана. Остальные домены в списке уже достаточно специализированы
+# по футболу/хоккею, поэтому потеря championat.com не страшна.
 TAVILY_INCLUDE_DOMAINS = [
-    "hc-avto.ru", "khl.ru", "news.sportbox.ru", "championat.com", "sports.ru",
+    "hc-avto.ru", "khl.ru", "news.sportbox.ru", "sports.ru",
     "mfkviz.ru", "superliga.rfs.ru", "rfs.ru", "fnl.pro", "fc-ural.ru",
     "fapl.ru", "arsenal.com", "legaseriea.it", "realmadrid.com", "acmilan.com",
     "laliga.com", "sport-express.ru", "ria.ru", "bundesliga.com", "bvb.de",
