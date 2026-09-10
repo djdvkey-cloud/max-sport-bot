@@ -164,7 +164,7 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
             json={
                 "query": query,
                 "search_depth": "basic",
-                "max_results": 5,
+                "max_results": 8,
                 "include_domains": TAVILY_INCLUDE_DOMAINS,
             },
             timeout=aiohttp.ClientTimeout(total=20),
@@ -183,7 +183,10 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     print(f"[DEBUG] Tavily нашёл {len(results)} источников по «{query}»")
     print(f"[DEBUG] все URL от Tavily: {[r.get('url', '') for r in results]}")
     combined = []
-    for r in results[:4]:
+    # max_results подняли с 5 до 8, и смотрим все 8, а не только первые 4 —
+    # в живом тесте нужный источник (fc-ural.ru) оказался ниже 4-й позиции
+    # (Tavily ставил впереди календари клуба-дубля «Урал-2» и чужих команд).
+    for r in results:
         content = r.get("content", "")
         url = r.get("url", "")
         if len(content) > 150:
@@ -392,8 +395,17 @@ async def check_morning(club: dict) -> dict | None:
         f"указано время в источнике.\n"
         f"Если сегодня матча нет — последней строкой напиши НЕТ."
     )
+    # Отдельный (короче и без инструкций по формату) поисковый запрос —
+    # с явным уточнением «основная команда»: полнотекстовый prompt выше
+    # в качестве поискового запроса путал Tavily, тот путал клуб с его
+    # дублирующим составом (например, «Урал» с «Урал-2») и вместо
+    # официального сайта клуба приносил чужие календари.
+    search_query = (
+        f"{club['name']} официальный сайт расписание ближайший матч "
+        f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
+    )
     try:
-        answer, context = await ask_gemini(prompt, club["sites"])
+        answer, context = await ask_gemini(prompt, club["sites"], search_query)
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (утро): {answer!r}")
         try:
@@ -487,8 +499,12 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         f"{club['name']}.\n"
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
     )
+    search_query = (
+        f"{club['name']} против {rival_hint} счёт результат сегодня "
+        f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
+    )
     try:
-        answer, context = await ask_gemini(prompt, club["sites"])
+        answer, context = await ask_gemini(prompt, club["sites"], search_query)
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
@@ -559,8 +575,12 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         f"(овертайм) или БУЛЛИТЫ.\n"
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
     )
+    search_query = (
+        f"{club['name']} против {rival_hint} счёт результат сегодня "
+        f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
+    )
     try:
-        answer, context = await ask_gemini(prompt, club["sites"])
+        answer, context = await ask_gemini(prompt, club["sites"], search_query)
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
