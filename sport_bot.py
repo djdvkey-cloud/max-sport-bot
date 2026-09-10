@@ -120,7 +120,14 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     """Поиск через Tavily — сразу очищенный текст, без ручного
     скачивания страниц и парсинга HTML. НЕ используем поле answer —
     оно иногда путает часовые пояса, полагаемся только на content
-    из результатов и отдаём это на разбор GigaChat, как раньше."""
+    из результатов и отдаём это на разбор GigaChat, как раньше.
+
+    sites (club["sites"]) сюда намеренно НЕ идёт как include_domains:
+    в живом тесте это ограничение резко ухудшало результаты — Tavily
+    находил только устаревшие/нерелевантные страницы внутри трёх старых
+    доменов (подобранных ещё под Yandex), вместо действительно лучших
+    источников (официальные сайты клубов, sofascore, sports.ru и т.п.),
+    которые и показали Tavily с лучшей стороны в исходном сравнении."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://api.tavily.com/search",
@@ -132,7 +139,6 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
                 "query": query,
                 "search_depth": "basic",
                 "max_results": 5,
-                "include_domains": sites,
             },
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
