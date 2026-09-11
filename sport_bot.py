@@ -68,16 +68,22 @@ TZ_OFFSET = {"мск": 3, "москва": 3, "екб": 5, "екатеринбу�
 # icon: 🏒 хоккей, ⚽ футбол, 🥅 футзал
 CLUBS = [
     {"key": "avtomobilist", "name": "ХК «Автомобилист»", "sport": "hockey", "icon": "🏒",
+     "aliases": ["Автомобилист", "Avtomobilist"],
      "sites": ["khl.ru", "hc-avto.ru", "championat.com"]},
     {"key": "sinara", "name": "МФК «Синара»", "sport": "futsal", "icon": "🥅",
+     "aliases": ["Синара", "Sinara"],
      "sites": ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru"]},
     {"key": "ural", "name": "ФК «Урал»", "sport": "football", "icon": "⚽",
+     "aliases": ["Урал", "Ural"],
      "sites": ["fc-ural.ru", "fnl.pro", "championat.com"]},
     {"key": "real", "name": "«Реал Мадрид»", "sport": "football", "icon": "⚽",
+     "aliases": ["Реал Мадрид", "Real Madrid"],
      "sites": ["realmadrid.com", "championat.com", "soccer.ru"]},
     {"key": "arsenal", "name": "«Арсенал» Лондон", "sport": "football", "icon": "⚽",
+     "aliases": ["Арсенал", "Arsenal"],
      "sites": ["arsenal.com", "championat.com", "soccer.ru"]},
     {"key": "milan", "name": "«Милан»", "sport": "football", "icon": "⚽",
+     "aliases": ["Милан", "Milan", "AC Milan"],
      "sites": ["acmilan.com", "championat.com", "soccer.ru"]},
 ]
 
@@ -88,14 +94,8 @@ CLUBS = [
 # осознанно с запасом на будущее — под расширение числа клубов и добавление
 # КХЛ/НХЛ, поэтому включает источники сверх текущих 6 клубов.
 #
-# championat.com сюда намеренно НЕ входит: include_domains у Tavily —
-# фильтр по домену целиком, без путей (нет способа ограничить его только
-# разделами /football/ и /hockey/), а в живом тесте этот домен несколько
-# раз приносил статьи не по теме (бокс, теннис, шахматы) для Арсенала
-# и Милана. Остальные домены в списке уже достаточно специализированы
-# по футболу/хоккею, поэтому потеря championat.com не страшна.
 TAVILY_INCLUDE_DOMAINS = [
-    "hc-avto.ru", "khl.ru", "news.sportbox.ru", "sports.ru",
+    "hc-avto.ru", "khl.ru", "championat.com", "news.sportbox.ru", "sports.ru",
     "mfkviz.ru", "superliga.rfs.ru", "rfs.ru", "fnl.pro", "fc-ural.ru",
     "fapl.ru", "arsenal.com", "legaseriea.it", "realmadrid.com", "acmilan.com",
     "laliga.com", "sport-express.ru", "ria.ru", "bundesliga.com", "bvb.de",
@@ -252,7 +252,10 @@ async def ask_deepseek_with_context(question: str, context: str, system_extra: s
         f"но обязательно указывай пояс словом «мск» или «екб».\n"
         f"Никогда не придумывай факты, которых нет в материалах ниже. Если по "
         f"материалам нельзя точно и однозначно установить ответ — считай, что "
-        f"события нет, и отвечай «НЕТ», а не давай предположительный ответ."
+        f"события нет, и отвечай «НЕТ», а не давай предположительный ответ.\n"
+        f"Учитывай только основную взрослую команду указанного клуба. Всегда "
+        f"игнорируй U-19/U-21/U-23, молодёжные, юношеские, резервные, вторые, "
+        f"женские команды, дубли и академии, даже если они стоят выше в выдаче."
     )
     if system_extra:
         system_text += f"\n{system_extra}"
@@ -292,8 +295,121 @@ def find_data_line(answer: str, min_pipes: int = 2) -> str | None:
     return None
 
 
-def looks_like_score(text: str) -> bool:
-    return bool(re.search(r"\d+\s*[:\-]\s*\d+", text))
+FORBIDDEN_SQUAD_RE = re.compile(
+    r"(?:\b(?:u|ю)\s*[-–—]?\s*\d{1,2}\b|"
+    r"\b(?:молод[её]ж\w*|юнош\w*|резерв\w*|дубл\w*|академ\w*|"
+    r"фарм[-\s]?клуб\w*|женск\w*|youth\w*|junior\w*|reserve\w*|"
+    r"academy\w*|women\w*|ladies\w*)\b|"
+    r"\b(?:вторая|резервная)\s+команд\w*\b)",
+    re.IGNORECASE,
+)
+SECOND_TEAM_SUFFIX_RE = re.compile(r"(?:[-–—]\s*2\b|\s+ii\b|\s+b\s*$)", re.IGNORECASE)
+
+
+def has_forbidden_squad_label(*texts: str) -> bool:
+    """Программный запрет на матчи неосновных составов."""
+    return any(
+        FORBIDDEN_SQUAD_RE.search(text or "")
+        or SECOND_TEAM_SUFFIX_RE.search(text or "")
+        for text in texts
+    )
+
+
+def answer_says_no(answer: str) -> bool:
+    return any(
+        line.strip().upper() == "НЕТ"
+        for line in answer.splitlines()
+        if line.strip()
+    )
+
+
+def normalize_team_name(text: str) -> str:
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[«»\"'().,]", " ", text)
+    text = re.sub(r"[-–—_/]+", " ", text)
+    words = re.findall(r"[а-яa-z0-9]+", text)
+    generic = {"фк", "хк", "мфк", "fc", "hc", "cf", "afc", "club"}
+    return " ".join(word for word in words if word not in generic)
+
+
+def team_name_matches(reported: str, expected_names: list[str]) -> bool:
+    """Сопоставляет русское/латинское имя команды и допускает клубные префиксы."""
+    reported_norm = normalize_team_name(reported)
+    if not reported_norm:
+        return False
+    reported_tokens = set(reported_norm.split())
+    for expected in expected_names:
+        expected_norm = normalize_team_name(expected)
+        if not expected_norm:
+            continue
+        if reported_norm == expected_norm:
+            return True
+        if len(expected_norm) >= 4 and (
+            reported_norm in expected_norm or expected_norm in reported_norm
+        ):
+            return True
+        expected_tokens = {token for token in expected_norm.split() if len(token) >= 4}
+        if expected_tokens and reported_tokens & expected_tokens:
+            return True
+    return False
+
+
+def parse_goals(text: str) -> int:
+    if not re.fullmatch(r"\d{1,2}", text.strip()):
+        raise ValueError(f"число голов имеет неверный формат: {text!r}")
+    return int(text)
+
+
+def score_pair_mentioned(first: int, second: int, context: str) -> bool:
+    """Проверяет счёт в исходном порядке источника, включая переносы строк."""
+    if not context:
+        return False
+    pattern = rf"(?<!\d){first}\s*[:\-–—]\s*{second}(?!\d)"
+    return bool(re.search(pattern, context))
+
+
+def resolve_reported_result(
+    team1: str,
+    goals1_raw: str,
+    team2: str,
+    goals2_raw: str,
+    club: dict,
+    rival_hint: str,
+    context: str,
+) -> tuple[str, str]:
+    """Проверяет участников и сам вычисляет исход с точки зрения нашего клуба."""
+    if has_forbidden_squad_label(team1, team2):
+        raise ValueError(f"обнаружен неосновной состав: {team1!r} — {team2!r}")
+
+    goals1 = parse_goals(goals1_raw)
+    goals2 = parse_goals(goals2_raw)
+    if not score_pair_mentioned(goals1, goals2, context):
+        raise ValueError(
+            f"счёт {goals1}:{goals2} в указанном порядке не подтверждается материалами"
+        )
+
+    club_names = [club["name"], *club.get("aliases", [])]
+    team1_is_club = team_name_matches(team1, club_names)
+    team2_is_club = team_name_matches(team2, club_names)
+    team1_is_rival = team_name_matches(team1, [rival_hint])
+    team2_is_rival = team_name_matches(team2, [rival_hint])
+
+    if team1_is_club and team2_is_rival and not team2_is_club:
+        club_goals, rival_goals = goals1, goals2
+    elif team2_is_club and team1_is_rival and not team1_is_club:
+        club_goals, rival_goals = goals2, goals1
+    else:
+        raise ValueError(
+            f"пары команд не совпадают с ожидаемыми: {team1!r} — {team2!r}"
+        )
+
+    if club_goals > rival_goals:
+        outcome = "ПОБЕДА"
+    elif club_goals == rival_goals:
+        outcome = "НИЧЬЯ"
+    else:
+        outcome = "ПОРАЖЕНИЕ"
+    return f"{club_goals}:{rival_goals}", outcome
 
 
 def looks_like_own_name(tournament: str, club_name: str) -> bool:
@@ -362,6 +478,8 @@ def parse_morning_line(answer: str, club_name: str, context: str):
     if len(parts) < 5:
         raise ValueError(f"меньше 5 полей: {parts!r}")
     tournament, time_str, zone_str, place, rival = parts[:5]
+    if FORBIDDEN_SQUAD_RE.search(tournament) or has_forbidden_squad_label(rival):
+        raise ValueError("обнаружен матч молодёжного, резервного или второго состава")
     if looks_like_own_name(tournament, club_name):
         raise ValueError(f"поле «Турнир» похоже на имя клуба/матча, не турнира: {tournament!r}")
     if not rival_mentioned(rival, context):
@@ -380,6 +498,9 @@ async def check_morning(club: dict) -> dict | None:
         f"Турнир|ЧЧ:ММ|ПОЯС|Место|Соперник\n"
         f"ПОЯС — слово «мск» или «екб» в зависимости от того, в каком поясе "
         f"указано время в источнике.\n"
+        f"Учитывай ТОЛЬКО основную взрослую команду. Матчи U-19/U-21/U-23, "
+        f"молодёжных, юношеских, резервных, вторых, женских команд, дублей "
+        f"и академий считать матчами клуба НЕЛЬЗЯ.\n"
         f"Если сегодня матча нет — последней строкой напиши НЕТ."
     )
     # Отдельный (короче и без инструкций по формату) поисковый запрос —
@@ -404,6 +525,8 @@ async def check_morning(club: dict) -> dict | None:
                 f"соперника, которого нет в материалах выше, или в поле "
                 f"«Турнир» указал название самого клуба вместо названия "
                 f"соревнования — не годится: {answer!r}.\n"
+                f"Любой матч U-19/U-21/U-23, молодёжной, юношеской, резервной, "
+                f"второй или женской команды, дубля или академии запрещён.\n"
                 f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений, строго "
                 f"в виде «Турнир|ЧЧ:ММ|ПОЯС|Место|Соперник». «Турнир» — это "
                 f"название соревнования (например «Лига чемпионов»), а НЕ "
@@ -458,20 +581,19 @@ async def job_morning(bot: Bot) -> None:
 
 # --- Проверка результата ----------------------------------------------------
 
-def parse_result_line_football(answer: str) -> tuple[str, str] | None:
-    """Возвращает (Счёт, Исход). None — матч искренне ещё не завершился.
-    Бросает ValueError, если строка нашлась, но поле счёта не похоже на
-    счёт — стоит переспросить у модели ещё раз."""
-    line = find_data_line(answer, min_pipes=1)
+def parse_result_line_football(
+    answer: str, club: dict, rival_hint: str, context: str
+) -> tuple[str, str] | None:
+    """Возвращает счёт клуба и вычисленный программой исход."""
+    line = find_data_line(answer, min_pipes=3)
     if line is None:
-        return None
+        if answer_says_no(answer):
+            return None
+        raise ValueError("нет строки результата из 4 полей")
     parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 2:
-        raise ValueError(f"меньше 2 полей: {parts!r}")
-    score, outcome = parts[0], parts[1].upper()
-    if not looks_like_score(score):
-        raise ValueError(f"поле счёта не похоже на счёт: {score!r}")
-    return score, outcome
+    if len(parts) < 4:
+        raise ValueError(f"меньше 4 полей: {parts!r}")
+    return resolve_reported_result(*parts[:4], club, rival_hint, context)
 
 
 async def check_result_football(club: dict, rival_hint: str) -> str | None:
@@ -480,10 +602,9 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         f"Завершился ли сегодня, {today:%d.%m.%Y}, матч {club['name']} "
         f"против {rival_hint}? Если да, найди точный счёт.\n"
         f"Ответь СТРОГО последней строкой:\n"
-        f"Счёт|ИСХОД\n"
-        f"Счёт — в формате число:число (сначала {club['name']}). "
-        f"ИСХОД — одно слово: ПОБЕДА, НИЧЬЯ или ПОРАЖЕНИЕ, с точки зрения "
-        f"{club['name']}.\n"
+        f"Команда 1|Голы 1|Команда 2|Голы 2\n"
+        f"Команды и голы укажи в том же порядке, как в источнике. Голы — "
+        f"только целые числа. Исход матча не пиши: программа вычислит его сама.\n"
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
     )
     search_query = (
@@ -495,21 +616,22 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
-            parsed = parse_result_line_football(answer)
+            parsed = parse_result_line_football(answer, club, rival_hint, context)
         except ValueError as e:
             print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз (тот же контекст, без нового поиска)")
             retry_extra = (
                 f"Твой предыдущий ответ был в неправильном формате — не "
                 f"годится: {answer!r}.\n"
                 f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений, строго "
-                f"в виде «Счёт|ИСХОД». Счёт — именно число:число (сначала "
-                f"{club['name']}), а не слово. Если матч ещё не завершился — "
+                f"в виде «Команда 1|Голы 1|Команда 2|Голы 2». Сохрани порядок "
+                f"команд и счёта из источника; голы — только числа. Не пиши "
+                f"исход матча. Если матч ещё не завершился — "
                 f"ответь одним словом НЕТ."
             )
             answer = (await ask_deepseek_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (результат, повтор): {answer!r}")
             try:
-                parsed = parse_result_line_football(answer)
+                parsed = parse_result_line_football(answer, club, rival_hint, context)
             except ValueError as e2:
                 print(f"[DEBUG] {club['name']}: после повтора всё ещё не разобралось ({e2}), пропускаю")
                 return None
@@ -532,19 +654,24 @@ def format_result_football(club: dict, score: str, outcome: str, rival: str) -> 
     return f"{head}\n\n{club['icon']} {club['name']} {score} {rival}"
 
 
-def parse_result_line_hockey(answer: str) -> tuple[str, str, str] | None:
-    """Возвращает (Счёт, Исход, Способ). None — матч искренне ещё не
-    завершился. Бросает ValueError при нехватке полей или счёте не
-    похожем на счёт."""
-    line = find_data_line(answer, min_pipes=2)
+def parse_result_line_hockey(
+    answer: str, club: dict, rival_hint: str, context: str
+) -> tuple[str, str, str] | None:
+    """Возвращает счёт клуба, вычисленный исход и способ завершения."""
+    line = find_data_line(answer, min_pipes=4)
     if line is None:
-        return None
+        if answer_says_no(answer):
+            return None
+        raise ValueError("нет строки результата из 5 полей")
     parts = [p.strip() for p in line.split("|")]
-    if len(parts) < 3:
-        raise ValueError(f"меньше 3 полей: {parts!r}")
-    score, outcome, method = parts[0], parts[1].upper(), parts[2].upper()
-    if not looks_like_score(score):
-        raise ValueError(f"поле счёта не похоже на счёт: {score!r}")
+    if len(parts) < 5:
+        raise ValueError(f"меньше 5 полей: {parts!r}")
+    score, outcome = resolve_reported_result(*parts[:4], club, rival_hint, context)
+    if outcome == "НИЧЬЯ":
+        raise ValueError("для хоккейного матча получен ничейный итоговый счёт")
+    method = parts[4].upper()
+    if method not in {"ОСНОВНОЕ", "ОТ", "БУЛЛИТЫ"}:
+        raise ValueError(f"неизвестный способ завершения матча: {method!r}")
     return score, outcome, method
 
 
@@ -555,9 +682,9 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         f"против {rival_hint}? Если да, найди точный счёт и способ "
         f"завершения матча.\n"
         f"Ответь СТРОГО последней строкой:\n"
-        f"Счёт|ИСХОД|СПОСОБ\n"
-        f"Счёт — число:число (сначала {club['name']}). ИСХОД — ПОБЕДА или "
-        f"ПОРАЖЕНИЕ с точки зрения {club['name']} (в КХЛ ничьих не бывает). "
+        f"Команда 1|Голы 1|Команда 2|Голы 2|СПОСОБ\n"
+        f"Команды и голы укажи в том же порядке, как в источнике. Голы — "
+        f"только целые числа. Исход программа вычислит сама. "
         f"СПОСОБ — одно слово: ОСНОВНОЕ (решилось в основное время), ОТ "
         f"(овертайм) или БУЛЛИТЫ.\n"
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
@@ -571,21 +698,22 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
-            parsed = parse_result_line_hockey(answer)
+            parsed = parse_result_line_hockey(answer, club, rival_hint, context)
         except ValueError as e:
             print(f"[DEBUG] {club['name']}: {e}, переспрашиваю ещё раз (тот же контекст, без нового поиска)")
             retry_extra = (
                 f"Твой предыдущий ответ был в неправильном формате — не "
                 f"годится: {answer!r}.\n"
                 f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений, строго "
-                f"в виде «Счёт|ИСХОД|СПОСОБ». Счёт — именно число:число "
-                f"(сначала {club['name']}), а не слово. Если матч ещё не "
+                f"в виде «Команда 1|Голы 1|Команда 2|Голы 2|СПОСОБ». Сохрани "
+                f"порядок команд и счёта из источника; голы — только числа. "
+                f"Не пиши исход матча. Если матч ещё не "
                 f"завершился — ответь одним словом НЕТ."
             )
             answer = (await ask_deepseek_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (результат, повтор): {answer!r}")
             try:
-                parsed = parse_result_line_hockey(answer)
+                parsed = parse_result_line_hockey(answer, club, rival_hint, context)
             except ValueError as e2:
                 print(f"[DEBUG] {club['name']}: после повтора всё ещё не разобралось ({e2}), пропускаю")
                 return None
