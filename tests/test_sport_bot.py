@@ -89,6 +89,14 @@ class ResultSafetyTests(unittest.TestCase):
                 "Урал-2 — Рубин-2",
             )
 
+    def test_u19_morning_match_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "молодёжного"):
+            sport_bot.parse_morning_line(
+                "Первенство молодежных команд|15:00|мск|Казань|Рубин U-19",
+                self.ural["name"],
+                "Рубин U-19 — Урал U-19",
+            )
+
     def test_hockey_away_win_is_reordered(self):
         parsed = sport_bot.parse_result_line_hockey(
             "Нефтехимик|2|Avtomobilist|3|ОТ",
