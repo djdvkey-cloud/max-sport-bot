@@ -13,14 +13,14 @@
 Хоккей (Автомобилист): ничьих не бывает, отдельно отмечаем победу/
 поражение в овертайме или по буллитам — это важно из-за очков.
 
-ИИ — связка Tavily Search + GigaChat. Раньше здесь был Yandex Search +
+ИИ — связка Tavily Search + DeepSeek. Раньше здесь был Yandex Search +
 собственное скачивание страниц через BeautifulSoup — сравнительный тест
 показал, что Tavily даёт заметно более чистые и точные результаты (Yandex
 как-то отдал ссылку на федерацию настольного тенниса вместо футбольного
 «Арсенала»), плюс сама возвращает очищенный текст, без ручного парсинга
 HTML. Поле "answer" из ответа Tavily НЕ используется — в тесте оно дважды
 путало часовой пояс (мск вместо екб, московское вместо местного) — весь
-разбор по-прежнему делает GigaChat по сырым "content" из источников.
+разбор по-прежнему делает DeepSeek по сырым "content" из источников.
 Защита от галлюцинаций (проверено на реальных инцидентах в соседнем
 боте того же стека): поле «Турнир» не может совпадать с именем самого
 клуба, а заявленный соперник должен реально встречаться в собранных
@@ -29,7 +29,7 @@ HTML. Поле "answer" из ответа Tavily НЕ используется �
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
-    GIGACHAT_AUTH_KEY, TAVILY_API_KEY
+    DEEPSEEK_API_KEY, TAVILY_API_KEY
 
 ЗАПУСК:
     python sport_bot.py
@@ -40,7 +40,6 @@ import datetime
 import json
 import os
 import re
-import uuid
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -48,7 +47,7 @@ from maxapi import Bot
 
 MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 MAX_CHAT_ID = int(os.environ["MAX_CHAT_ID"])
-GIGACHAT_AUTH_KEY = os.environ["GIGACHAT_AUTH_KEY"]
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
@@ -135,13 +134,13 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-# --- Поиск (Tavily) и обращение к GigaChat ----------------------------------
+# --- Поиск (Tavily) и обращение к DeepSeek ----------------------------------
 
 async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     """Поиск через Tavily — сразу очищенный текст, без ручного
     скачивания страниц и парсинга HTML. НЕ используем поле answer —
     оно иногда путает часовые пояса, полагаемся только на content
-    из результатов и отдаём это на разбор GigaChat, как раньше.
+    из результатов и отдаём это на разбор DeepSeek, как раньше.
 
     include_domains — глобальный TAVILY_INCLUDE_DOMAINS, а не per-club
     sites (последний параметр сейчас не используется внутри функции,
@@ -199,89 +198,49 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     return "\n\n---\n\n".join(combined)
 
 
-_gigachat_token: dict = {"value": None, "expires_at": 0.0}
-_gigachat_token_lock = asyncio.Lock()
-_gigachat_semaphore = asyncio.Semaphore(1)
-
-
-async def get_gigachat_token() -> str:
-    async with _gigachat_token_lock:
-        now = asyncio.get_event_loop().time()
-        if _gigachat_token["value"] and now < _gigachat_token["expires_at"]:
-            return _gigachat_token["value"]
+async def deepseek_completion(messages: list[dict]) -> str:
+    """Вызов DeepSeek через OpenAI-совместимый API с постоянным ключом."""
+    try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+                "https://api.deepseek.com/chat/completions",
                 headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "application/json",
-                    "RqUID": str(uuid.uuid4()),
-                    "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
                 },
-                data={"scope": "GIGACHAT_API_PERS"},
-                ssl=False,
-                timeout=aiohttp.ClientTimeout(total=20),
+                json={
+                    "model": "deepseek-v4-flash",
+                    "messages": messages,
+                    "stream": False,
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 raw = await resp.text()
-                try:
-                    data = json.loads(raw)
-                except ValueError:
-                    raise RuntimeError(f"GigaChat вернул не-JSON ответ на токен (статус {resp.status}): {raw[:200]}")
-                if resp.status != 200:
-                    raise RuntimeError(data.get("message", f"ошибка токена, статус {resp.status}"))
-        _gigachat_token["value"] = data["access_token"]
-        _gigachat_token["expires_at"] = now + 25 * 60
-        print("[DEBUG] получен новый токен GigaChat")
-        return _gigachat_token["value"]
+                status = resp.status
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        raise RuntimeError(f"DeepSeek: сетевая ошибка {type(e).__name__}: {e}") from e
+
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise RuntimeError(
+            f"DeepSeek вернул не-JSON ответ (статус {status}): {raw[:200]}"
+        ) from e
+    if status != 200:
+        error = data.get("error", {})
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        raise RuntimeError(message or f"DeepSeek: ошибка запроса, статус {status}")
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"DeepSeek вернул неожиданный ответ: {raw[:200]}") from e
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("DeepSeek вернул пустой ответ")
+    return content
 
 
-async def gigachat_completion(messages: list[dict]) -> str:
-    """До 3 попыток — не только при HTTP 429/401, но и при голом сетевом
-    сбое (таймаут, обрыв соединения) на самом запросе к GigaChat. Раньше
-    такой сбой не ловился здесь вообще и вылетал наверх пустым
-    исключением (str(TimeoutError()) == '') — с виду необъяснимой
-    ошибкой без единой зацепки в логе."""
-    async with _gigachat_semaphore:
-        for attempt in range(3):
-            access_token = await get_gigachat_token()
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        json={"model": "GigaChat", "messages": messages},
-                        ssl=False,
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as resp:
-                        raw = await resp.text()
-                        status = resp.status
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                print(f"[DEBUG] GigaChat: сетевая ошибка {type(e).__name__}: {e}, попытка {attempt + 1}/3")
-                if attempt < 2:
-                    await asyncio.sleep(5 * (attempt + 1))
-                    continue
-                raise RuntimeError(f"GigaChat: сетевая ошибка после 3 попыток: {type(e).__name__}: {e}")
-
-            try:
-                data = json.loads(raw)
-            except ValueError:
-                raise RuntimeError(f"GigaChat вернул не-JSON ответ (статус {status}): {raw[:200]}")
-            if status == 429 and attempt < 2:
-                print(f"[DEBUG] GigaChat: Too Many Requests, пауза и повтор ({attempt + 1}/3)")
-                await asyncio.sleep(5 * (attempt + 1))
-                continue
-            if status == 401:
-                _gigachat_token["value"] = None
-                if attempt < 2:
-                    continue
-            if status != 200:
-                raise RuntimeError(data.get("message", f"ошибка запроса, статус {status}"))
-            return data["choices"][0]["message"]["content"]
-        raise RuntimeError("GigaChat: превышены попытки после Too Many Requests")
-
-
-async def ask_gigachat_with_context(question: str, context: str, system_extra: str = "") -> str:
-    """Спрашивает GigaChat по уже готовому контексту, без нового похода в
+async def ask_deepseek_with_context(question: str, context: str, system_extra: str = "") -> str:
+    """Спрашивает DeepSeek по уже готовому контексту, без нового похода в
     поиск — используется для повторных попыток: не тратим лишний запрос
     к Tavily на то же самое, раз материалы уже собраны, и вопрос-уточнение
     может быть длинной инструкцией с цитатой прошлого плохого ответа."""
@@ -302,21 +261,21 @@ async def ask_gigachat_with_context(question: str, context: str, system_extra: s
     else:
         system_text += "\n\nВ интернете ничего найти не удалось."
     messages = [{"role": "system", "content": system_text}, {"role": "user", "content": question}]
-    return await gigachat_completion(messages)
+    return await deepseek_completion(messages)
 
 
-async def ask_gigachat(question: str, sites: list[str], search_query: str | None = None) -> tuple[str, str]:
-    """Ищет материалы в интернете и спрашивает GigaChat. Возвращает
+async def ask_deepseek(question: str, sites: list[str], search_query: str | None = None) -> tuple[str, str]:
+    """Ищет материалы в интернете и спрашивает DeepSeek. Возвращает
     (ответ, собранный контекст) — контекст нужен, чтобы потом проверить,
     не придумала ли модель факты, и чтобы можно было переспросить без
     нового поиска."""
     context = await collect_web_context_tavily(search_query or question, sites)
-    answer = await ask_gigachat_with_context(question, context)
+    answer = await ask_deepseek_with_context(question, context)
     return answer, context
 
 
 def find_data_line(answer: str, min_pipes: int = 2) -> str | None:
-    """GigaChat иногда оформляет ответ markdown-таблицей (шапка + разделитель +
+    """Модель иногда оформляет ответ markdown-таблицей (шапка + разделитель +
     данные, или наоборот — сначала пояснение, потом НЕТ). Поэтому: сначала
     ищем НЕТ по всему ответу целиком — если есть где угодно, данных нет,
     и не важно, что стоит рядом с шапкой таблицы. Только если НЕТ нигде
@@ -433,7 +392,7 @@ async def check_morning(club: dict) -> dict | None:
         f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
     )
     try:
-        answer, context = await ask_gigachat(prompt, club["sites"], search_query)
+        answer, context = await ask_deepseek(prompt, club["sites"], search_query)
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (утро): {answer!r}")
         try:
@@ -453,7 +412,7 @@ async def check_morning(club: dict) -> dict | None:
                 f"именно про {club['name']}. Если нет уверенности — одним "
                 f"словом НЕТ."
             )
-            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
+            answer = (await ask_deepseek_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (утро, повтор): {answer!r}")
             try:
                 parsed = parse_morning_line(answer, club["name"], context)
@@ -532,7 +491,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
     )
     try:
-        answer, context = await ask_gigachat(prompt, club["sites"], search_query)
+        answer, context = await ask_deepseek(prompt, club["sites"], search_query)
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
@@ -547,7 +506,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
                 f"{club['name']}), а не слово. Если матч ещё не завершился — "
                 f"ответь одним словом НЕТ."
             )
-            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
+            answer = (await ask_deepseek_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (результат, повтор): {answer!r}")
             try:
                 parsed = parse_result_line_football(answer)
@@ -608,7 +567,7 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
     )
     try:
-        answer, context = await ask_gigachat(prompt, club["sites"], search_query)
+        answer, context = await ask_deepseek(prompt, club["sites"], search_query)
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
@@ -623,7 +582,7 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
                 f"(сначала {club['name']}), а не слово. Если матч ещё не "
                 f"завершился — ответь одним словом НЕТ."
             )
-            answer = (await ask_gigachat_with_context(prompt, context, retry_extra)).strip()
+            answer = (await ask_deepseek_with_context(prompt, context, retry_extra)).strip()
             print(f"[DEBUG] {club['name']} (результат, повтор): {answer!r}")
             try:
                 parsed = parse_result_line_hockey(answer)
