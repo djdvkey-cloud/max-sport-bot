@@ -49,6 +49,12 @@ MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 MAX_CHAT_ID = int(os.environ["MAX_CHAT_ID"])
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
+# Тихий тестовый режим — вся логика (поиск, разбор, сохранение состояния)
+# работает как обычно, меняется только последний шаг: send_to_group не
+# шлёт в реальный MAX-чат, а печатает текст в лог. Нужен, чтобы гонять
+# ручные проверки без риска задублировать реальные сообщения (как было
+# несколько раз за один день с Автомобилистом при живой отладке).
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 MORNING_HOUR = 10
@@ -872,6 +878,9 @@ async def job_check_results(bot: Bot) -> None:
 # --- Отправка и точка входа -------------------------------------------------
 
 async def send_to_group(bot: Bot, text: str) -> None:
+    if DRY_RUN:
+        print(f"[DRY RUN] было бы отправлено:\n{text}")
+        return
     for attempt in range(3):
         try:
             await bot.send_message(chat_id=MAX_CHAT_ID, text=text)

@@ -18,6 +18,11 @@ on:
           - auto
           - morning
           - results
+      dry_run:
+        description: 'Тихий режим — не слать в реальный MAX-чат, только печатать в лог что было бы отправлено'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -49,6 +54,7 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           FORCE_MODE: ${{ github.event.inputs.mode }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: python sport_bot.py
 
       # Сохраняем state (что сегодня играет, отправлен ли результат) между
