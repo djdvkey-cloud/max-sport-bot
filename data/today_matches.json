@@ -1,5 +1,5 @@
 {
-  "saved_at": "2026-09-13T16:56:31.772340+05:00",
+  "saved_at": "2026-09-13T19:10:43.078395+05:00",
   "avtomobilist": {
     "tournament": "КХЛ",
     "time": "13:30",
@@ -16,6 +16,6 @@
     "place": "Екатеринбург, ДИВС",
     "rival": "Сибиряк",
     "start_utc": "2026-09-13T07:00:00+00:00",
-    "result_sent": false
+    "result_sent": true
   }
 }
