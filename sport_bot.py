@@ -270,12 +270,23 @@ async def collect_web_context_tavily(query: str, sites: list[str], extract_urls:
     # max_results подняли с 5 до 8, и смотрим все 8, а не только первые 4 —
     # в живом тесте нужный источник (fc-ural.ru) оказался ниже 4-й позиции
     # (Tavily ставил впереди календари клуба-дубля «Урал-2» и чужих команд).
-    for r in results:
+    #
+    # Живой прогон 13.09.2026 показал ещё один случай той же болезни: для
+    # Синары среди 8 источников были и страница самого матча
+    # (superliga.rfs.ru/match/...), и новость «итоги матча» — но обе стояли
+    # ниже двух страниц с составами игроков (там счёта нет в принципе), а
+    # код брал первые 2 подряд по порядку Tavily и на этом останавливался —
+    # DeepSeek получал только составы и честно отвечал «НЕТ», хотя счёт уже
+    # был опубликован. Поэтому сначала берём источники, где в тексте похоже
+    # на счёт матча (цифра:цифра), и только потом — остальные по порядку.
+    score_pattern = re.compile(r"\b\d{1,2}\s*[:\-]\s*\d{1,2}\b")
+    candidates = [r for r in results if len(r.get("content", "")) > 150]
+    candidates.sort(key=lambda r: 0 if score_pattern.search(r.get("content", "")) else 1)
+    for r in candidates:
         content = r.get("content", "")
         url = r.get("url", "")
-        if len(content) > 150:
-            print(f"[DEBUG] источник {url}, символов: {len(content)}, фрагмент: {content[:200]!r}")
-            combined.append(f"Источник {url}:\n{content}")
+        print(f"[DEBUG] источник {url}, символов: {len(content)}, фрагмент: {content[:200]!r}")
+        combined.append(f"Источник {url}:\n{content}")
         if len(combined) >= 3:
             break
     return "\n\n---\n\n".join(combined)
