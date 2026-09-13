@@ -84,15 +84,25 @@ TZ_OFFSET = {"мск": 3, "москва": 3, "екб": 5, "екатеринбу�
 CLUBS = [
     {"key": "avtomobilist", "name": "ХК «Автомобилист»", "sport": "hockey", "icon": "🏒",
      "aliases": ["Автомобилист", "Avtomobilist"],
-     "sites": ["khl.ru", "hc-avto.ru", "championat.com"]},
+     "sites": ["khl.ru", "hc-avto.ru", "championat.com"],
+     # Живой инцидент 13.09.2026: Tavily Search раз за разом приносил
+     # только архивные календарные страницы news.sportbox.ru без разбора
+     # конкретной игры (khl.ru отдаёт 403 боту, туда напрямую тоже не
+     # достучаться). sports.ru/.../calendar/ — стабильная, серверно
+     # отрендеренная страница с историей результатов и статусом
+     # "завершен" — проверено вручную, содержит точный счёт сразу после
+     # финального свистка. Забираем её напрямую (см. extract_urls_tavily
+     # / fetch_url_direct), в обход и поиска, и кэша Tavily.
+     "extract_urls": ["https://www.sports.ru/hockey/club/avtomobilist/calendar/"]},
     {"key": "sinara", "name": "МФК «Синара»", "sport": "futsal", "icon": "🥅",
      "aliases": ["Синара", "Sinara"],
      "sites": ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru"],
      # mfkviz.ru — собственный сайт клуба — Tavily Search стабильно не
      # ранжирует нужный раздел в топ выдачи, сколько ни меняй текст
      # запроса (пробовали search_hint — не помогло). Поэтому вдобавок
-     # забираем страницу клуба на сайте лиги НАПРЯМУЮ через Tavily
-     # Extract, в обход ранжирования — см. extract_urls_tavily().
+     # забираем страницу клуба на сайте лиги НАПРЯМУЮ (см.
+     # extract_urls_tavily / fetch_url_direct), в обход и ранжирования
+     # поиска, и (что оказалось важнее) собственного кэша Tavily.
      "search_hint": "БЕТСИТИ Суперлига мини-футбол",
      "extract_urls": ["https://superliga.rfs.ru/team/1258508"]},
     {"key": "ural", "name": "ФК «Урал»", "sport": "football", "icon": "⚽",
@@ -166,50 +176,70 @@ def save_state(state: dict) -> None:
 
 # --- Поиск (Tavily) и обращение к DeepSeek ----------------------------------
 
+def html_to_text(html: str) -> str:
+    """Грубая, но достаточная очистка HTML до читаемого текста — без
+    внешних зависимостей вроде BeautifulSoup (её сейчас нет в зависимостях,
+    раньше была — см. историю в шапке файла)."""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", "\n", text)
+    text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
+            .replace("&laquo;", "«").replace("&raquo;", "»")
+            .replace("&mdash;", "—").replace("&ndash;", "–").replace("&quot;", '"'))
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
+async def fetch_url_direct(url: str) -> str:
+    """Скачивает страницу НАПРЯМУЮ по HTTP, в обход Tavily — своя очистка
+    HTML в текст вместо Tavily Extract.
+
+    Живой инцидент 13.09.2026: Tavily Search и даже Tavily Extract (тот
+    самый метод, что был здесь раньше именно ради обхода их же поискового
+    ранжирования) отдавали устаревший закэшированный вариант страницы
+    Синары («-:-» вместо реального счёта), хотя сам сайт уже был обновлён.
+    Прямой запрос в обход Tavily сработал мгновенно и точно — у Tavily
+    свой отдельный слой кэширования/индексации, который не поспевает за
+    часто обновляемыми спортивными страницами. Раз URL уже известен заранее
+    (extract_urls per club) — искать и кэшировать через Tavily незачем,
+    можно просто скачать самим."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SportBot/1.0; +sport-bot)"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[DEBUG] прямой фетч {url}: статус {resp.status}")
+                    return ""
+                raw = await resp.read()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        print(f"[DEBUG] прямой фетч {url}: {type(e).__name__}: {e}")
+        return ""
+    html = raw.decode("utf-8", errors="ignore")
+    return html_to_text(html)
+
+
 async def extract_urls_tavily(urls: list[str]) -> list[str]:
-    """Забирает содержимое конкретных URL напрямую через Tavily Extract —
-    в обход поискового ранжирования. Нужно для источников, которые Tavily
-    Search стабильно не выбирает в топ выдачи, сколько ни меняй текст
-    запроса (проверено на mfkviz.ru/superliga.rfs.ru для Синары — обычный
-    поиск раз за разом приносил только общие страницы клуба, хотя нужная
-    страница лиги технически доступна и есть в белом списке доменов)."""
+    """Забирает содержимое конкретных, заранее известных URL напрямую по
+    HTTP (см. fetch_url_direct) — не через Tavily. Нужно для источников,
+    которые Tavily Search стабильно не выбирает в топ выдачи, сколько ни
+    меняй текст запроса (проверено на mfkviz.ru/superliga.rfs.ru для
+    Синары — обычный поиск раз за разом приносил только общие страницы
+    клуба, хотя нужная страница лиги технически доступна)."""
     if not urls:
         return []
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.tavily.com/extract",
-            headers={
-                "Authorization": f"Bearer {TAVILY_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"urls": urls, "extract_depth": "advanced", "format": "text"},
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            raw = await resp.text()
-            if resp.status != 200:
-                print(f"[DEBUG] Tavily Extract статус={resp.status}, тело={raw[:300]!r}")
-                return []
-            try:
-                data = json.loads(raw)
-            except ValueError as e:
-                print(f"[DEBUG] не удалось разобрать ответ Tavily Extract: {type(e).__name__}: {e}")
-                return []
-
-    for failed in data.get("failed_results", []):
-        print(f"[DEBUG] Tavily Extract не смог забрать {failed.get('url')}: {failed.get('error')}")
     out = []
-    for r in data.get("results", []):
-        content = r.get("raw_content", "")
-        url = r.get("url", "")
+    for url in urls:
+        content = await fetch_url_direct(url)
         if content:
-            print(f"[DEBUG] extract {url}, символов: {len(content)}")
-            # Без обрезки: это заведомо релевантная страница (не топ-8 из
-            # общего поиска), а нужная строка расписания/результата может
-            # оказаться в любом месте длинного дампа страницы — обрезка до
-            # 3000 символов в живом тесте срезала её раньше, чем модель
-            # успевала до неё дойти (Синара 13.09, счёт 6:4 был на странице,
-            # но модель ответила "НЕТ", не увидев его в обрезанном тексте).
+            print(f"[DEBUG] прямой фетч {url}, символов: {len(content)}")
+            # Без обрезки: это заведомо релевантная страница, а нужная
+            # строка расписания/результата может оказаться в любом месте
+            # дампа страницы.
             out.append(f"Источник {url}:\n{content}")
+        else:
+            print(f"[DEBUG] прямой фетч {url}: пусто")
     return out
 
 
