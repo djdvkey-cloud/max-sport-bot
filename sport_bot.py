@@ -280,9 +280,6 @@ async def collect_web_context_tavily(query: str, sites: list[str], extract_urls:
     # был опубликован. Поэтому сначала берём источники, где в тексте похоже
     # на счёт матча (цифра:цифра), и только потом — остальные по порядку.
     score_pattern = re.compile(r"\b\d{1,2}\s*[:\-]\s*\d{1,2}\b")
-    for r in results:
-        c = r.get("content", "")
-        print(f"[DEBUG-TMP] {r.get('url','')} len={len(c)} score_match={bool(score_pattern.search(c))} full={c!r}")
     candidates = [r for r in results if len(r.get("content", "")) > 150]
     candidates.sort(key=lambda r: 0 if score_pattern.search(r.get("content", "")) else 1)
     for r in candidates:
