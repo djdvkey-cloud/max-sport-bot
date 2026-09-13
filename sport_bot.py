@@ -107,16 +107,25 @@ CLUBS = [
      "extract_urls": ["https://superliga.rfs.ru/team/1258508"]},
     {"key": "ural", "name": "ФК «Урал»", "sport": "football", "icon": "⚽",
      "aliases": ["Урал", "Ural"],
-     "sites": ["fc-ural.ru", "fnl.pro", "championat.com"]},
+     "sites": ["fc-ural.ru", "fnl.pro", "championat.com"],
+     # 13.09.2026: тот же принцип для всех 6 клубов — известная стабильная
+     # серверно отрендеренная страница sports.ru/.../calendar/ забирается
+     # напрямую (extract_urls_tavily / fetch_url_direct), в обход и
+     # поиска, и кэша Tavily. Проверено вручную на всех 4 клубах ниже:
+     # чистый текст, счёт + статус "завершен" сразу после матча.
+     "extract_urls": ["https://www.sports.ru/football/club/ural/calendar/"]},
     {"key": "real", "name": "«Реал Мадрид»", "sport": "football", "icon": "⚽",
      "aliases": ["Реал Мадрид", "Real Madrid"],
-     "sites": ["realmadrid.com", "championat.com", "soccer.ru"]},
+     "sites": ["realmadrid.com", "championat.com", "soccer.ru"],
+     "extract_urls": ["https://www.sports.ru/football/club/real/calendar/"]},
     {"key": "arsenal", "name": "«Арсенал» Лондон", "sport": "football", "icon": "⚽",
      "aliases": ["Арсенал", "Arsenal"],
-     "sites": ["arsenal.com", "championat.com", "soccer.ru"]},
+     "sites": ["arsenal.com", "championat.com", "soccer.ru"],
+     "extract_urls": ["https://www.sports.ru/football/club/arsenal/calendar/"]},
     {"key": "milan", "name": "«Милан»", "sport": "football", "icon": "⚽",
      "aliases": ["Милан", "Milan", "AC Milan"],
-     "sites": ["acmilan.com", "championat.com", "soccer.ru"]},
+     "sites": ["acmilan.com", "championat.com", "soccer.ru"],
+     "extract_urls": ["https://www.sports.ru/football/club/milan/calendar/"]},
 ]
 
 # Глобальный (не per-club) список доменов для Tavily include_domains — по
@@ -709,6 +718,14 @@ async def job_morning(bot: Bot) -> None:
         match = await check_morning(club)
         if not match:
             continue
+        # Не затираем уже подтверждённую отправку результата, если это
+        # повторный ручной прогон "morning" в тот же день (например, для
+        # диагностики): без этого club["key"] безусловно перезаписывался
+        # бы свежей записью с result_sent=False, и следующая проверка
+        # результатов отправила бы уже отправленный результат повторно.
+        existing = state.get(club["key"])
+        if existing and existing.get("result_sent"):
+            match["result_sent"] = True
         state[club["key"]] = match
         await send_to_group(bot, format_morning(club, match))
     save_state(state)
