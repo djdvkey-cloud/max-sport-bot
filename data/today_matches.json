@@ -1,5 +1,5 @@
 {
-  "saved_at": "2026-09-13T19:30:11.102590+05:00",
+  "saved_at": "2026-09-13T19:33:24.886584+05:00",
   "avtomobilist": {
     "tournament": "КХЛ",
     "time": "13:30",
@@ -7,7 +7,7 @@
     "place": "не указано",
     "rival": "Сибирь",
     "start_utc": "2026-09-13T10:30:00+00:00",
-    "result_sent": false
+    "result_sent": true
   },
   "sinara": {
     "tournament": "БЕТСИТИ Суперлига",
