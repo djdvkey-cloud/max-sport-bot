@@ -81,7 +81,13 @@ CLUBS = [
      "sites": ["khl.ru", "hc-avto.ru", "championat.com"]},
     {"key": "sinara", "name": "МФК «Синара»", "sport": "futsal", "icon": "🥅",
      "aliases": ["Синара", "Sinara"],
-     "sites": ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru"]},
+     "sites": ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru"],
+     # mfkviz.ru — собственный сайт клуба — Tavily стабильно не может
+     # вытащить со своей стороны сам календарь/результаты (только общие
+     # страницы клуба), при том что superliga.rfs.ru (сайт лиги) уже есть
+     # в белом списке доменов. Добавляем название лиги прямо в текст
+     # поискового запроса, чтобы Tavily охотнее ранжировал именно его.
+     "search_hint": "БЕТСИТИ Суперлига мини-футбол"},
     {"key": "ural", "name": "ФК «Урал»", "sport": "football", "icon": "⚽",
      "aliases": ["Урал", "Ural"],
      "sites": ["fc-ural.ru", "fnl.pro", "championat.com"]},
@@ -528,6 +534,7 @@ async def check_morning(club: dict) -> dict | None:
     search_query = (
         f"{club['name']} официальный сайт расписание ближайший матч "
         f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
+        + (f" {club['search_hint']}" if club.get("search_hint") else "")
     )
     try:
         answer, context = await ask_deepseek(prompt, club["sites"], search_query)
@@ -627,6 +634,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
     search_query = (
         f"{club['name']} против {rival_hint} счёт результат сегодня "
         f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
+        + (f" {club['search_hint']}" if club.get("search_hint") else "")
     )
     try:
         answer, context = await ask_deepseek(prompt, club["sites"], search_query)
@@ -709,6 +717,7 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
     search_query = (
         f"{club['name']} против {rival_hint} счёт результат сегодня "
         f"{today:%d.%m.%Y} основная команда, не дубль и не молодёжный состав"
+        + (f" {club['search_hint']}" if club.get("search_hint") else "")
     )
     try:
         answer, context = await ask_deepseek(prompt, club["sites"], search_query)
