@@ -82,12 +82,13 @@ CLUBS = [
     {"key": "sinara", "name": "МФК «Синара»", "sport": "futsal", "icon": "🥅",
      "aliases": ["Синара", "Sinara"],
      "sites": ["superliga.rfs.ru", "mfkviz.ru", "futsal.rfs.ru"],
-     # mfkviz.ru — собственный сайт клуба — Tavily стабильно не может
-     # вытащить со своей стороны сам календарь/результаты (только общие
-     # страницы клуба), при том что superliga.rfs.ru (сайт лиги) уже есть
-     # в белом списке доменов. Добавляем название лиги прямо в текст
-     # поискового запроса, чтобы Tavily охотнее ранжировал именно его.
-     "search_hint": "БЕТСИТИ Суперлига мини-футбол"},
+     # mfkviz.ru — собственный сайт клуба — Tavily Search стабильно не
+     # ранжирует нужный раздел в топ выдачи, сколько ни меняй текст
+     # запроса (пробовали search_hint — не помогло). Поэтому вдобавок
+     # забираем страницу клуба на сайте лиги НАПРЯМУЮ через Tavily
+     # Extract, в обход ранжирования — см. extract_urls_tavily().
+     "search_hint": "БЕТСИТИ Суперлига мини-футбол",
+     "extract_urls": ["https://superliga.rfs.ru/team/1258508"]},
     {"key": "ural", "name": "ФК «Урал»", "sport": "football", "icon": "⚽",
      "aliases": ["Урал", "Ural"],
      "sites": ["fc-ural.ru", "fnl.pro", "championat.com"]},
@@ -159,7 +160,48 @@ def save_state(state: dict) -> None:
 
 # --- Поиск (Tavily) и обращение к DeepSeek ----------------------------------
 
-async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
+async def extract_urls_tavily(urls: list[str]) -> list[str]:
+    """Забирает содержимое конкретных URL напрямую через Tavily Extract —
+    в обход поискового ранжирования. Нужно для источников, которые Tavily
+    Search стабильно не выбирает в топ выдачи, сколько ни меняй текст
+    запроса (проверено на mfkviz.ru/superliga.rfs.ru для Синары — обычный
+    поиск раз за разом приносил только общие страницы клуба, хотя нужная
+    страница лиги технически доступна и есть в белом списке доменов)."""
+    if not urls:
+        return []
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.tavily.com/extract",
+            headers={
+                "Authorization": f"Bearer {TAVILY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"urls": urls, "extract_depth": "advanced", "format": "text"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            raw = await resp.text()
+            if resp.status != 200:
+                print(f"[DEBUG] Tavily Extract статус={resp.status}, тело={raw[:300]!r}")
+                return []
+            try:
+                data = json.loads(raw)
+            except ValueError as e:
+                print(f"[DEBUG] не удалось разобрать ответ Tavily Extract: {type(e).__name__}: {e}")
+                return []
+
+    for failed in data.get("failed_results", []):
+        print(f"[DEBUG] Tavily Extract не смог забрать {failed.get('url')}: {failed.get('error')}")
+    out = []
+    for r in data.get("results", []):
+        content = r.get("raw_content", "")
+        url = r.get("url", "")
+        if content:
+            print(f"[DEBUG] extract {url}, символов: {len(content)}")
+            out.append(f"Источник {url}:\n{content[:3000]}")
+    return out
+
+
+async def collect_web_context_tavily(query: str, sites: list[str], extract_urls: list[str] | None = None) -> str:
     """Поиск через Tavily — сразу очищенный текст, без ручного
     скачивания страниц и парсинга HTML. НЕ используем поле answer —
     оно иногда путает часовые пояса, полагаемся только на content
@@ -171,7 +213,13 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
     club["sites"]). Полностью неограниченный поиск в живом тесте иногда
     приносил нерелевантные источники (например, UFC/MMA для Автомобилиста);
     старые узкие per-club sites — наоборот, резко ухудшали результаты.
-    Этот список — осознанный выбор пользователя как компромисс."""
+    Этот список — осознанный выбор пользователя как компромисс.
+
+    extract_urls — известные заранее адреса (club["extract_urls"]), которые
+    подмешиваются В НАЧАЛО контекста через Tavily Extract, независимо от
+    того, что вернул обычный поиск — гарантирует, что модель увидит именно
+    эту страницу, а не только то, что Tavily Search решил проранжировать."""
+    extracted = await extract_urls_tavily(extract_urls or [])
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://api.tavily.com/search",
@@ -196,17 +244,17 @@ async def collect_web_context_tavily(query: str, sites: list[str]) -> str:
             raw = await resp.text()
             if resp.status != 200:
                 print(f"[DEBUG] Tavily статус={resp.status}, тело={raw[:300]!r}")
-                return ""
+                return "\n\n---\n\n".join(extracted)
             try:
                 data = json.loads(raw)
             except ValueError as e:
                 print(f"[DEBUG] не удалось разобрать ответ Tavily: {type(e).__name__}: {e}")
-                return ""
+                return "\n\n---\n\n".join(extracted)
 
     results = data.get("results", [])
     print(f"[DEBUG] Tavily нашёл {len(results)} источников по «{query}»")
     print(f"[DEBUG] все URL от Tavily: {[r.get('url', '') for r in results]}")
-    combined = []
+    combined = list(extracted)
     # max_results подняли с 5 до 8, и смотрим все 8, а не только первые 4 —
     # в живом тесте нужный источник (fc-ural.ru) оказался ниже 4-й позиции
     # (Tavily ставил впереди календари клуба-дубля «Урал-2» и чужих команд).
@@ -290,12 +338,17 @@ async def ask_deepseek_with_context(question: str, context: str, system_extra: s
     return await deepseek_completion(messages)
 
 
-async def ask_deepseek(question: str, sites: list[str], search_query: str | None = None) -> tuple[str, str]:
+async def ask_deepseek(
+    question: str,
+    sites: list[str],
+    search_query: str | None = None,
+    extract_urls: list[str] | None = None,
+) -> tuple[str, str]:
     """Ищет материалы в интернете и спрашивает DeepSeek. Возвращает
     (ответ, собранный контекст) — контекст нужен, чтобы потом проверить,
     не придумала ли модель факты, и чтобы можно было переспросить без
     нового поиска."""
-    context = await collect_web_context_tavily(search_query or question, sites)
+    context = await collect_web_context_tavily(search_query or question, sites, extract_urls)
     answer = await ask_deepseek_with_context(question, context)
     return answer, context
 
@@ -537,7 +590,7 @@ async def check_morning(club: dict) -> dict | None:
         + (f" {club['search_hint']}" if club.get("search_hint") else "")
     )
     try:
-        answer, context = await ask_deepseek(prompt, club["sites"], search_query)
+        answer, context = await ask_deepseek(prompt, club["sites"], search_query, club.get("extract_urls"))
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (утро): {answer!r}")
         try:
@@ -637,7 +690,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         + (f" {club['search_hint']}" if club.get("search_hint") else "")
     )
     try:
-        answer, context = await ask_deepseek(prompt, club["sites"], search_query)
+        answer, context = await ask_deepseek(prompt, club["sites"], search_query, club.get("extract_urls"))
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
@@ -720,7 +773,7 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         + (f" {club['search_hint']}" if club.get("search_hint") else "")
     )
     try:
-        answer, context = await ask_deepseek(prompt, club["sites"], search_query)
+        answer, context = await ask_deepseek(prompt, club["sites"], search_query, club.get("extract_urls"))
         answer = answer.strip()
         print(f"[DEBUG] {club['name']} (результат): {answer!r}")
         try:
@@ -828,6 +881,16 @@ async def main():
     # не дожидаясь нужного часа. На расписании (schedule) эта переменная
     # всегда пустая, и режим определяется как обычно, по текущему часу.
     force_mode = os.environ.get("FORCE_MODE", "").strip().lower()
+    if force_mode == "test_sinara":
+        # Одноразовая точечная проверка фикса с extract_urls для Синары —
+        # только check_morning для одного клуба, БЕЗ send_to_group, чтобы
+        # не плодить лишние сообщения в чат (Автомобилист в те же сутки
+        # уже несколько раз находился и слался повторно при обычных
+        # ручных прогонах morning). Убрать эту ветку после проверки.
+        club = next(c for c in CLUBS if c["key"] == "sinara")
+        match = await check_morning(club)
+        print(f"[DEBUG] test_sinara результат: {match!r}")
+        return
     if force_mode == "morning":
         run_morning = True
         print("[DEBUG] режим принудительно установлен: morning (ручная проверка)")
