@@ -24,6 +24,7 @@ on:
           - auto
           - morning
           - results
+          - manual_send_sinara
       dry_run:
         description: 'Тихий режим — не слать в реальный MAX-чат, только печатать в лог что было бы отправлено'
         required: false
