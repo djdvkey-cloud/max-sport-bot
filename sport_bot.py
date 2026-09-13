@@ -197,7 +197,6 @@ async def extract_urls_tavily(urls: list[str]) -> list[str]:
         url = r.get("url", "")
         if content:
             print(f"[DEBUG] extract {url}, символов: {len(content)}")
-            print(f"[DEBUG] extract содержимое целиком: {content!r}")
             # Без обрезки: это заведомо релевантная страница (не топ-8 из
             # общего поиска), а нужная строка расписания/результата может
             # оказаться в любом месте длинного дампа страницы — обрезка до
