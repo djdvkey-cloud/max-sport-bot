@@ -8,5 +8,14 @@
     "rival": "Сибирь",
     "start_utc": "2026-09-13T10:30:00+00:00",
     "result_sent": false
+  },
+  "sinara": {
+    "tournament": "Суперлига 2026/27",
+    "time": "12:00",
+    "zone": "мск",
+    "place": "ДИВС, Екатеринбург",
+    "rival": "Сибиряк",
+    "start_utc": "2026-09-13T09:00:00+00:00",
+    "result_sent": false
   }
 }

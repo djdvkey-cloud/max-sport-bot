@@ -18,7 +18,6 @@ on:
           - auto
           - morning
           - results
-          - test_sinara
 
 permissions:
   contents: write

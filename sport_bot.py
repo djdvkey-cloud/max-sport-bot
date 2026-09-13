@@ -881,16 +881,6 @@ async def main():
     # не дожидаясь нужного часа. На расписании (schedule) эта переменная
     # всегда пустая, и режим определяется как обычно, по текущему часу.
     force_mode = os.environ.get("FORCE_MODE", "").strip().lower()
-    if force_mode == "test_sinara":
-        # Одноразовая точечная проверка фикса с extract_urls для Синары —
-        # только check_morning для одного клуба, БЕЗ send_to_group, чтобы
-        # не плодить лишние сообщения в чат (Автомобилист в те же сутки
-        # уже несколько раз находился и слался повторно при обычных
-        # ручных прогонах morning). Убрать эту ветку после проверки.
-        club = next(c for c in CLUBS if c["key"] == "sinara")
-        match = await check_morning(club)
-        print(f"[DEBUG] test_sinara результат: {match!r}")
-        return
     if force_mode == "morning":
         run_morning = True
         print("[DEBUG] режим принудительно установлен: morning (ручная проверка)")
