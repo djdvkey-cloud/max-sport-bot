@@ -907,8 +907,16 @@ async def job_check_results(bot: Bot) -> None:
 
         if text:
             await send_to_group(bot, text)
-            match["result_sent"] = True
-            changed = True
+            # DRY_RUN ничего реально не отправляет (см. send_to_group) —
+            # нельзя помечать result_sent, иначе следующий боевой прогон
+            # молча пропустит уже "найденный", но так и не отправленный
+            # результат (ровно это и случилось 13.09.2026 с Автомобилистом:
+            # тестовый прогон между двумя дозвонами пометил найденный
+            # результат отправленным, и боевой прогон сразу после него
+            # решил, что делать нечего).
+            if not DRY_RUN:
+                match["result_sent"] = True
+                changed = True
         else:
             print(f"[DEBUG] {club['name']}: результата пока нет, попробуем в следующий раз")
 
