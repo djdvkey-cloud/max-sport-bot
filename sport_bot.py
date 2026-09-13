@@ -918,6 +918,32 @@ async def main():
     elif force_mode == "results":
         run_morning = False
         print("[DEBUG] режим принудительно установлен: results (ручная проверка)")
+    elif force_mode == "manual_send_sinara":
+        # Временно: Tavily (и Search, и Extract) отдаёт устаревший кэш
+        # страницы Синары («-:-»), хотя на живом сайте уже опубликован
+        # реальный счёт 6:4 (подтверждено прямым запросом в обход Tavily,
+        # 13.09.2026). Шлём подтверждённый результат вручную тем же путём
+        # и в том же формате, что и обычная автоматика, чтобы не ждать,
+        # пока у Tavily обновится индекс. Убрать после использования.
+        bot = Bot(MAX_BOT_TOKEN)
+        try:
+            text = format_result_football(
+                next(c for c in CLUBS if c["key"] == "sinara"), "6:4", "ПОБЕДА", "Сибиряк"
+            )
+            await send_to_group(bot, text)
+            state = load_state()
+            if state.get("sinara"):
+                state["sinara"]["result_sent"] = True
+                save_state(state)
+        finally:
+            session = getattr(bot, "session", None)
+            if session is not None:
+                close = getattr(session, "close", None)
+                if close:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+        return
     else:
         run_morning = now.hour == MORNING_HOUR
 
