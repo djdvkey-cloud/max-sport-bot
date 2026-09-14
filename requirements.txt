@@ -1,4 +1,2 @@
-aiogram
-apscheduler
+maxapi
 aiohttp
-beautifulsoup4
