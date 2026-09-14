@@ -1,14 +1,25 @@
 """
-Спортивный бот для группы в MAX — версия 2.
+Спортивный бот для группы в MAX — версия 3, постоянный процесс на Amvera.
 
 6 клубов: Автомобилист (КХЛ), Синара, Урал, Реал Мадрид, Арсенал Лондон, Милан.
 Любые официальные турниры. Без турнирных таблиц — только результат.
 
+14.09.2026 перенесли с GitHub Actions cron на постоянный процесс: утро
+14.09.2026 показало, что GitHub Actions может молча не запустить scheduled
+job вообще (без единой ошибки в логах) — расписание `0 5 * * *` просто не
+сработало, оповещение по Уралу чуть не потерялось. Постоянный процесс сам
+следит за временем и не зависит от чужого внешнего расписания — тот же
+принцип уже проверен на соседнем боте того же стека (myach-bot), который
+именно поэтому стабильно работает на Amvera.
+
 10:00 ЕКБ — если клуб играет сегодня, подробное оповещение с временем
             начала, местом и соперником; время старта сохраняется.
-Каждые 20 минут (13:00-22:00 UTC ≈ 16:00-01:00 ЕКБ) — проверка: если
-с начала сохранённого матча прошло 2,5 часа и результат ещё не
-отправлен, ищем счёт и шлём сообщение с нужной эмоцией.
+            Один раз в сутки (дедуп через LAST_MORNING_FILE).
+Каждые 20 минут — проверка: если с начала сохранённого матча прошло
+2,5 часа и результат ещё не отправлен, ищем счёт и шлём сообщение с
+нужной эмоцией. Раньше это было ограничено окном 8-22 UTC (нужно было
+для GitHub Actions cron) — постоянному процессу такое ограничение уже не
+нужно, проверяем круглосуточно.
 
 Хоккей (Автомобилист): ничьих не бывает, отдельно отмечаем победу/
 поражение в овертайме или по буллитам — это важно из-за очков.
@@ -31,7 +42,7 @@ HTML. Поле "answer" из ответа Tavily НЕ используется �
     MAX_BOT_TOKEN, MAX_CHAT_ID,
     DEEPSEEK_API_KEY, TAVILY_API_KEY
 
-ЗАПУСК:
+ЗАПУСК (постоянный процесс, сам следит за временем — не нужен внешний cron):
     python sport_bot.py
 """
 
@@ -59,8 +70,14 @@ DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 MORNING_HOUR = 10
 RESULT_DELAY_HOURS = 2.5
+CHECK_INTERVAL_SECONDS = 20 * 60
 
-DATA_FILE = "data/today_matches.json"   # что сегодня играет и отправлен ли результат
+# На Amvera — постоянный диск /data (как у myach-bot), переживает рестарты
+# и пересборки контейнера; локально (тесты, отладка на своей машине) —
+# обычная папка data/ рядом со скриптом.
+DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "data")
+DATA_FILE = os.path.join(DATA_DIR, "today_matches.json")   # что сегодня играет и отправлен ли результат
+LAST_MORNING_FILE = os.path.join(DATA_DIR, "last_morning.txt")   # дедуп: утро уже было сегодня
 # Утренний прогон (10:00 ЕКБ) должен пережить проверки результатов вплоть до
 # раннего утра следующих суток — поздние вечерние матчи (22:00+ мск) с учётом
 # RESULT_DELAY_HOURS проверяются уже ПОСЛЕ полуночи по Екатеринбургу, то есть
@@ -958,30 +975,79 @@ async def send_to_group(bot: Bot, text: str) -> None:
     print("[DEBUG] отправить не удалось ни с одной попытки")
 
 
-async def main():
-    now = datetime.datetime.now(YEKB_TZ)
-    print(f"[DEBUG] сейчас по Екатеринбургу: {now:%d.%m.%Y %H:%M}")
+def load_last_morning_date() -> datetime.date | None:
+    if not os.path.exists(LAST_MORNING_FILE):
+        return None
+    try:
+        with open(LAST_MORNING_FILE, "r", encoding="utf-8") as f:
+            return datetime.date.fromisoformat(f.read().strip())
+    except Exception:
+        return None
 
-    # FORCE_MODE — только для ручного запуска (workflow_dispatch input
-    # mode=morning/results), чтобы можно было проверить конкретную ветку
-    # не дожидаясь нужного часа. На расписании (schedule) эта переменная
-    # всегда пустая, и режим определяется как обычно, по текущему часу.
+
+def save_last_morning_date(day: datetime.date) -> None:
+    os.makedirs(os.path.dirname(LAST_MORNING_FILE), exist_ok=True)
+    with open(LAST_MORNING_FILE, "w", encoding="utf-8") as f:
+        f.write(day.isoformat())
+
+
+async def scheduler_loop(bot: Bot) -> None:
+    """Основной цикл постоянного процесса: раз в CHECK_INTERVAL_SECONDS
+    проверяет, не пора ли утреннее оповещение (раз в сутки, по часу, с
+    дедупом через LAST_MORNING_FILE — иначе прогон повторялся бы каждый
+    тик, пока идёт 10-й час), и на каждом тике — проверку результатов
+    (сама job_check_results решает по каждому клубу, рано ли ещё)."""
+    last_morning = load_last_morning_date()
+    while True:
+        now = datetime.datetime.now(YEKB_TZ)
+        today = now.date()
+        print(f"[DEBUG] тик планировщика: {now:%d.%m.%Y %H:%M}")
+
+        if now.hour == MORNING_HOUR and last_morning != today:
+            try:
+                await job_morning(bot)
+                last_morning = today
+                save_last_morning_date(today)
+            except Exception as e:
+                print(f"[DEBUG] ошибка утренней проверки: {type(e).__name__}: {e}")
+
+        try:
+            await job_check_results(bot)
+        except Exception as e:
+            print(f"[DEBUG] ошибка проверки результатов: {type(e).__name__}: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+async def main():
+    print(f"Постоянный запуск спортивного бота {datetime.datetime.now(YEKB_TZ)}")
+
+    # FORCE_MODE — разовый прогон конкретной ветки и выход, для ручной
+    # отладки после редеплоя (без этого пришлось бы ждать нужного часа
+    # или полного цикла CHECK_INTERVAL_SECONDS). На постоянной работе не
+    # используется — там всегда пусто, и работает scheduler_loop.
     force_mode = os.environ.get("FORCE_MODE", "").strip().lower()
-    if force_mode == "morning":
-        run_morning = True
-        print("[DEBUG] режим принудительно установлен: morning (ручная проверка)")
-    elif force_mode == "results":
-        run_morning = False
-        print("[DEBUG] режим принудительно установлен: results (ручная проверка)")
-    else:
-        run_morning = now.hour == MORNING_HOUR
+    if force_mode in ("morning", "results"):
+        print(f"[DEBUG] режим принудительно установлен: {force_mode} (разовая ручная проверка)")
+        bot = Bot(MAX_BOT_TOKEN)
+        try:
+            if force_mode == "morning":
+                await job_morning(bot)
+            else:
+                await job_check_results(bot)
+        finally:
+            session = getattr(bot, "session", None)
+            if session is not None:
+                close = getattr(session, "close", None)
+                if close:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+        return
 
     bot = Bot(MAX_BOT_TOKEN)
     try:
-        if run_morning:
-            await job_morning(bot)
-        else:
-            await job_check_results(bot)
+        await scheduler_loop(bot)
     finally:
         session = getattr(bot, "session", None)
         if session is not None:
