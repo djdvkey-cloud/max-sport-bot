@@ -1022,30 +1022,22 @@ async def scheduler_loop(bot: Bot) -> None:
 async def main():
     print(f"Постоянный запуск спортивного бота {datetime.datetime.now(YEKB_TZ)}")
 
-    # FORCE_MODE — разовый прогон конкретной ветки и выход, для ручной
-    # отладки после редеплоя (без этого пришлось бы ждать нужного часа
-    # или полного цикла CHECK_INTERVAL_SECONDS). На постоянной работе не
-    # используется — там всегда пусто, и работает scheduler_loop.
+    # FORCE_MODE — разовый внеочередной прогон конкретной ветки СРАЗУ при
+    # старте, для ручной отладки или досева состояния после переезда на
+    # новый постоянный диск (без этого пришлось бы ждать нужного часа или
+    # полного цикла CHECK_INTERVAL_SECONDS). ВАЖНО: раньше после разового
+    # прогона процесс завершался (return) — для постоянного сервиса это
+    # означало, что контейнер просто останавливался и переставал что-либо
+    # проверять вообще. Теперь разовый прогон — это только доп. действие
+    # перед стартом обычного постоянного цикла, а не замена ему.
     force_mode = os.environ.get("FORCE_MODE", "").strip().lower()
-    if force_mode in ("morning", "results"):
-        print(f"[DEBUG] режим принудительно установлен: {force_mode} (разовая ручная проверка)")
-        bot = Bot(MAX_BOT_TOKEN)
-        try:
-            if force_mode == "morning":
-                await job_morning(bot)
-            else:
-                await job_check_results(bot)
-        finally:
-            session = getattr(bot, "session", None)
-            if session is not None:
-                close = getattr(session, "close", None)
-                if close:
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-        return
-
     bot = Bot(MAX_BOT_TOKEN)
+    if force_mode in ("morning", "results"):
+        print(f"[DEBUG] режим принудительно установлен: {force_mode} (разовая проверка перед стартом цикла)")
+        if force_mode == "morning":
+            await job_morning(bot)
+        else:
+            await job_check_results(bot)
     try:
         await scheduler_loop(bot)
     finally:
