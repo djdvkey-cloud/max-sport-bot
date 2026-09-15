@@ -38,9 +38,18 @@ HTML. Поле "answer" из ответа Tavily НЕ используется �
 материалах — иначе один повтор запроса с уточнением, и только потом
 пропуск, а не отправка недостоверных данных.
 
+15.09.2026: добавлен необязательный резерв на OpenAI web_search
+(OPENAI_API_KEY) — если основной путь Tavily+DeepSeek+extract_urls не
+нашёл результат матча спустя RESULT_DELAY_HOURS + OPENAI_FALLBACK_
+AFTER_HOURS, пробуем ещё раз через OpenAI. Не замена основному пути —
+только точечный резерв для редких "зависших" случаев (дороже по
+токенам, см. ask_openai_websearch). Если ключ не задан — просто не
+используется, ничего не меняется.
+
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
     DEEPSEEK_API_KEY, TAVILY_API_KEY
+    OPENAI_API_KEY (необязательно, см. выше)
 
 ЗАПУСК (постоянный процесс, сам следит за временем — не нужен внешний cron):
     python sport_bot.py
@@ -60,6 +69,10 @@ MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 MAX_CHAT_ID = int(os.environ["MAX_CHAT_ID"])
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
+# Необязательный резерв для проверки результатов (см. ask_openai_websearch
+# и OPENAI_FALLBACK_AFTER_HOURS ниже) — если не задан, просто не используется,
+# работа продолжается как раньше, только на Tavily+DeepSeek.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 # Тихий тестовый режим — вся логика (поиск, разбор, сохранение состояния)
 # работает как обычно, меняется только последний шаг: send_to_group не
 # шлёт в реальный MAX-чат, а печатает текст в лог. Нужен, чтобы гонять
@@ -70,6 +83,12 @@ DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 MORNING_HOUR = 10
 RESULT_DELAY_HOURS = 2.5
+# Резерв на OpenAI (см. ask_openai_websearch) пробуем только для матчей,
+# которые "зависли" — основной путь уже проверял их и не нашёл результат
+# спустя RESULT_DELAY_HOURS. Доп. запас в 1.5 часа — чтобы не дёргать
+# платный и дорогой по токенам OpenAI на каждой рутинной проверке, а
+# только когда Tavily+DeepSeek реально не справились.
+OPENAI_FALLBACK_AFTER_HOURS = 1.5
 CHECK_INTERVAL_SECONDS = 20 * 60
 
 # На Amvera — постоянный диск /data (как у myach-bot), переживает рестарты
@@ -536,14 +555,22 @@ def resolve_reported_result(
     club: dict,
     rival_hint: str,
     context: str,
+    *,
+    require_context_score: bool = True,
 ) -> tuple[str, str]:
-    """Проверяет участников и сам вычисляет исход с точки зрения нашего клуба."""
+    """Проверяет участников и сам вычисляет исход с точки зрения нашего клуба.
+
+    require_context_score=False — для источников без сырого текста контекста
+    (OpenAI web_search отдаёт только готовый ответ модели + ссылки на
+    источники, а не сам текст страниц, поэтому score_pair_mentioned для
+    такого пути в принципе нечего проверять — это осознанное отличие от
+    основного пути Tavily+DeepSeek, а не недосмотр)."""
     if has_forbidden_squad_label(team1, team2):
         raise ValueError(f"обнаружен неосновной состав: {team1!r} — {team2!r}")
 
     goals1 = parse_goals(goals1_raw)
     goals2 = parse_goals(goals2_raw)
-    if not score_pair_mentioned(goals1, goals2, context):
+    if require_context_score and not score_pair_mentioned(goals1, goals2, context):
         raise ValueError(
             f"счёт {goals1}:{goals2} в указанном порядке не подтверждается материалами"
         )
@@ -751,7 +778,8 @@ async def job_morning(bot: Bot) -> None:
 # --- Проверка результата ----------------------------------------------------
 
 def parse_result_line_football(
-    answer: str, club: dict, rival_hint: str, context: str
+    answer: str, club: dict, rival_hint: str, context: str,
+    *, require_context_score: bool = True,
 ) -> tuple[str, str] | None:
     """Возвращает счёт клуба и вычисленный программой исход."""
     line = find_data_line(answer, min_pipes=3)
@@ -762,7 +790,10 @@ def parse_result_line_football(
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 4:
         raise ValueError(f"меньше 4 полей: {parts!r}")
-    return resolve_reported_result(*parts[:4], club, rival_hint, context)
+    return resolve_reported_result(
+        *parts[:4], club, rival_hint, context,
+        require_context_score=require_context_score,
+    )
 
 
 async def check_result_football(club: dict, rival_hint: str) -> str | None:
@@ -825,7 +856,8 @@ def format_result_football(club: dict, score: str, outcome: str, rival: str) -> 
 
 
 def parse_result_line_hockey(
-    answer: str, club: dict, rival_hint: str, context: str
+    answer: str, club: dict, rival_hint: str, context: str,
+    *, require_context_score: bool = True,
 ) -> tuple[str, str, str] | None:
     """Возвращает счёт клуба, вычисленный исход и способ завершения."""
     line = find_data_line(answer, min_pipes=4)
@@ -836,7 +868,10 @@ def parse_result_line_hockey(
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 5:
         raise ValueError(f"меньше 5 полей: {parts!r}")
-    score, outcome = resolve_reported_result(*parts[:4], club, rival_hint, context)
+    score, outcome = resolve_reported_result(
+        *parts[:4], club, rival_hint, context,
+        require_context_score=require_context_score,
+    )
     if outcome == "НИЧЬЯ":
         raise ValueError("для хоккейного матча получен ничейный итоговый счёт")
     method = parts[4].upper()
@@ -919,6 +954,121 @@ def format_result_hockey(club: dict, score: str, outcome: str, method: str, riva
     return f"{head}\n\n{club['icon']} {club['name']} {score}{tail} {rival}"
 
 
+# --- Резерв: OpenAI web_search для "зависших" результатов -------------------
+
+async def ask_openai_websearch(prompt: str) -> str:
+    """Запрос к OpenAI Responses API с инструментом web_search. Используется
+    ТОЛЬКО как резерв (см. OPENAI_FALLBACK_AFTER_HOURS и check_result_openai
+    ниже), когда основной путь Tavily+DeepSeek+extract_urls не смог найти
+    результат — не как замена основному пути.
+
+    Проверено вживую 15.09.2026 на реальном матче: ответ точный, но расход
+    токенов большой (~9200 токенов на один запрос, из них подавляющее
+    большинство — невидимые reasoning-токены), поэтому пускаем это в ход
+    только для редких "зависших" случаев, а не на каждой проверке."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY не задан")
+    payload = {
+        "model": "gpt-5.5",
+        "tools": [{"type": "web_search"}],
+        "input": prompt,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.openai.com/v1/responses",
+                data=data,
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                },
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                raw = await resp.text()
+                status = resp.status
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        raise RuntimeError(f"OpenAI: сетевая ошибка {type(e).__name__}: {e}") from e
+
+    try:
+        result = json.loads(raw)
+    except ValueError as e:
+        raise RuntimeError(f"OpenAI вернул не-JSON ответ (статус {status}): {raw[:200]}") from e
+    if status != 200:
+        error = result.get("error", {})
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        raise RuntimeError(message or f"OpenAI: ошибка запроса, статус {status}")
+
+    for item in result.get("output", []):
+        if item.get("type") == "message":
+            for block in item.get("content", []):
+                if block.get("type") == "output_text" and block.get("text", "").strip():
+                    return block["text"]
+    raise RuntimeError("OpenAI вернул ответ без итогового текста")
+
+
+async def check_result_openai(club: dict, rival_hint: str) -> str | None:
+    """Резервная проверка результата через OpenAI web_search — см.
+    ask_openai_websearch. OpenAI отдаёт только готовый текст ответа и
+    ссылки на источники, без сырого текста страниц, поэтому здесь
+    сознательно отключена проверка score_pair_mentioned (require_context_
+    score=False) — её просто не с чем сверять; проверки на неосновной
+    состав и совпадение названий команд/соперника остаются в силе. Без
+    повторного переспроса при плохом формате (в отличие от DeepSeek-пути) —
+    это редкий резерв, при неудаче попробуем на следующем тике."""
+    today = datetime.date.today()
+    is_hockey = club["sport"] == "hockey"
+    base = (
+        f"Завершился ли сегодня, {today:%d.%m.%Y}, матч {club['name']} "
+        f"против {rival_hint}? Учитывай только основную взрослую команду — "
+        f"матчи U-19/U-21/U-23, молодёжных, юношеских, резервных, вторых, "
+        f"женских команд, дублей и академий не считаются.\n"
+        f"Если матч завершился, найди точный счёт"
+        + (" и способ завершения матча.\n" if is_hockey else ".\n")
+    )
+    if is_hockey:
+        prompt = (
+            base
+            + "Ответь СТРОГО последней строкой:\n"
+            "Команда 1|Голы 1|Команда 2|Голы 2|СПОСОБ\n"
+            "Команды и голы укажи в том же порядке, как в источнике. Голы — "
+            "только целые числа. Исход не пиши: программа вычислит сама. "
+            "СПОСОБ — одно слово: ОСНОВНОЕ (решилось в основное время), ОТ "
+            "(овертайм) или БУЛЛИТЫ.\n"
+            "Если матч ещё не завершился — последней строкой напиши НЕТ."
+        )
+    else:
+        prompt = (
+            base
+            + "Ответь СТРОГО последней строкой:\n"
+            "Команда 1|Голы 1|Команда 2|Голы 2\n"
+            "Команды и голы укажи в том же порядке, как в источнике. Голы — "
+            "только целые числа. Исход не пиши: программа вычислит сама.\n"
+            "Если матч ещё не завершился — последней строкой напиши НЕТ."
+        )
+    try:
+        answer = (await ask_openai_websearch(prompt)).strip()
+        print(f"[DEBUG] {club['name']} (результат, OpenAI-резерв): {answer!r}")
+        if is_hockey:
+            parsed = parse_result_line_hockey(
+                answer, club, rival_hint, "", require_context_score=False
+            )
+        else:
+            parsed = parse_result_line_football(
+                answer, club, rival_hint, "", require_context_score=False
+            )
+        if parsed is None:
+            return None
+        if is_hockey:
+            score, outcome, method = parsed
+            return format_result_hockey(club, score, outcome, method, rival_hint)
+        score, outcome = parsed
+        return format_result_football(club, score, outcome, rival_hint)
+    except Exception as e:
+        print(f"[DEBUG] ошибка при OpenAI-резервной проверке результата {club['name']}: {type(e).__name__}: {e}")
+        return None
+
+
 async def job_check_results(bot: Bot) -> None:
     print("[DEBUG] === проверка результатов ===")
     state = load_state()
@@ -938,6 +1088,12 @@ async def job_check_results(bot: Bot) -> None:
             text = await check_result_hockey(club, match["rival"])
         else:
             text = await check_result_football(club, match["rival"])
+
+        if not text and OPENAI_API_KEY and now_utc >= start_utc + datetime.timedelta(
+            hours=RESULT_DELAY_HOURS + OPENAI_FALLBACK_AFTER_HOURS
+        ):
+            print(f"[DEBUG] {club['name']}: основной путь не нашёл результат, пробую резерв OpenAI")
+            text = await check_result_openai(club, match["rival"])
 
         if text:
             await send_to_group(bot, text)
@@ -1022,30 +1178,22 @@ async def scheduler_loop(bot: Bot) -> None:
 async def main():
     print(f"Постоянный запуск спортивного бота {datetime.datetime.now(YEKB_TZ)}")
 
-    # FORCE_MODE — разовый прогон конкретной ветки и выход, для ручной
-    # отладки после редеплоя (без этого пришлось бы ждать нужного часа
-    # или полного цикла CHECK_INTERVAL_SECONDS). На постоянной работе не
-    # используется — там всегда пусто, и работает scheduler_loop.
+    # FORCE_MODE — разовый внеочередной прогон конкретной ветки СРАЗУ при
+    # старте, для ручной отладки или досева состояния после переезда на
+    # новый постоянный диск (без этого пришлось бы ждать нужного часа или
+    # полного цикла CHECK_INTERVAL_SECONDS). ВАЖНО: раньше после разового
+    # прогона процесс завершался (return) — для постоянного сервиса это
+    # означало, что контейнер просто останавливался и переставал что-либо
+    # проверять вообще. Теперь разовый прогон — это только доп. действие
+    # перед стартом обычного постоянного цикла, а не замена ему.
     force_mode = os.environ.get("FORCE_MODE", "").strip().lower()
-    if force_mode in ("morning", "results"):
-        print(f"[DEBUG] режим принудительно установлен: {force_mode} (разовая ручная проверка)")
-        bot = Bot(MAX_BOT_TOKEN)
-        try:
-            if force_mode == "morning":
-                await job_morning(bot)
-            else:
-                await job_check_results(bot)
-        finally:
-            session = getattr(bot, "session", None)
-            if session is not None:
-                close = getattr(session, "close", None)
-                if close:
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-        return
-
     bot = Bot(MAX_BOT_TOKEN)
+    if force_mode in ("morning", "results"):
+        print(f"[DEBUG] режим принудительно установлен: {force_mode} (разовая проверка перед стартом цикла)")
+        if force_mode == "morning":
+            await job_morning(bot)
+        else:
+            await job_check_results(bot)
     try:
         await scheduler_loop(bot)
     finally:
