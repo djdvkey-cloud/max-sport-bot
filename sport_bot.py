@@ -1194,6 +1194,20 @@ async def main():
             await job_morning(bot)
         else:
             await job_check_results(bot)
+    elif force_mode == "test_openai":
+        # Разовая ручная проверка живой связи с OpenAI API именно с IP
+        # Amvera (см. историю: Tavily с этого IP отдаёт 403, а локальный
+        # тест OpenAI 15.09.2026 проверялся только с домашней машины).
+        # Дешёвый запрос без реальной нагрузки на web_search, но по тому
+        # же пути кода, что и боевой резерв (ask_openai_websearch).
+        print("[DEBUG] режим принудительно установлен: test_openai (проверка связи с OpenAI с этого сервера)")
+        try:
+            reply = await ask_openai_websearch(
+                "Не ищи ничего в интернете, просто ответь одним словом: ОК."
+            )
+            print(f"[DEBUG] test_openai: успех, ответ={reply!r}")
+        except Exception as e:
+            print(f"[DEBUG] test_openai: ОШИБКА {type(e).__name__}: {e}")
     try:
         await scheduler_loop(bot)
     finally:
