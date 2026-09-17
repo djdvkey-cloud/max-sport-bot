@@ -46,6 +46,19 @@ AFTER_HOURS, пробуем ещё раз через OpenAI. Не замена �
 токенам, см. ask_openai_websearch). Если ключ не задан — просто не
 используется, ничего не меняется.
 
+17.09.2026 живой инцидент: реальный результат матча Автомобилиста был
+Авангард 3:2 ОТ Автомобилист (гостевое поражение), а в чат ушло
+«ПОБЕДА!!! Автомобилист 3:2 Авангард». Причина — код раньше всегда
+пересобирал счёт как «клуб:соперник» и печатал клуб первым, а
+источник (sports.ru) показывает счёт как «домашняя:гостевая»; модель
+(зная, что вопрос про Автомобилист) подставила ему первую цифру не
+сверяясь с реальным порядком команд в источнике. Исправлено: команды
+и голы теперь везде печатаются строго в том порядке, в котором их
+прислала модель (см. resolve_reported_result / format_result_*), без
+перестановки клуба на первое место — промпт тоже явно просит не
+переставлять. Исход (ПОБЕДА/НИЧЬЯ/ПОРАЖЕНИЕ) вычисляется отдельно и
+на порядок отображения не влияет.
+
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
     DEEPSEEK_API_KEY, TAVILY_API_KEY
@@ -557,8 +570,23 @@ def resolve_reported_result(
     context: str,
     *,
     require_context_score: bool = True,
-) -> tuple[str, str]:
-    """Проверяет участников и сам вычисляет исход с точки зрения нашего клуба.
+) -> tuple[str, str, int, str, int]:
+    """Проверяет участников, вычисляет исход с точки зрения нашего клуба —
+    но НЕ переставляет клуб на первое место: возвращает команды и голы в
+    том же порядке, в каком их прислала модель (team1/goals1 первыми).
+
+    17.09.2026 живой инцидент: реальный счёт был Авангард 3:2 ОТ
+    Автомобилист (Автомобилист — в гостях, проиграл), но раньше здесь
+    счёт всегда пересобирался как «club_goals:rival_goals» и клуб
+    печатался первым в сообщении — источник (sports.ru) показывает счёт
+    как «домашняя:гостевая», и модель, зная, что вопрос именно про
+    Автомобилист, подставила ему первую попавшуюся цифру (3) вместо
+    того чтобы сверить её с порядком команд в источнике. Результат:
+    в чат ушла «ПОБЕДА» вместо поражения. Раз возможность подставить
+    клуб первым в самом выводе провоцировала эту путаницу — теперь
+    просто печатаем то, что прислала модель, как есть (см. новый
+    промпт: «не переставляй») и вычисляем исход отдельно, не трогая
+    порядок отображения.
 
     require_context_score=False — для источников без сырого текста контекста
     (OpenAI web_search отдаёт только готовый ответ модели + ссылки на
@@ -596,7 +624,10 @@ def resolve_reported_result(
         outcome = "НИЧЬЯ"
     else:
         outcome = "ПОРАЖЕНИЕ"
-    return f"{club_goals}:{rival_goals}", outcome
+
+    name1 = club["name"] if team1_is_club else rival_hint
+    name2 = club["name"] if team2_is_club else rival_hint
+    return outcome, name1, goals1, name2, goals2
 
 
 def looks_like_own_name(tournament: str, club_name: str) -> bool:
@@ -780,8 +811,9 @@ async def job_morning(bot: Bot) -> None:
 def parse_result_line_football(
     answer: str, club: dict, rival_hint: str, context: str,
     *, require_context_score: bool = True,
-) -> tuple[str, str] | None:
-    """Возвращает счёт клуба и вычисленный программой исход."""
+) -> tuple[str, str, int, str, int] | None:
+    """Возвращает исход и обе команды/голы в порядке, как прислала модель
+    (без перестановки клуба на первое место — см. resolve_reported_result)."""
     line = find_data_line(answer, min_pipes=3)
     if line is None:
         if answer_says_no(answer):
@@ -803,8 +835,13 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
         f"против {rival_hint}? Если да, найди точный счёт.\n"
         f"Ответь СТРОГО последней строкой:\n"
         f"Команда 1|Голы 1|Команда 2|Голы 2\n"
-        f"Команды и голы укажи в том же порядке, как в источнике. Голы — "
-        f"только целые числа. Исход матча не пиши: программа вычислит его сама.\n"
+        f"ВАЖНО про порядок: пиши команды и голы СТРОГО в том порядке, как "
+        f"в источнике (обычно сначала домашняя команда, потом гостевая — "
+        f"счёт на странице часто дан именно так, «домашние:гостевые»). НЕ "
+        f"переставляй {club['name']} на первое место просто потому, что "
+        f"вопрос про него, если в источнике он идёт вторым — это уже "
+        f"приводило к ошибке, кто выиграл. Голы — только целые числа. "
+        f"Исход матча не пиши: программа вычислит его сама.\n"
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
     )
     search_query = (
@@ -825,7 +862,8 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
                 f"годится: {answer!r}.\n"
                 f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений, строго "
                 f"в виде «Команда 1|Голы 1|Команда 2|Голы 2». Сохрани порядок "
-                f"команд и счёта из источника; голы — только числа. Не пиши "
+                f"команд и счёта из источника КАК ЕСТЬ, не переставляй "
+                f"{club['name']} вперёд; голы — только числа. Не пиши "
                 f"исход матча. Если матч ещё не завершился — "
                 f"ответь одним словом НЕТ."
             )
@@ -838,28 +876,29 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
                 return None
         if parsed is None:
             return None
-        score, outcome = parsed
-        return format_result_football(club, score, outcome, rival_hint)
+        outcome, name1, goals1, name2, goals2 = parsed
+        return format_result_football(club, outcome, name1, goals1, name2, goals2)
     except Exception as e:
         print(f"[DEBUG] ошибка при проверке результата {club['name']}: {type(e).__name__}: {e}")
         return None
 
 
-def format_result_football(club: dict, score: str, outcome: str, rival: str) -> str:
+def format_result_football(club: dict, outcome: str, name1: str, goals1: int, name2: str, goals2: int) -> str:
     if "ПОБЕД" in outcome:
         head = "🎆🎆🎆 ПОБЕДА!!!"
     elif "НИЧЬ" in outcome:
         head = "🤝 НИЧЬЯ!"
     else:
         head = "😔 Увы, сегодня проиграли"
-    return f"{head}\n\n{club['icon']} {club['name']} {score} {rival}"
+    return f"{head}\n\n{club['icon']} {name1} {goals1}:{goals2} {name2}"
 
 
 def parse_result_line_hockey(
     answer: str, club: dict, rival_hint: str, context: str,
     *, require_context_score: bool = True,
-) -> tuple[str, str, str] | None:
-    """Возвращает счёт клуба, вычисленный исход и способ завершения."""
+) -> tuple[str, str, int, str, int, str] | None:
+    """Возвращает исход, обе команды/голы в порядке, как прислала модель
+    (см. resolve_reported_result), и способ завершения матча."""
     line = find_data_line(answer, min_pipes=4)
     if line is None:
         if answer_says_no(answer):
@@ -868,7 +907,7 @@ def parse_result_line_hockey(
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 5:
         raise ValueError(f"меньше 5 полей: {parts!r}")
-    score, outcome = resolve_reported_result(
+    outcome, name1, goals1, name2, goals2 = resolve_reported_result(
         *parts[:4], club, rival_hint, context,
         require_context_score=require_context_score,
     )
@@ -877,7 +916,7 @@ def parse_result_line_hockey(
     method = parts[4].upper()
     if method not in {"ОСНОВНОЕ", "ОТ", "БУЛЛИТЫ"}:
         raise ValueError(f"неизвестный способ завершения матча: {method!r}")
-    return score, outcome, method
+    return outcome, name1, goals1, name2, goals2, method
 
 
 async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
@@ -888,8 +927,13 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
         f"завершения матча.\n"
         f"Ответь СТРОГО последней строкой:\n"
         f"Команда 1|Голы 1|Команда 2|Голы 2|СПОСОБ\n"
-        f"Команды и голы укажи в том же порядке, как в источнике. Голы — "
-        f"только целые числа. Исход программа вычислит сама. "
+        f"ВАЖНО про порядок: пиши команды и голы СТРОГО в том порядке, как "
+        f"в источнике (обычно сначала домашняя команда, потом гостевая — "
+        f"счёт на странице часто дан именно так, «домашние:гостевые»). НЕ "
+        f"переставляй {club['name']} на первое место просто потому, что "
+        f"вопрос про него, если в источнике он идёт вторым — это уже "
+        f"приводило к ошибке, кто выиграл. Голы — только целые числа. "
+        f"Исход программа вычислит сама. "
         f"СПОСОБ — одно слово: ОСНОВНОЕ (решилось в основное время), ОТ "
         f"(овертайм) или БУЛЛИТЫ.\n"
         f"Если матч ещё не завершился — последней строкой напиши НЕТ."
@@ -912,7 +956,8 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
                 f"годится: {answer!r}.\n"
                 f"Ответь ЕЩЁ РАЗ и ТОЛЬКО одной строкой, без пояснений, строго "
                 f"в виде «Команда 1|Голы 1|Команда 2|Голы 2|СПОСОБ». Сохрани "
-                f"порядок команд и счёта из источника; голы — только числа. "
+                f"порядок команд и счёта из источника КАК ЕСТЬ, не переставляй "
+                f"{club['name']} вперёд; голы — только числа. "
                 f"Не пиши исход матча. Если матч ещё не "
                 f"завершился — ответь одним словом НЕТ."
             )
@@ -925,14 +970,14 @@ async def check_result_hockey(club: dict, rival_hint: str) -> str | None:
                 return None
         if parsed is None:
             return None
-        score, outcome, method = parsed
-        return format_result_hockey(club, score, outcome, method, rival_hint)
+        outcome, name1, goals1, name2, goals2, method = parsed
+        return format_result_hockey(club, outcome, name1, goals1, name2, goals2, method)
     except Exception as e:
         print(f"[DEBUG] ошибка при проверке результата {club['name']}: {type(e).__name__}: {e}")
         return None
 
 
-def format_result_hockey(club: dict, score: str, outcome: str, method: str, rival: str) -> str:
+def format_result_hockey(club: dict, outcome: str, name1: str, goals1: int, name2: str, goals2: int, method: str) -> str:
     won = "ПОБЕД" in outcome
     extra = "ОТ" in method
     shootout = "БУЛЛИТ" in method
@@ -951,7 +996,7 @@ def format_result_hockey(club: dict, score: str, outcome: str, method: str, riva
         head = "😔 Увы, сегодня проиграли"
 
     tail = " ОТ" if extra else (" Б" if shootout else "")
-    return f"{head}\n\n{club['icon']} {club['name']} {score}{tail} {rival}"
+    return f"{head}\n\n{club['icon']} {name1} {goals1}:{goals2}{tail} {name2}"
 
 
 # --- Резерв: OpenAI web_search для "зависших" результатов -------------------
@@ -1018,6 +1063,14 @@ async def check_result_openai(club: dict, rival_hint: str) -> str | None:
     это редкий резерв, при неудаче попробуем на следующем тике."""
     today = datetime.date.today()
     is_hockey = club["sport"] == "hockey"
+    order_warning = (
+        f"ВАЖНО про порядок: пиши команды и голы СТРОГО в том порядке, как "
+        f"в источнике (обычно сначала домашняя команда, потом гостевая — "
+        f"счёт на странице часто дан именно так, «домашние:гостевые»). НЕ "
+        f"переставляй {club['name']} на первое место просто потому, что "
+        f"вопрос про него, если в источнике он идёт вторым — это уже "
+        f"приводило к ошибке, кто выиграл.\n"
+    )
     base = (
         f"Завершился ли сегодня, {today:%d.%m.%Y}, матч {club['name']} "
         f"против {rival_hint}? Учитывай только основную взрослую команду — "
@@ -1031,8 +1084,8 @@ async def check_result_openai(club: dict, rival_hint: str) -> str | None:
             base
             + "Ответь СТРОГО последней строкой:\n"
             "Команда 1|Голы 1|Команда 2|Голы 2|СПОСОБ\n"
-            "Команды и голы укажи в том же порядке, как в источнике. Голы — "
-            "только целые числа. Исход не пиши: программа вычислит сама. "
+            + order_warning +
+            "Голы — только целые числа. Исход не пиши: программа вычислит сама. "
             "СПОСОБ — одно слово: ОСНОВНОЕ (решилось в основное время), ОТ "
             "(овертайм) или БУЛЛИТЫ.\n"
             "Если матч ещё не завершился — последней строкой напиши НЕТ."
@@ -1042,8 +1095,8 @@ async def check_result_openai(club: dict, rival_hint: str) -> str | None:
             base
             + "Ответь СТРОГО последней строкой:\n"
             "Команда 1|Голы 1|Команда 2|Голы 2\n"
-            "Команды и голы укажи в том же порядке, как в источнике. Голы — "
-            "только целые числа. Исход не пиши: программа вычислит сама.\n"
+            + order_warning +
+            "Голы — только целые числа. Исход не пиши: программа вычислит сама.\n"
             "Если матч ещё не завершился — последней строкой напиши НЕТ."
         )
     try:
@@ -1060,10 +1113,10 @@ async def check_result_openai(club: dict, rival_hint: str) -> str | None:
         if parsed is None:
             return None
         if is_hockey:
-            score, outcome, method = parsed
-            return format_result_hockey(club, score, outcome, method, rival_hint)
-        score, outcome = parsed
-        return format_result_football(club, score, outcome, rival_hint)
+            outcome, name1, goals1, name2, goals2, method = parsed
+            return format_result_hockey(club, outcome, name1, goals1, name2, goals2, method)
+        outcome, name1, goals1, name2, goals2 = parsed
+        return format_result_football(club, outcome, name1, goals1, name2, goals2)
     except Exception as e:
         print(f"[DEBUG] ошибка при OpenAI-резервной проверке результата {club['name']}: {type(e).__name__}: {e}")
         return None
@@ -1194,6 +1247,20 @@ async def main():
             await job_morning(bot)
         else:
             await job_check_results(bot)
+    elif force_mode == "test_openai":
+        # Разовая ручная проверка живой связи с OpenAI API именно с IP
+        # Amvera (см. историю: Tavily с этого IP отдаёт 403, а локальный
+        # тест OpenAI 15.09.2026 проверялся только с домашней машины).
+        # Дешёвый запрос без реальной нагрузки на web_search, но по тому
+        # же пути кода, что и боевой резерв (ask_openai_websearch).
+        print("[DEBUG] режим принудительно установлен: test_openai (проверка связи с OpenAI с этого сервера)")
+        try:
+            reply = await ask_openai_websearch(
+                "Не ищи ничего в интернете, просто ответь одним словом: ОК."
+            )
+            print(f"[DEBUG] test_openai: успех, ответ={reply!r}")
+        except Exception as e:
+            print(f"[DEBUG] test_openai: ОШИБКА {type(e).__name__}: {e}")
     try:
         await scheduler_loop(bot)
     finally:
