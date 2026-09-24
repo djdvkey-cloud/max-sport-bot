@@ -798,8 +798,18 @@ async def job_morning(bot: Bot) -> None:
         # диагностики): без этого club["key"] безусловно перезаписывался
         # бы свежей записью с result_sent=False, и следующая проверка
         # результатов отправила бы уже отправленный результат повторно.
+        # ВАЖНО: переносим result_sent только если это ТОТ ЖЕ матч
+        # (совпадает start_utc) — иначе, если предыдущий матч клуба уже
+        # был отправлен, а сегодня нашёлся НОВЫЙ матч, result_sent=True
+        # ошибочно наследовался бы на новый матч и job_check_results
+        # навсегда пропускал бы его без единой проверки (живой инцидент
+        # 24.09.2026: Северсталь — Автомобилист).
         existing = state.get(club["key"])
-        if existing and existing.get("result_sent"):
+        if (
+            existing
+            and existing.get("result_sent")
+            and existing.get("start_utc") == match.get("start_utc")
+        ):
             match["result_sent"] = True
         state[club["key"]] = match
         await send_to_group(bot, format_morning(club, match))
@@ -1149,15 +1159,14 @@ async def job_check_results(bot: Bot) -> None:
             text = await check_result_openai(club, match["rival"])
 
         if text:
-            await send_to_group(bot, text)
-            # DRY_RUN ничего реально не отправляет (см. send_to_group) —
-            # нельзя помечать result_sent, иначе следующий боевой прогон
-            # молча пропустит уже "найденный", но так и не отправленный
-            # результат (ровно это и случилось 13.09.2026 с Автомобилистом:
-            # тестовый прогон между двумя дозвонами пометил найденный
-            # результат отправленным, и боевой прогон сразу после него
-            # решил, что делать нечего).
-            if not DRY_RUN:
+            sent = await send_to_group(bot, text)
+            # DRY_RUN и реальная ошибка отправки в MAX — оба случая, когда
+            # send_to_group возвращает False, — не должны помечать
+            # result_sent: иначе следующий боевой прогон молча пропустит
+            # уже "найденный", но так и не отправленный результат (ровно
+            # это случилось 13.09.2026 с Автомобилистом при DRY_RUN, и
+            # это же произошло бы при реальном сбое отправки в MAX).
+            if sent:
                 match["result_sent"] = True
                 changed = True
         else:
@@ -1169,19 +1178,26 @@ async def job_check_results(bot: Bot) -> None:
 
 # --- Отправка и точка входа -------------------------------------------------
 
-async def send_to_group(bot: Bot, text: str) -> None:
+async def send_to_group(bot: Bot, text: str) -> bool:
+    """Возвращает True только при реально подтверждённой отправке —
+    вызывающий код (job_check_results) использует это, чтобы не помечать
+    result_sent при ошибке MAX (см. живой инцидент 24.09.2026: результат
+    Северсталь — Автомобилист несколько суток не находился заново именно
+    потому, что result_sent мог быть выставлен без подтверждённой
+    отправки)."""
     if DRY_RUN:
         print(f"[DRY RUN] было бы отправлено:\n{text}")
-        return
+        return False
     for attempt in range(3):
         try:
             await bot.send_message(chat_id=MAX_CHAT_ID, text=text)
-            return
+            return True
         except Exception as e:
             print(f"[DEBUG] попытка {attempt + 1} отправить не удалась: {type(e).__name__}: {e}")
             if attempt < 2:
                 await asyncio.sleep(10)
     print("[DEBUG] отправить не удалось ни с одной попытки")
+    return False
 
 
 def load_last_morning_date() -> datetime.date | None:
