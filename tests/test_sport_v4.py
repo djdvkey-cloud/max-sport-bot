@@ -92,7 +92,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.patches.append(p)
 
     def tearDown(self):
-        for p in self.patches:
+        for p in reversed(self.patches):      # в обратном порядке: иначе повторный патч одного имени оставляет подмену в модуле
             p.stop()
 
     # --- помощники ---
@@ -986,6 +986,20 @@ class SourceConflicts(Base):
         self._patch(S, "fetch_result_openai", mock.AsyncMock(return_value=None))
         await S.job_check_results(self.bot, self.T1 + datetime.timedelta(minutes=70))
         self.assertEqual(len(self.bot.group), 1)
+
+    async def test_crosscheck_openai_call_is_accounted_under_its_own_purpose(self):
+        import costs
+        seen = []
+
+        async def spy(club, rival, day):
+            seen.append(costs.purpose_var.get())
+            return None
+        self._patch(S, "OPENAI_API_KEY", "key")
+        self._patch(S, "fetch_result_openai", spy)
+        self.patch_fetch("avtomobilist", self.avto_cand(3, 1, ctx(("a.ru", "Автомобилист 3:1 Амур"))))
+        await S.job_check_results(self.bot, self.T1)
+        self.assertEqual(seen, ["result_crosscheck"])
+        self.assertIsNone(costs.purpose_var.get())                 # назначение не «протекает» за пределы вызова
 
     async def test_two_agreeing_sources_skip_paid_crosscheck(self):
         self._patch(S, "OPENAI_API_KEY", "key")

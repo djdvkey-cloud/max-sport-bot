@@ -1,4 +1,4 @@
-"""Стыковка клубного слоя «Трибун» с SPORTBOT: события дня из афиши/состояния, автоматика, состояние, запуск слушателя."""
+"""Стыковка клубного слоя «Трибун» с SPORTBOT: автоматика, состояние, запуск слушателя."""
 import asyncio
 import datetime
 import os
@@ -27,33 +27,9 @@ class ClubLayer(Base):
         with mock.patch.dict(os.environ, {"ADMIN_USER_ID": "", "ADMIN_CHAT_ID": "555"}):
             self.assertIsNone(S.owner_user_id())                    # чат — не user_id: владельцем никого не назначаем
 
-    def test_events_for_day_from_schedule_and_state_without_duplicates_or_invention(self):
-        day = datetime.date(2026, 10, 3)
-        self.put_schedule(self.entry("avtomobilist", day, "19:00", "мск", "КХЛ", "Амур"),
-                          self.entry("ural", datetime.date(2026, 10, 4), "12:00", "мск", "Первая лига", "Велес"))
-        self.put(self.rec("avtomobilist", ekb(2026, 10, 3, 21, 0), rival="Амур", day=day))     # то же событие в состоянии — без дубля
-        self.put(self.rec("real", ekb(2026, 10, 3, 23, 0), rival="Райо", day=day))
-        events = S.tribun_events_for_day(day)
-        self.assertEqual(sorted(e["club_key"] for e in events), ["avtomobilist", "real"])
-        auto = [e for e in events if e["club_key"] == "avtomobilist"][0]
-        self.assertEqual((auto["rival"], auto["tournament"], auto["sport_key"], auto["icon"]), ("Амур", "КХЛ", "hockey", "🏒"))
-        self.assertIn("19:00", auto["time_text"])
-        self.assertEqual(S.tribun_events_for_day(datetime.date(2026, 10, 9)), [])
-
-    async def test_today_view_uses_real_sources(self):
-        day = datetime.date(2026, 10, 3)
-        self.put_schedule(self.entry("avtomobilist", day, "19:00", "мск", "КХЛ", "Амур"),
-                          self.entry("milan", day, "21:45", "мск", "Серия А", "Рома"))
-        import tempfile
-        club = T.Tribun(self.bot, data_dir=tempfile.mkdtemp(), group_chat_id=S.MAX_CHAT_ID, owner_id=S.owner_user_id, version="t",
-                        now=lambda: ekb(2026, 10, 3, 9, 0).astimezone(datetime.timezone.utc), events_for_day=S.tribun_events_for_day)
-        store = club.load_members()
-        p = club.touch(store, 5, "Мария", active=True)
-        p.update({"sports": ["hockey"], "teams": ["Автомобилист"], "competitions": ["КХЛ"]})
-        club.save_members(store)
-        text, _ = club.today_view(p)
-        self.assertIn("⭐ По твоим интересам:", text)
-        self.assertLess(text.index("Автомобилист"), text.index("Милан"))
+    def test_personal_feed_is_gone(self):
+        self.assertFalse(hasattr(S, "tribun_events_for_day"))
+        self.assertFalse(hasattr(T.Tribun, "today_view"))
 
     def test_automation_lists_existing_jobs_with_timezone_and_status(self):
         self._patch(S, "utc_now", lambda: ekb(2026, 10, 3, 9, 30).astimezone(S.UTC) if hasattr(S, "UTC") else ekb(2026, 10, 3, 9, 30))

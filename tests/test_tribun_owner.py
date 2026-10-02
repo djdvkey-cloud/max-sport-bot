@@ -81,60 +81,65 @@ class CompletionCard(OwnerBase):
         self.bot.sent.clear()
         await self.tribun.on_bot_started(user(uid, name), uid, "interests", self.ctx(uid).reply)
         for key in ("hockey", "football"):
-            await self.press(uid, f"t:sp:{key}:o")
-        for key in ("avto", "zenit"):
-            await self.press(uid, f"t:tm:{key}:o")
-        for key in ("khl", "rpl"):
-            await self.press(uid, f"t:cp:{key}:o")
-        for key in ("matches", "results", "analysis"):
-            await self.press(uid, f"t:ct:{key}:o")
-        await self.press(uid, "nl:main:o")
+            await self.press(uid, f"t:sp:{key}")
+        for key in ("khl", "laliga"):
+            await self.press(uid, f"t:cp:{key}")
+        for key in ("avtomobilist", "real"):
+            await self.press(uid, f"t:cl:{key}")
+        await self.press(uid, "sv")
 
     async def test_3_completion_sends_one_compact_card_to_owner(self):
         await self.finish_profile()
         self.assertEqual(self.owner_msgs(), [
-            "✅ Алексей настроил интересы\n\n🏒 Хоккей\n⚽ Футбол\n\n❤️ Команды / спортсмены:\nАвтомобилист\nЗенит\n\n"
-            "🏆 Турниры:\nКХЛ\nРПЛ\n\n🔥 Интересует:\nважные матчи\nрезультаты\nразборы\n\n🔔 Личные уведомления:\nтолько главное"])
+            "✅ Алексей настроил интересы\n\n🏅 Спорт:\n⚽ Футбол\n🏒 Хоккей\n\n🏆 Чемпионаты:\nКХЛ\nЛа Лига\n\n❤️ Клубы:\n"
+            "Автомобилист\nРеал Мадрид\n\n➕ Запросы:\n—"])
         self.assertEqual(self.group_texts()[1:], [])                           # в группу — ничего, кроме приветствия
 
     async def test_4_later_edits_send_no_extra_push(self):
         await self.finish_profile()
         count = len(self.owner_msgs())
-        await self.press(1, "ed:tm")
-        await self.press(1, "t:tm:zenit:e")                                    # убрал команду
-        await self.press(1, "t:tm:spartak:e")                                  # заменил
-        await self.press(1, "ed:sp")
-        await self.press(1, "t:sp:tennis:e")                                   # добавил теннис
-        await self.press(1, "ed:nl")
-        await self.press(1, "nl:off:e")                                        # сменил уровень уведомлений
-        await self.press(1, "add:tm:e")
-        await self.say(1, "Новая Команда")
+        await self.press(1, "c:cl")
+        await self.press(1, "t:cl:real")                                       # убрал клуб
+        await self.press(1, "t:cl:ural")                                       # добавил другой
+        await self.press(1, "c:sp")
+        await self.press(1, "t:sp:basketball")                                 # добавил вид спорта
+        await self.press(1, "o:cp")
+        await self.say(1, "Кубок Первого канала")                              # новый запрос
+        await self.press(1, "sv")
         self.assertEqual(len(self.owner_msgs()), count)
-        self.assertEqual(self.profile(1)["teams"], ["Автомобилист", "Спартак", "Новая Команда"])
+        self.assertEqual(self.profile(1)["clubs"], ["avtomobilist", "ural"])
 
     async def test_card_not_resent_after_restart(self):
         await self.finish_profile()
         self.make()
         await self.tribun.flush_owner_notifications()
-        await self.press(1, "me")
+        await self.press(1, "c:sp")
         self.assertEqual(len([m for m in self.owner_msgs() if "настроил интересы" in m]), 1)
 
     async def test_owner_own_profile_is_not_reported_to_himself(self):
         await self.join(OWNER, "Дмитрий")
         await self.tribun.on_bot_started(user(OWNER, "Дмитрий"), OWNER, "interests", self.ctx(OWNER).reply)
-        await self.press(OWNER, "t:sp:hockey:o")
-        await self.press(OWNER, "nl:all:o")
+        for payload in ("t:sp:hockey", "t:cp:khl", "t:cl:avtomobilist", "sv"):
+            await self.press(OWNER, payload)
+        self.assertTrue(self.profile(OWNER)["completion_notified"])
         self.assertEqual(self.owner_msgs(), [])
 
-    async def test_empty_choices_card_is_readable(self):
+    async def test_incomplete_profile_is_not_reported_and_requests_only_card_is_readable(self):
         await self.join(1, "Алексей")
         self.bot.sent.clear()
         await self.tribun.on_bot_started(user(1, "Алексей"), 1, None, self.ctx(1).reply)
-        await self.press(1, "nl:off:o")
+        await self.press(1, "sv")
+        self.assertTrue(self.last_text().startswith("✅ Интересы сохранены"))
+        self.assertEqual(self.owner_msgs(), [])                                 # в трёх разделах пока ничего — карточки нет
+        for code, text in (("sp", "Теннис"), ("cp", "Ролан Гаррос"), ("cl", "Ювентус")):
+            await self.press(1, f"o:{code}")
+            await self.say(1, text)
+        await self.press(1, "sv")
         card = self.owner_msgs()[0]
         self.assertIn("✅ Алексей настроил интересы", card)
-        self.assertIn("❤️ Команды / спортсмены:\n—", card)
-        self.assertIn("без личных уведомлений", card)
+        self.assertIn("🏅 Спорт:\n➕ Теннис", card)
+        self.assertIn("❤️ Клубы:\n➕ Ювентус", card)
+        self.assertIn("➕ Запросы:\nТеннис (спорт)\nРолан Гаррос (чемпионат)\nЮвентус (клуб)", card)
 
     async def test_undelivered_card_is_retried_by_flush(self):
         self.bot.fail_user = True
@@ -158,8 +163,8 @@ class LeaveReturn(OwnerBase):
                                              "В общей карте интересов больше не учитывается."])
         self.assertFalse(self.profile(1)["active_in_group"])
         m = self.tribun.interest_map(self.tribun.load_members())
-        self.assertEqual((m["active"], m["sports"], m["teams"]), (0, [], []))
-        self.assertEqual(self.profile(1)["teams"], ["Автомобилист", "Зенит"])
+        self.assertEqual((m["active"], m["sports"], m["clubs"]), (0, [], []))
+        self.assertEqual(self.profile(1)["clubs"], ["avtomobilist", "real"])
         self.assertEqual(await self.tribun.on_user_removed(GROUP, user(1)), "already-left")      # повтор — без второго сообщения
         self.assertEqual(len(self.owner_msgs()), 1)
         self.assertEqual(self.group_texts(), [])
@@ -215,20 +220,21 @@ class AdminScreens(OwnerBase):
         self.assertIn(("1. Алексей", "adm:mc:1"), self.buttons())
         await self.press(OWNER, "adm:mc:1")
         text = self.last_text()
-        for part in ("👤 Алексей", "✅ В группе", "✅ Настроен", "🏒 Виды спорта:\nХоккей, футбол", "❤️ Команды / спортсмены:\nАвтомобилист, Зенит",
-                     "🏆 Турниры:\nКХЛ, РПЛ", "🔥 Контент:\nважные матчи, результаты, разборы", "🔔 Уведомления:\nтолько главное",
-                     "Дата вступления:\n03.10.2026 09:00", "Последнее изменение профиля:\n03.10.2026 09:00"):
+        for part in ("👤 Алексей", "✅ В группе", "✅ Настроен", "🏅 Виды спорта:\n⚽ Футбол, 🏒 Хоккей", "🏆 Чемпионаты:\nКХЛ, Ла Лига",
+                     "❤️ Клубы:\nАвтомобилист, Реал Мадрид", "Дата вступления:\n03.10.2026 09:00", "Последнее изменение профиля:\n03.10.2026 09:00"):
             self.assertIn(part, text)
+        for gone in ("Контент", "Уведомления", "Спортсмены", "Команды"):
+            self.assertNotIn(gone, text)
         self.assertNotIn("✏️", str(self.buttons()))                                # никаких кнопок редактирования чужих предпочтений
         self.clock.dt += datetime.timedelta(hours=5)
-        await self.press(1, "ed:tm")
-        await self.press(1, "t:tm:zenit:e")
-        await self.press(1, "t:tm:spartak:e")
+        await self.press(1, "c:cl")
+        await self.press(1, "t:cl:real")
+        await self.press(1, "t:cl:ural")
         await self.press(OWNER, "adm:mc:1")
         text = self.last_text()
-        self.assertIn("❤️ Команды / спортсмены:\nАвтомобилист, Спартак", text)
+        self.assertIn("❤️ Клубы:\nАвтомобилист, Урал", text)
         self.assertIn("Последнее изменение профиля:\n03.10.2026 14:00", text)
-        self.assertNotIn("Зенит", text)
+        self.assertNotIn("Реал", text)
 
     async def test_card_for_left_and_unconfigured_and_unknown(self):
         await self.join(2, "Михаил")
@@ -244,8 +250,7 @@ class AdminScreens(OwnerBase):
         for i in range(1, 31):
             await self.join(i, f"Участник{i:02d}")
         for uid in range(1, 6):
-            await self.tribun.on_bot_started(user(uid, f"Участник{uid:02d}"), uid, None, self.ctx(uid).reply)
-            await self.press(uid, "nl:all:o")
+            await self.onboard(uid)
         await self.tribun.on_user_removed(GROUP, user(30))
         await self.press(OWNER, "adm:mem:0")
         text = self.last_text()
@@ -262,62 +267,55 @@ class AdminScreens(OwnerBase):
         self.assertIn("Стр. 4 из 4", self.last_text())
 
     async def test_6_interest_screen_exact_shape_from_8_participants(self):
-        spec = [("hockey", "avto", "khl", "matches"), ("hockey", "avto", "khl", "results"), ("hockey", "zenit", "khl", "matches"),
-                ("hockey", "avto", "khl", "analysis"), ("football", "zenit", "rpl", "results"), ("football", "spartak", "rpl", "matches"),
-                ("hockey", "avto", "khl", "stats"), ("football", "zenit", "f1", "matches")]
-        for i, (sport, team, comp, content) in enumerate(spec, 1):
+        spec = [("hockey", "khl", "avtomobilist")] * 5 + [("football", "laliga", "real")] * 2 + [("football", "apl", "arsenal")]
+        for i, (sport, comp, club) in enumerate(spec, 1):
             await self.join(i, f"У{i}")
-            await self.onboard(i, sports=(sport,), teams=(team,), comps=(comp,), content=(content,))
+            await self.onboard(i, sports=(sport,), comps=(comp,), clubs=(club,))
         await self.join(9, "БезПрофиля")                                         # без профиля: в числе участников, фиктивных интересов нет
         await self.press(OWNER, "adm:int")
         text = self.last_text()
         self.assertIn("Участников: 9", text)
         self.assertIn("Настроили профиль: 8", text)
-        self.assertIn("🏒 Хоккей — 5 из 9", text)
-        self.assertIn("⚽ Футбол — 3 из 9", text)
-        self.assertIn("❤️ Команды:\nАвтомобилист — 4\nЗенит — 3\nСпартак — 1", text)
-        self.assertIn("🏆 Турниры:\nКХЛ — 5\nРПЛ — 2\nФормула-1 — 1" if False else "🏆 Турниры:\nКХЛ — 5", text)
-        self.assertIn("🔥 Контент:\nВажные матчи — 4", text)
+        self.assertIn("🏒 Хоккей — 5\n⚽ Футбол — 3", text)
+        self.assertIn("🏆 Чемпионаты:\nКХЛ — 5\nЛа Лига — 2\nАПЛ — 1", text)
+        self.assertIn("❤️ Клубы:\nАвтомобилист — 5\nРеал Мадрид — 2\nАрсенал — 1", text)
         self.assertNotIn("БезПрофиля", text)
+        for gone in ("Спортсмены", "Контент", "из 9"):
+            self.assertNotIn(gone, text)
 
     async def test_7_aggregate_recalculates_after_each_change(self):
         await self.join(1, "А")
-        await self.onboard(1, sports=("hockey",), teams=("avto",))
+        await self.onboard(1, sports=("hockey",), comps=("khl",), clubs=("avtomobilist",))
         await self.press(OWNER, "adm:int")
-        self.assertIn("🏒 Хоккей — 1 из 1", self.last_text())
-        await self.press(1, "ed:sp")
-        await self.press(1, "t:sp:tennis:e")
+        self.assertIn("🏒 Хоккей — 1", self.last_text())
+        await self.press(1, "c:sp")
+        await self.press(1, "t:sp:football")
         await self.press(OWNER, "adm:int")
-        self.assertIn("🎾 Теннис — 1 из 1", self.last_text())
+        self.assertIn("⚽ Футбол — 1", self.last_text())
         await self.join(2, "Б")
         await self.press(OWNER, "adm:int")
-        self.assertIn("🏒 Хоккей — 1 из 2", self.last_text())
+        self.assertIn("Участников: 2", self.last_text())
         await self.tribun.on_user_removed(GROUP, user(1))
         await self.press(OWNER, "adm:int")
         self.assertIn("Участников: 1", self.last_text())
         self.assertNotIn("Хоккей", self.last_text())
         await self.join(1, "А")
         await self.press(OWNER, "adm:int")
-        self.assertIn("🏒 Хоккей — 1 из 2", self.last_text())
+        self.assertIn("🏒 Хоккей — 1", self.last_text())
 
     async def test_editorial_service_returns_high_interest_sets(self):
-        for i in range(1, 5):
+        for i in range(1, 6):
             await self.join(i, f"У{i}")
-            await self.onboard(i, sports=("hockey",) if i <= 3 else ("football",), teams=("avto",) if i <= 2 else ("zenit",),
-                               comps=("khl",), content=("matches",))
-        await self.tribun.on_bot_started(user(5, "Без"), 5, None, self.ctx(5).reply)
-        store = self.tribun.load_members()
-        self.tribun.touch(store, 5, active=True)
-        self.tribun.save_members(store)
+            if i <= 3:
+                await self.onboard(i, sports=("hockey",), comps=("khl",), clubs=("avtomobilist",))
+            else:
+                await self.onboard(i, sports=("football",), comps=("laliga",), clubs=("real",))
+        await self.join(6, "Без")
         high = self.tribun.high_interest()
-        self.assertEqual(high["sports"], ["🏒 Хоккей"])                          # 3 из 5 = 60%
-        self.assertEqual(high["teams"], [])                                       # 2 из 5 = 40% — средний
-        self.assertEqual(high["competitions"], ["КХЛ"])
-        self.assertEqual(high["preferred_content"], ["🔥 Важные матчи"])
-        self.assertEqual(high["athletes"], [])
+        self.assertEqual(high, {"sports": ["🏒 Хоккей"], "championships": ["КХЛ"], "clubs": ["Автомобилист"]})      # 3 из 6 = 50%
         ed = self.tribun.editorial_summary(self.tribun.load_members())
-        self.assertEqual(ed["medium"]["teams"], ["Автомобилист", "Зенит"])
-        self.assertEqual(ed["niche"]["sports"], ["⚽ Футбол"])
+        self.assertEqual(ed["medium"], {"sports": ["⚽ Футбол"], "championships": ["Ла Лига"], "clubs": ["Реал Мадрид"]})   # 2 из 6 = 33%
+        self.assertEqual(ed["niche"], {"sports": [], "championships": [], "clubs": []})
 
     async def test_notification_settings_default_and_toggle(self):
         self.assertEqual({k: v for k, v in self.tribun.owner_settings().items()},
@@ -342,7 +340,7 @@ class AdminScreens(OwnerBase):
     async def test_clicks_and_menu_opens_never_notify_owner(self):
         await self.join(1, "Алексей")
         self.bot.sent.clear()
-        for payload in ("m", "me", "today", "about", "ob:sp", "t:sp:hockey:o", "ed:tm"):
+        for payload in ("m", "c:sp", "c:cp", "c:cl", "t:sp:hockey", "o:sp", "rt:sp:zzz", "sv"):
             await self.press(1, payload)
         await self.say(1, "привет")
         self.assertEqual(self.owner_msgs(), [])
@@ -350,7 +348,8 @@ class AdminScreens(OwnerBase):
 
 class AccessControl(OwnerBase):
     ADMIN_PAYLOADS = ("adm", "adm:int", "adm:mem:0", "adm:mc:2", "adm:ns", "adm:nt:new_member", "adm:nt:left", "adm:auto", "adm:state",
-                      "pub:list", "pr:list", "inv")
+                      "adm:rq", "adm:rqd:cp:12345678", "adm:src", "adm:src:cov", "adm:src:all", "adm:src:prob", "adm:src:gap",
+                      "adm:api", "adm:api:d", "adm:api:m", "adm:api:ai", "adm:api:api", "adm:api:pur", "adm:api:err", "pub:list", "pr:list", "inv")
 
     async def test_8_member_gets_access_denied_for_every_owner_screen(self):
         await self.join(1, "Алексей")
@@ -410,10 +409,10 @@ class RestartAndPrivacy(OwnerBase):
         await CompletionCard.finish_profile(self)
         await self.tribun.on_user_removed(GROUP, user(1))
         await self.join(1, "Алексей")
-        await self.press(1, "ed:tm")
-        await self.press(1, "t:tm:spartak:e")
+        await self.press(1, "c:cl")
+        await self.press(1, "t:cl:ural")
         for text in [m[1] for m in self.bot.group_log]:
-            for secret in ("Автомобилист", "Зенит", "Спартак", "КХЛ", "РПЛ", "выбрал", "болеет", "настроил"):
+            for secret in ("Автомобилист", "Реал", "Урал", "КХЛ", "Ла Лига", "выбрал", "болеет", "настроил"):
                 self.assertNotIn(secret, text, text)
         self.assertEqual(len(self.bot.group_log), 1)                                # только приветствие при первом входе
 

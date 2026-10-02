@@ -66,6 +66,13 @@ AFTER_HOURS, пробуем ещё раз через OpenAI. Не замена �
 (понедельник 09:00 ЕКБ); контроль изменений расписания (время, перенос, отмена) вместо двух
 сообщений; защита от публикации неверного счёта при конфликте источников.
 
+03.10.2026 (2026-10-03.1, «Своя Трибуна» этап 2): личка участника — только три раздела интересов (виды спорта,
+чемпионаты, клубы; «➕ Другое» = запрос), без персональных спортивных сообщений; реестр источников
+(здоровье по реальным запросам, покрытие, разрывы) и учёт API (Tavily / DeepSeek / OpenAI: вызовы, токены,
+кредиты, оценка стоимости, защита от лишних повторов) — всё это только наблюдение: логика афиши, утренних
+анонсов, результатов и шести клубов не изменена и от профилей участников не зависит (см. tribun*.py,
+sources.py, costs.py, tribun_hooks.py).
+
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
     DEEPSEEK_API_KEY, TAVILY_API_KEY
@@ -91,6 +98,8 @@ import aiohttp
 from maxapi import Bot, Dispatcher
 
 import tribun
+import tribun_hooks as hooks
+import sources as tribun_sources
 
 MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 MAX_CHAT_ID = int(os.environ["MAX_CHAT_ID"])
@@ -217,7 +226,7 @@ TAVILY_INCLUDE_DOMAINS = [
 
 # --- Настройки v4: личные уведомления, афиша, контроль расписания --------------
 
-BOT_VERSION = "2026-10-03"
+BOT_VERSION = "2026-10-03.1"
 # Первая проверка результата — через RESULT_DELAY_HOURS после начала матча
 # (раньше 2,5 ч, теперь 2 ч). Цикл не ждёт полного интервала: планировщик
 # просыпается точно к этому моменту (см. seconds_until_next_event).
@@ -843,14 +852,19 @@ async def fetch_club_calendar(club: dict, ref: datetime.date) -> list:
     urls = club.get("extract_urls") or []
     if not urls:
         raise SourceError("у клуба нет страницы календаря")
+    source_id = hooks.source_for_url(urls[0])
     text = await fetch_url_direct(urls[0])
     if not text:
+        hooks.source_event(source_id, "failed", "страница недоступна")
         raise SourceError(f"страница календаря {urls[0]} недоступна")
     fixtures = parse_calendar(club, text, ref)
     lines = _clean_lines(text)
     has_layout = "Будущие матчи" in lines or any(SPORTSRU_DATE_RE.match(ln) or TABLE_DATE_RE.match(ln) for ln in lines)
     if not fixtures and not has_layout:
+        hooks.source_event(source_id, "failed", "вёрстка изменилась")
         raise SourceError("в календаре не найдено ни одного матча — вёрстка изменилась?")
+    # страница получена и разобрана: пустой список — подтверждённое «матчей нет» (CONFIRMED_EMPTY), а не сбой источника
+    hooks.source_event(source_id, "ok" if fixtures else "confirmed_empty")
     return fixtures
 
 
@@ -987,9 +1001,12 @@ async def extract_urls_tavily(urls: list[str]) -> list[str]:
             out.append(f"Источник {url}:\n{content}")
         else:
             print(f"[DEBUG] прямой фетч {url}: пусто")
+            hooks.source_event(hooks.source_for_url(url), "failed", "страница недоступна")
     return out
 
 
+@hooks.tracked_api("tavily", "search", model="search", source_id="search:tavily",
+                   key_from=lambda query, sites=None, extract_urls=None: (query, tuple(extract_urls or ())))
 async def collect_web_context_tavily(query: str, sites: list[str], extract_urls: list[str] | None = None) -> str:
     """Поиск через Tavily — сразу очищенный текст, без ручного
     скачивания страниц и парсинга HTML. НЕ используем поле answer —
@@ -1033,14 +1050,17 @@ async def collect_web_context_tavily(query: str, sites: list[str], extract_urls:
             raw = await resp.text()
             if resp.status != 200:
                 print(f"[DEBUG] Tavily статус={resp.status}, тело={raw[:300]!r}")
+                hooks.report_failure(f"HTTP {resp.status}")
                 return "\n\n---\n\n".join(extracted)
             try:
                 data = json.loads(raw)
             except ValueError as e:
                 print(f"[DEBUG] не удалось разобрать ответ Tavily: {type(e).__name__}: {e}")
+                hooks.report_failure("ответ не разобран")
                 return "\n\n---\n\n".join(extracted)
 
     results = data.get("results", [])
+    hooks.report_usage(units=2)          # search_depth=advanced — 2 кредита за запрос
     print(f"[DEBUG] Tavily нашёл {len(results)} источников по «{query}»")
     print(f"[DEBUG] все URL от Tavily: {[r.get('url', '') for r in results]}")
     combined = list(extracted)
@@ -1069,6 +1089,7 @@ async def collect_web_context_tavily(query: str, sites: list[str], extract_urls:
     return "\n\n---\n\n".join(combined)
 
 
+@hooks.tracked_api("deepseek", "chat", model="deepseek-v4-flash", key_from=lambda messages: (messages,))
 async def deepseek_completion(messages: list[dict]) -> str:
     """Вызов DeepSeek через OpenAI-совместимый API с постоянным ключом."""
     try:
@@ -1107,6 +1128,8 @@ async def deepseek_completion(messages: list[dict]) -> str:
         raise RuntimeError(f"DeepSeek вернул неожиданный ответ: {raw[:200]}") from e
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("DeepSeek вернул пустой ответ")
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    hooks.report_usage(input_tokens=usage.get("prompt_tokens"), output_tokens=usage.get("completion_tokens"))
     return content
 
 
@@ -1394,6 +1417,7 @@ def parse_morning_line(answer: str, club_name: str, context: str):
     return tournament, time_str, zone_str, place, rival
 
 
+@hooks.with_purpose("schedule_search")
 async def check_morning(club: dict, today: datetime.date | None = None) -> dict | None:
     """Если клуб играет сегодня — возвращает данные матча; None — матча
     действительно нет. Сбой источника/разбора — SourceError (а не None):
@@ -1788,6 +1812,7 @@ def _make_candidate(club: dict, hockey: bool, parsed: tuple, context: str, origi
     }
 
 
+@hooks.with_purpose("result_search")
 async def fetch_result_football(club: dict, rival_hint: str, on_date: datetime.date | None = None) -> dict | None:
     """Результат матча по основному пути (Tavily + прямые страницы → DeepSeek).
     None — матч ещё не завершился; SourceError — сбой источника/разбора.
@@ -1857,6 +1882,7 @@ async def check_result_football(club: dict, rival_hint: str) -> str | None:
     return cand["text"] if cand else None
 
 
+@hooks.with_purpose("result_search")
 async def fetch_result_hockey(club: dict, rival_hint: str, on_date: datetime.date | None = None) -> dict | None:
     """То же для хоккея (дополнительно — способ завершения: основное время / ОТ / буллиты)."""
     today = on_date or ekb_now().date()
@@ -1986,6 +2012,7 @@ def format_result_hockey(club: dict, outcome: str, name1: str, goals1: int, name
 
 # --- Резерв: OpenAI web_search для "зависших" результатов -------------------
 
+@hooks.tracked_api("openai", "responses_web_search", model="gpt-5.5", source_id="search:openai", key_from=lambda prompt: (prompt,))
 async def ask_openai_websearch(prompt: str) -> str:
     """Запрос к OpenAI Responses API с инструментом web_search. Используется
     ТОЛЬКО как резерв (см. OPENAI_FALLBACK_AFTER_HOURS и check_result_openai
@@ -2029,6 +2056,8 @@ async def ask_openai_websearch(prompt: str) -> str:
         message = error.get("message") if isinstance(error, dict) else str(error)
         raise RuntimeError(message or f"OpenAI: ошибка запроса, статус {status}")
 
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    hooks.report_usage(input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
     for item in result.get("output", []):
         if item.get("type") == "message":
             for block in item.get("content", []):
@@ -2037,6 +2066,7 @@ async def ask_openai_websearch(prompt: str) -> str:
     raise RuntimeError("OpenAI вернул ответ без итогового текста")
 
 
+@hooks.with_purpose("fallback")
 async def fetch_result_openai(club: dict, rival_hint: str, on_date: datetime.date | None = None) -> dict | None:
     """Резервная проверка результата через OpenAI web_search — см.
     ask_openai_websearch. OpenAI отдаёт только готовый текст ответа и
@@ -2297,7 +2327,8 @@ async def resolve_result(club: dict, rec: dict, now: datetime.datetime) -> dict:
         due = not last or now - last >= datetime.timedelta(minutes=CROSSCHECK_MIN_INTERVAL_MINUTES)
         if OPENAI_API_KEY and corroboration < 2 and due:
             rec["last_crosscheck_at"] = now.isoformat()
-            other = await fetch_result_openai(club, rival, day)
+            with hooks.purpose("result_crosscheck"):
+                other = await fetch_result_openai(club, rival, day)
             if other and candidate_signature(other) != candidate_signature(cand):
                 return {"state": "conflict",
                         "reason": f"независимая проверка даёт {other['club_goals']}:{other['rival_goals']}"}
@@ -2532,31 +2563,6 @@ def owner_user_id() -> int | None:
     return target.get("user_id") if target else None
 
 
-def tribun_events_for_day(day: datetime.date) -> list:
-    """События дня из того, что бот уже знает (афиша недели + найденные утром матчи). Ничего не выдумывается."""
-    events, seen = [], set()
-
-    def add(club_key, rival, date_iso, time_str, zone, tournament):
-        club = club_by_key(club_key)
-        if not club or date_iso != day.isoformat():
-            return
-        ident = match_identity(club_key, date_iso, rival)
-        if ident in seen:
-            return
-        seen.add(ident)
-        events.append({"club_key": club_key, "club_name": club["name"], "icon": club["icon"], "aliases": club.get("aliases", []),
-                       "sport_key": tribun.SPORT_FAMILY_TO_KEY.get(sport_family(club)), "tournament": tournament or "",
-                       "rival": rival, "time_text": fmt_clock(time_str, zone), "date": date_iso})
-    try:
-        for e in load_schedule()["entries"]:
-            add(e.get("club_key"), e.get("rival", ""), e.get("date"), e.get("time"), e.get("zone"), e.get("tournament"))
-        for rec in load_state()["matches"].values():
-            add(rec.get("club_key"), rec.get("rival", ""), rec.get("match_date"), rec.get("time"), rec.get("zone"), rec.get("tournament"))
-    except Exception as e:
-        print(f"[TRIBUN] события дня недоступны: {type(e).__name__}: {e}")
-    return events
-
-
 def _fmt_ekb(value) -> str | None:
     dt = parse_iso(value)
     return dt.astimezone(YEKB_TZ).strftime("%d.%m.%Y %H:%M") if dt else None
@@ -2638,7 +2644,41 @@ def tribun_status() -> dict:
 
 def build_tribun(bot: Bot) -> "tribun.Tribun":
     return tribun.Tribun(bot, data_dir=DATA_DIR, group_chat_id=MAX_CHAT_ID, owner_id=owner_user_id, version=BOT_VERSION,
-                         dry_run=DRY_RUN, events_for_day=tribun_events_for_day, automation=tribun_automation, status=tribun_status)
+                         dry_run=DRY_RUN, automation=tribun_automation, status=tribun_status,
+                         registry=hooks.REGISTRY, tracker=hooks.TRACKER)
+
+
+def setup_tribun_hooks() -> None:
+    """Учёт API и здоровье источников. Не настроится — SPORTBOT работает как раньше (хуки превращаются в прямой вызов)."""
+    if not TRIBUN_ENABLED:
+        return
+    try:
+        hooks.configure(DATA_DIR, tribun_sources.build_source_defs(CLUBS, bool(OPENAI_API_KEY)))
+    except Exception as e:
+        hooks.reset()
+        print(f"[TRIBUN] учёт API не включён: {type(e).__name__}: {e}")
+
+
+async def tribun_tick_alerts(bot: Bot, now: datetime.datetime) -> None:
+    """Предупреждения владельцу по результатам учёта: критичный сбой источника (повторные падения, нет замены) и расход/защита.
+    Одно сообщение на событие и одно о восстановлении (raise_alert/clear_alert), без спама."""
+    reg = hooks.REGISTRY
+    if reg is None or DRY_RUN:
+        return
+    critical = {row["def"].source_id: row for row in reg.critical_failures()}
+    for source_id, d in reg.defs.items():
+        key = f"source:{source_id}"
+        if source_id in critical:
+            row = critical[source_id]
+            await raise_alert(bot, key, f"⚠️ Трибун\nИсточник «{d.name}» не отвечает {row['state'].get('consecutive_failures', 0)} раза подряд, "
+                              f"рабочей замены нет. Матчи по нему могут не находиться автоматически.", now)
+        elif alert_active(key):
+            await clear_alert(bot, key, f"✅ Трибун\nИсточник «{d.name}» снова работает.", now)
+    if hooks.TRACKER is not None:
+        for i, text in enumerate(hooks.TRACKER.pending_warnings() + (hooks.GUARD.alerts if hooks.GUARD else [])):
+            await admin_notify(bot, f"⚠️ Трибун · расходы API\n{text}")
+        if hooks.GUARD:
+            hooks.GUARD.alerts.clear()
 
 
 async def run_tribun(bot: Bot) -> list:
@@ -2780,6 +2820,7 @@ async def scheduler_loop(bot: Bot) -> None:
         await guarded("morning_retry", retry_failed_morning(bot, now))
         await guarded("announce_retry", retry_unsent_announcements(bot, now))
         await guarded("results", job_check_results(bot, now))
+        await guarded("tribun_alerts", tribun_tick_alerts(bot, now))
 
         await asyncio.sleep(seconds_until_next_event(utc_now()))
 
@@ -2797,6 +2838,7 @@ async def main():
     # перед стартом обычного постоянного цикла, а не замена ему.
     force_mode = os.environ.get("FORCE_MODE", "").strip().lower()
     bot = Bot(MAX_BOT_TOKEN)
+    setup_tribun_hooks()
     await notify_startup(bot)
     if force_mode in ("morning", "results"):
         print(f"[DEBUG] режим принудительно установлен: {force_mode} (разовая проверка перед стартом цикла)")
@@ -2815,9 +2857,10 @@ async def main():
         # же пути кода, что и боевой резерв (ask_openai_websearch).
         print("[DEBUG] режим принудительно установлен: test_openai (проверка связи с OpenAI с этого сервера)")
         try:
-            reply = await ask_openai_websearch(
-                "Не ищи ничего в интернете, просто ответь одним словом: ОК."
-            )
+            with hooks.purpose("admin_test"):
+                reply = await ask_openai_websearch(
+                    "Не ищи ничего в интернете, просто ответь одним словом: ОК."
+                )
             print(f"[DEBUG] test_openai: успех, ответ={reply!r}")
         except Exception as e:
             print(f"[DEBUG] test_openai: ОШИБКА {type(e).__name__}: {e}")

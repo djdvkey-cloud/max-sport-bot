@@ -93,8 +93,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
 
     def make(self, owner=OWNER, **kw):
         self.tribun = T.Tribun(self.bot, data_dir=self.tmp, group_chat_id=GROUP, owner_id=lambda: owner, version="test-1",
-                               now=self.clock, events_for_day=lambda day: [e for e in self.events if e["date"] == day.isoformat()],
-                               bot_username="tribun_bot", **kw)
+                               now=self.clock, bot_username="tribun_bot", **kw)
         return self.tribun
 
     # ---- помощники диалога
@@ -132,17 +131,19 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.names[uid] = name
         return await self.tribun.on_user_added(GROUP, user(uid, name, **kw))
 
-    async def onboard(self, uid, sports=("hockey",), teams=("avto",), comps=("khl",), content=("matches",), level="all"):
+    async def onboard(self, uid, sports=("hockey",), comps=("khl",), clubs=("avtomobilist",), other=None):
+        """Полный профиль через кнопки: три раздела (+ «➕ Другое» текстом) и «✅ Сохранить»."""
         await self.tribun.on_bot_started(user(uid, self.names.get(uid, "Иван")), uid, None, self.ctx(uid).reply)
         for s in sports:
-            await self.press(uid, f"t:sp:{s}:o")
-        for t in teams:
-            await self.press(uid, f"t:tm:{t}:o")
+            await self.press(uid, f"t:sp:{s}")
         for c in comps:
-            await self.press(uid, f"t:cp:{c}:o")
-        for c in content:
-            await self.press(uid, f"t:ct:{c}:o")
-        await self.press(uid, f"nl:{level}:o")
+            await self.press(uid, f"t:cp:{c}")
+        for c in clubs:
+            await self.press(uid, f"t:cl:{c}")
+        for code, text in (other or {}).items():
+            await self.press(uid, f"o:{code}")
+            await self.say(uid, text)
+        await self.press(uid, "sv")
 
 
 class Welcome(Base):
@@ -204,157 +205,29 @@ class Welcome(Base):
         self.assertEqual(self.bot.sent, [])
 
 
-class Onboarding(Base):
-    async def test_bot_started_with_interests_payload_starts_wizard(self):
-        await self.tribun.on_bot_started(user(5, "Мария"), 5, "interests", self.ctx(5).reply)
-        self.assertIn("Привет, Мария! Я Трибун", self.last_text())
-        self.assertIn(("▶️ Начать настройку", "ob:sp"), self.buttons())
-
-    async def test_full_personal_onboarding_flow(self):
-        await self.tribun.on_bot_started(user(5, "Мария"), 5, "interests", self.ctx(5).reply)
-        await self.press(5, "ob:sp")
-        self.assertIn("Шаг 1 из 5 · Виды спорта", self.last_text())
-        labels = [l for l, p in self.buttons()]
-        for sport in ("🏒 Хоккей", "⚽ Футбол", "🎾 Теннис", "🏀 Баскетбол", "🏎️ Автоспорт", "🥊 Единоборства", "⛷️ Зимние виды", "➕ Другое"):
-            self.assertIn(sport, labels)
-        await self.press(5, "t:sp:hockey:o")
-        await self.press(5, "ob:ts")
-        self.assertIn("Шаг 2 из 5 · Команды и спортсмены", self.last_text())
-        await self.press(5, "t:tm:avto:o")
-        await self.press(5, "ob:cp")
-        await self.press(5, "t:cp:khl:o")
-        await self.press(5, "ob:ct")
-        await self.press(5, "t:ct:matches:o")
-        await self.press(5, "ob:nl")
-        self.assertIn("Шаг 5 из 5", self.last_text())
-        self.assertFalse(self.profile(5)["onboarding_completed"])
-        await self.press(5, "nl:main:o")
-        self.assertIn("✅ Запомнил!", self.last_text())
-        self.assertIn("Теперь я буду учитывать твои интересы в работе «Своей Трибуны».", self.last_text())
-        self.assertEqual([p for _, p in self.buttons()], ["me", "today"])
-        p = self.profile(5)
-        self.assertTrue(p["onboarding_completed"])
-        self.assertEqual((p["sports"], p["teams"], p["competitions"], p["content_preferences"], p["notification_level"]),
-                         (["hockey"], ["Автомобилист"], ["КХЛ"], ["matches"], "main"))
-
-    async def test_multi_select_toggles_on_and_off(self):
-        await self.tribun.on_bot_started(user(5), 5, None, self.ctx(5).reply)
-        for key in ("hockey", "football", "tennis"):
-            await self.press(5, f"t:sp:{key}:o")
-        self.assertEqual(self.profile(5)["sports"], ["hockey", "football", "tennis"])
-        await self.press(5, "t:sp:football:o")
-        self.assertEqual(self.profile(5)["sports"], ["hockey", "tennis"])
-        self.assertIn("✅ 🏒 Хоккей", [l for l, _ in self.buttons()])
-        self.assertIn("⚽ Футбол", [l for l, _ in self.buttons()])
-
-    async def test_suggestions_follow_chosen_sports(self):
-        await self.tribun.on_bot_started(user(5), 5, None, self.ctx(5).reply)
-        await self.press(5, "t:sp:motorsport:o")
-        await self.press(5, "ob:ts")
-        labels = [l for l, _ in self.buttons()]
-        self.assertIn("Макс Ферстаппен", labels)
-        self.assertNotIn("Автомобилист", labels)
-        self.assertIn("Сборная России", labels)                   # общие варианты есть всегда
-
-    async def test_add_custom_team_unknown_kept_as_typed_known_canonical(self):
-        await self.tribun.on_bot_started(user(5), 5, None, self.ctx(5).reply)
-        await self.press(5, "add:tm:o")
-        self.assertIn("Напиши команды", self.last_text())
-        await self.say(5, "автомобилист\nНовая Команда FC;  Зенит ")
-        self.assertEqual(self.profile(5)["teams"], ["Автомобилист", "Новая Команда FC", "Зенит"])      # неизвестное — без правок
-        self.assertIn("Добавил: Автомобилист, Новая Команда FC, Зенит", self.last_text())
-        await self.press(5, "add:tm:o")
-        await self.say(5, "ЗЕНИТ")
-        self.assertEqual(self.profile(5)["teams"].count("Зенит"), 1)
-        self.assertIn("Это уже в списке", self.last_text())
-        labels = [l for l, _ in self.buttons()]
-        self.assertIn("✅ Новая Команда FC", labels)               # свой вариант виден и снимается кнопкой
-        key = [p for l, p in self.buttons() if l == "✅ Новая Команда FC"][0]
-        await self.press(5, key)
-        self.assertNotIn("Новая Команда FC", self.profile(5)["teams"])
-
-    async def test_custom_sport_and_athlete_and_competition(self):
-        await self.tribun.on_bot_started(user(5), 5, None, self.ctx(5).reply)
-        await self.press(5, "add:sp:o")
-        await self.say(5, "керлинг")
-        await self.press(5, "add:at:o")
-        await self.say(5, "Карлос Алькарас, Некто Неизвестный")
-        await self.press(5, "add:cp:o")
-        await self.say(5, "Чемпионат города")
-        p = self.profile(5)
-        self.assertEqual((p["sports"], p["athletes"], p["competitions"]), (["керлинг"], ["Карлос Алькарас", "Некто Неизвестный"], ["Чемпионат города"]))
-
-    async def test_empty_custom_input_asks_again(self):
-        await self.tribun.on_bot_started(user(5), 5, None, self.ctx(5).reply)
-        await self.press(5, "add:tm:o")
-        await self.say(5, "  ,  ; ")
-        self.assertIn("Не понял", self.last_text())
-        self.assertEqual(self.profile(5)["teams"], [])
-        await self.say(5, "Спартак")                                # ожидание ввода сохранилось
-        self.assertEqual(self.profile(5)["teams"], ["Спартак"])
-
-    async def test_change_one_setting_keeps_everything_else(self):
-        await self.onboard(5, sports=("hockey", "football"), teams=("avto", "zenit"), comps=("khl",), content=("matches", "results"))
-        before = {k: self.profile(5)[k] for k in ("teams", "competitions", "content_preferences", "notification_level")}
-        await self.press(5, "me")
-        self.assertIn("🏅 Виды спорта: 🏒 Хоккей, ⚽ Футбол", self.last_text())
-        await self.press(5, "ed:sp")
-        await self.press(5, "t:sp:football:e")
-        await self.press(5, "t:sp:tennis:e")
-        self.assertEqual(self.profile(5)["sports"], ["hockey", "tennis"])
-        self.assertEqual({k: self.profile(5)[k] for k in before}, before)
-        self.assertTrue(self.profile(5)["onboarding_completed"])
-        self.assertEqual([p for l, p in self.buttons() if l == "✅ Готово"], ["me"])
-        await self.press(5, "ed:nl")
-        await self.press(5, "nl:off:e")
-        self.assertEqual(self.profile(5)["notification_level"], "off")
-
-    async def test_interests_hub_lists_all_categories(self):
-        await self.onboard(5)
-        await self.press(5, "me")
-        for part in ("Виды спорта:", "Команды:", "Спортсмены:", "Турниры:", "Что интересно:", "Личные уведомления:"):
-            self.assertIn(part, self.last_text())
-        self.assertEqual({p for _, p in self.buttons()}, {"ed:sp", "ed:tm", "ed:at", "ed:cp", "ed:ct", "ed:nl", "today", "m"})
-
-    async def test_name_change_does_not_create_new_profile(self):
-        await self.onboard(5)
-        await self.tribun.on_message(self.ctx(5, text="привет", name="Иван Новый"))
-        members = self.tribun.load_members()["members"]
-        self.assertEqual(len(members), 1)
-        self.assertEqual(members["5"]["display_name"], "Иван Новый")
-        self.assertEqual(members["5"]["teams"], ["Автомобилист"])
-
-    async def test_unknown_payload_returns_to_menu(self):
-        await self.press(5, "ob:zzz")
-        self.assertIn("Своя Трибуна", self.last_text())
-
-
 class MenusAndRoles(Base):
-    async def test_member_menu_has_three_buttons_and_no_admin(self):
+    async def test_member_menu_has_exactly_three_sections_and_no_admin(self):
         await self.say(5, "/start")
-        self.assertEqual([p for _, p in self.buttons() if p in ("today", "me", "about")], ["today", "me", "about"])
         labels = [l for l, _ in self.buttons()]
-        self.assertIn("🔥 Что сегодня у меня?", labels)
-        self.assertIn("⚙️ Мои интересы", labels)
-        self.assertIn("ℹ️ О Трибуне", labels)
-        for forbidden in ("🛠 Управление Трибуной", "📨 Приглашение"):
-            self.assertNotIn(forbidden, labels)
+        self.assertEqual(labels, ["🏅 Виды спорта", "🏆 Чемпионаты", "❤️ Клубы"])
+        for gone in ("🔥 Что сегодня у меня?", "ℹ️ О Трибуне", "⚙️ Мои интересы", "🛠 Управление Трибуной", "📨 Приглашение"):
+            self.assertNotIn(gone, labels)
 
-    async def test_owner_menu_has_everything_plus_admin(self):
+    async def test_owner_menu_has_three_sections_plus_admin(self):
         await self.say(OWNER, "меню", name="Дмитрий")
-        labels = [l for l, _ in self.buttons()]
-        for item in ("🔥 Что сегодня у меня?", "⚙️ Мои интересы", "ℹ️ О Трибуне", "📨 Приглашение", "🛠 Управление Трибуной"):
-            self.assertIn(item, labels)
+        self.assertEqual([l for l, _ in self.buttons()], ["🏅 Виды спорта", "🏆 Чемпионаты", "❤️ Клубы", "🛠 Управление Трибуной"])
         await self.press(OWNER, "adm")
         labels = [l for l, _ in self.buttons()]
-        for item in ("👥 Интересы Трибуны", "👤 Участники", "📣 Публикации", "🗓 Автоматика", "⭐ Приоритеты", "📊 Состояние"):
+        for item in ("👤 Участники", "👥 Интересы Трибуны", "📝 Запросы участников", "🌐 Источники", "💰 API / расходы", "📣 Публикации",
+                     "🗓 Автоматика", "⭐ Приоритеты", "📊 Состояние", "🔔 Уведомления", "📨 Приглашение"):
             self.assertIn(item, labels)
 
     async def test_member_cannot_use_admin_callbacks_even_by_hand(self):
         await self.join(5)
         pubs = {"items": [{"id": "abc12345", "text": "секрет", "status": "draft", "published": False, "created_at": "x", "updated_at": "x"}]}
         self.tribun.save_pubs(pubs)
-        for payload in ("adm", "adm:int", "adm:mem:0", "adm:auto", "adm:state", "pub:list", "pub:new", "pub:go:abc12345", "pub:view:abc12345",
+        for payload in ("adm", "adm:int", "adm:mem:0", "adm:auto", "adm:state", "adm:rq", "adm:rqd:cp:abcd1234", "adm:src", "adm:src:gap",
+                        "adm:api", "adm:api:err", "adm:src:all", "pub:list", "pub:new", "pub:go:abc12345", "pub:view:abc12345",
                         "pub:del:abc12345", "pr:list", "pr:add", "pr:type:team", "pr:dur:x:7", "inv"):
             self.out = []
             await self.press(5, payload)
@@ -384,13 +257,13 @@ class MenusAndRoles(Base):
         self.assertEqual(self.out, [])
         await self.press(OWNER, "adm", private=False)
         self.assertEqual(self.out, [])
-        await self.press(5, "t:sp:hockey:o", private=False)
+        await self.press(5, "t:sp:hockey", private=False)
         self.assertNotIn("5", self.tribun.load_members()["members"])
 
-    async def test_about_text(self):
-        await self.press(5, "about")
-        self.assertIn("Матчи. Эмоции. Разборы. Своя компания.", self.last_text())
-        self.assertIn("🏟️ Своя Трибуна · 🤖 Трибун", self.last_text())
+    async def test_old_buttons_of_previous_menu_lead_to_main_menu(self):
+        for old in ("today", "me", "about", "ob:sp", "ed:tm", "nl:all:o", "add:tm:e", "t:tm:avto:o"):
+            await self.press(5, old)
+            self.assertEqual([l for l, _ in self.buttons()], ["🏅 Виды спорта", "🏆 Чемпионаты", "❤️ Клубы"], old)
 
     def test_no_telegram_dependencies(self):
         for name in ("tribun.py", "sport_bot.py"):
@@ -403,7 +276,7 @@ class MenusAndRoles(Base):
 class Persistence(Base):
     async def test_profiles_survive_restart_and_corrupted_file_is_not_overwritten(self):
         await self.join(5, "Мария")
-        await self.onboard(5, teams=("avto", "zenit"))
+        await self.onboard(5, sports=("hockey", "football"), clubs=("avtomobilist", "ural"))
         before = self.profile(5)
         self.make()                                                # «перезапуск»: новый экземпляр на тех же файлах
         self.assertEqual(self.profile(5), before)
@@ -412,7 +285,7 @@ class Persistence(Base):
         self.assertEqual(await self.join(6), "data-error")
         await self.say(5, "привет")
         self.assertIn("временно недоступны", self.last_text())
-        await self.press(5, "me")
+        await self.press(5, "c:sp")
         self.assertIn("временно недоступны", self.last_text())
         self.assertEqual(rd(self.tribun.members_path), "{broken")
         self.assertEqual(self.bot.group()[1:], [])
@@ -448,197 +321,6 @@ class Persistence(Base):
         self.assertTrue(self.profile(5)["active_in_group"])
         await self.tribun.on_bot_started(user(6, "Гость"), 6, None, self.ctx(6).reply)
         self.assertFalse(self.profile(6)["active_in_group"])
-
-
-class Aggregation(Base):
-    def populate(self, n, hockey_share=1.0):
-        store = self.tribun.load_members()
-        for i in range(n):
-            p = self.tribun.touch(store, 1000 + i, f"U{i}", active=True)
-            p["onboarding_completed"] = True
-            if i < n * hockey_share:
-                p["sports"], p["teams"], p["competitions"] = ["hockey"], ["Автомобилист"], ["КХЛ"]
-            p["content_preferences"] = ["matches"]
-        self.tribun.save_members(store)
-        return self.tribun.interest_map(self.tribun.load_members())
-
-    def test_interest_levels(self):
-        self.assertEqual(T.interest_level(5, 10), "high")
-        self.assertEqual(T.interest_level(4, 10), "medium")
-        self.assertEqual(T.interest_level(3, 10), "medium")
-        self.assertEqual(T.interest_level(2, 10), "niche")
-        self.assertEqual(T.interest_level(1, 4), "medium")
-        self.assertEqual(T.interest_level(0, 0), "niche")
-        self.assertEqual(T.interest_level(25, 100), "medium")
-        self.assertEqual(T.interest_level(24, 100), "niche")
-        self.assertEqual(T.interest_level(50, 100), "high")
-        self.assertEqual(T.interest_level(49, 100), "medium")
-
-    def test_aggregation_for_1_3_10_100_users(self):
-        for n in (1, 3, 10, 100):
-            self.setUp()
-            m = self.populate(n)
-            self.assertEqual((m["active"], m["configured"]), (n, n), n)
-            self.assertEqual(m["sports"], [("🏒 Хоккей", n, "high")])
-            self.assertEqual(m["teams"], [("Автомобилист", n, "high")])
-            self.assertEqual(m["competitions"], [("КХЛ", n, "high")])
-
-    def test_partial_interest_levels_on_10(self):
-        m = self.populate(10, hockey_share=0.3)
-        self.assertEqual(m["sports"], [("🏒 Хоккей", 3, "medium")])
-        m = self.populate(10, hockey_share=0.0) if False else m
-        self.assertEqual(m["configured"], 10)
-
-    async def test_text_example_and_no_personal_data(self):
-        await self.onboard(1, sports=("hockey", "football"), teams=("avto",))
-        await self.onboard(2, sports=("hockey",), teams=("avto", "zenit"))
-        await self.onboard(3, sports=("football",), teams=("zenit",))
-        for uid in (1, 2, 3):
-            await self.join(uid, f"Участник{uid}")
-        self.tribun.touch(store := self.tribun.load_members(), 4, "Без профиля", active=True)
-        self.tribun.save_members(store)
-        text = self.tribun.interest_map_text(self.tribun.load_members())
-        self.assertIn("Участников: 4", text)
-        self.assertIn("Настроили профиль: 3", text)
-        self.assertIn("🏒 Хоккей — 2 из 4", text)
-        self.assertIn("⚽ Футбол — 2 из 4", text)
-        self.assertIn("Автомобилист — 2", text)
-        self.assertIn("Зенит — 2", text)
-        self.assertNotIn("Участник1", text)                           # персональное наружу не идёт
-
-    async def test_user_without_profile_or_empty_store_does_not_break(self):
-        text = self.tribun.interest_map_text(self.tribun.load_members())
-        self.assertIn("Участников: 0", text)
-        await self.join(1)                                          # профиль есть, интересов нет
-        text = self.tribun.interest_map_text(self.tribun.load_members())
-        self.assertIn("Участников: 1", text)
-        self.assertIn("Настроили профиль: 0", text)
-        self.assertIn("Никто ещё не настроил интересы", text)
-
-    async def test_leave_excludes_return_restores(self):
-        await self.join(1)
-        await self.onboard(1, sports=("hockey",))
-        await self.join(2)
-        await self.onboard(2, sports=("hockey", "football"))
-        self.assertEqual(dict((l, n) for l, n, _ in self.tribun.interest_map(self.tribun.load_members())["sports"])["🏒 Хоккей"], 2)
-        await self.tribun.on_user_removed(GROUP, user(2))
-        m = self.tribun.interest_map(self.tribun.load_members())
-        self.assertEqual((m["active"], dict((l, n) for l, n, _ in m["sports"])), (1, {"🏒 Хоккей": 1}))
-        self.assertEqual(self.profile(2)["sports"], ["hockey", "football"])                      # профиль не удалён
-        await self.join(2)
-        m = self.tribun.interest_map(self.tribun.load_members())
-        self.assertEqual((m["active"], dict((l, n) for l, n, _ in m["sports"])["🏒 Хоккей"]), (2, 2))
-        self.assertEqual(self.profile(2)["sports"], ["hockey", "football"])                      # настройки восстановились
-
-    async def test_owner_screens(self):
-        await self.join(1, "Мария")
-        await self.onboard(1)
-        await self.join(2, "Пётр")
-        await self.press(OWNER, "adm:int")
-        self.assertIn("Участников: 2", self.last_text())
-        await self.press(OWNER, "adm:mem:0")
-        text = self.last_text()
-        self.assertIn("Участников группы: 2", text)
-        self.assertIn("✅ Настроили интересы: 1", text)
-        self.assertIn("⏳ Не настроили: 1", text)
-        self.assertIn("1. Мария — ✅ профиль", text)
-        self.assertIn("2. Пётр — ⏳ не настроил", text)
-        await self.tribun.on_user_removed(GROUP, user(2))
-        await self.press(OWNER, "adm:mem:0")
-        self.assertIn("🚪 вышел", self.last_text())
-
-
-class TodayView(Base):
-    def ev(self, club, rival, tour, time_text="19:00 (мск)", sport="hockey", date="2026-10-03", icon="🏒", aliases=()):
-        return {"club_key": club, "club_name": club, "rival": rival, "tournament": tour, "time_text": time_text, "sport_key": sport,
-                "date": date, "icon": icon, "aliases": list(aliases)}
-
-    async def test_personal_priority_by_team_and_competition(self):
-        self.events = [self.ev("ФК «Урал»", "Велес", "Первая лига", sport="football", icon="⚽", aliases=["Урал"]),
-                       self.ev("ХК «Автомобилист»", "Амур", "КХЛ", aliases=["Автомобилист"]),
-                       self.ev("«Реал Мадрид»", "Райо", "Ла Лига", sport="football", icon="⚽")]
-        await self.onboard(5, sports=("hockey",), teams=("avto",), comps=("khl",))
-        await self.press(5, "today")
-        text = self.last_text()
-        self.assertIn("⭐ По твоим интересам:", text)
-        self.assertLess(text.index("Автомобилист"), text.index("Урал"))
-        self.assertLess(text.index("Автомобилист"), text.index("Реал Мадрид"))
-        self.assertIn("Ещё сегодня у Трибуны:", text)
-        self.assertIn("ХК «Автомобилист» — Амур", text)
-        self.assertIn("19:00 (мск) · КХЛ", text)
-
-    async def test_competition_only_match(self):
-        self.events = [self.ev("ФК «Урал»", "Велес", "РПЛ", sport="football", icon="⚽", aliases=["Урал"])]
-        await self.onboard(5, sports=(), teams=(), comps=("rpl",))
-        await self.press(5, "today")
-        self.assertIn("⭐ По твоим интересам:", self.last_text())
-
-    async def test_no_events_does_not_invent(self):
-        await self.onboard(5)
-        await self.press(5, "today")
-        self.assertIn("Сегодня по моим источникам событий нет.", self.last_text())
-        self.assertNotIn("Ближайшее", self.last_text())
-        self.events = [self.ev("ХК «Автомобилист»", "Амур", "КХЛ", date="2026-10-05", aliases=["Автомобилист"])]
-        await self.press(5, "today")
-        self.assertIn("Ближайшее:", self.last_text())
-        self.assertIn("05.10 · ", self.last_text())
-
-    async def test_no_match_with_interests_shows_all_with_honest_note(self):
-        self.events = [self.ev("«Милан»", "Рома", "Серия А", sport="football", icon="⚽")]
-        await self.onboard(5, sports=("tennis",), teams=(), comps=())
-        await self.press(5, "today")
-        self.assertIn("По твоим интересам на сегодня совпадений нет", self.last_text())
-        self.assertIn("«Милан» — Рома", self.last_text())
-
-    async def test_user_without_interests_sees_everything_and_hint(self):
-        self.events = [self.ev("«Милан»", "Рома", "Серия А", sport="football", icon="⚽")]
-        await self.press(5, "today")
-        self.assertIn("Ты ещё не настроил интересы", self.last_text())
-        self.assertIn("«Милан» — Рома", self.last_text())
-
-    async def test_admin_priority_boosts_and_does_not_change_personal_interests(self):
-        self.events = [self.ev("«Милан»", "Рома", "Серия А", sport="football", icon="⚽"),
-                       self.ev("«Арсенал» Лондон", "Челси", "АПЛ", sport="football", icon="⚽", aliases=["Арсенал"])]
-        await self.onboard(5, sports=("football",), teams=(), comps=())
-        await self.press(5, "today")
-        first = self.last_text()
-        self.assertLess(first.index("Милан"), first.index("Арсенал"))        # без приоритета — как есть
-        await self.press(OWNER, "pr:add")
-        await self.press(OWNER, "pr:type:team")
-        await self.say(OWNER, "Арсенал")
-        self.assertIn("На сколько повысить «Арсенал»?", self.out[-1][1])
-        dur = [p for l, p in self.buttons() if l == "7 дней"][0]
-        before = self.profile(5)
-        await self.press(OWNER, dur)
-        self.assertIn("Команда: Арсенал", self.last_text())
-        await self.press(5, "today")
-        text = self.last_text()
-        self.assertLess(text.index("Арсенал"), text.index("Милан"))
-        self.assertIn("🔝", text)
-        self.assertEqual(self.profile(5), before)                          # личные интересы не тронуты
-
-    async def test_priority_expires_and_can_be_removed(self):
-        await self.press(OWNER, "pr:type:sport")
-        await self.say(OWNER, "football")
-        dur = [p for l, p in self.buttons() if l == "1 день"][0]
-        await self.press(OWNER, dur)
-        self.assertEqual(len(self.tribun.active_priorities()), 1)
-        self.clock.dt += datetime.timedelta(days=2)
-        self.assertEqual(self.tribun.active_priorities(), [])
-        await self.press(OWNER, "pr:list")
-        self.assertIn("Сейчас приоритетов нет", self.last_text())
-        await self.press(OWNER, "pr:type:team")
-        await self.say(OWNER, "Зенит")
-        pid = self.tribun.load_prios()["items"][-1]["id"]
-        await self.press(OWNER, f"pr:dur:{pid}:30")
-        self.assertEqual(len(self.tribun.active_priorities()), 1)
-        await self.press(OWNER, f"pr:del:{pid}")
-        self.assertEqual(self.tribun.active_priorities(), [])
-
-    async def test_unfinished_priority_does_not_count(self):
-        await self.press(OWNER, "pr:type:team")
-        await self.say(OWNER, "Спартак")                                   # длительность не выбрана
-        self.assertEqual(self.tribun.active_priorities(), [])
 
 
 class Publications(Base):
@@ -868,7 +550,7 @@ class ThroughRealDispatcher(unittest.IsolatedAsyncioTestCase):
             out.clear()
             await dp.handle(msg(5, "dialog", "привет"))
             self.assertEqual(len(out), 1)
-            self.assertIn("Выбирай", out[0][1])
+            self.assertIn("Привет, Иван", out[0][1])
             out.clear()
             await dp.handle(msg(5, "chat", "что тут", chat_id=GROUP))                 # в группе Трибун молчит
             await dp.handle(cb(5, "dialog", "adm"))                                    # member → админ-кнопка молча отклонена
@@ -876,8 +558,8 @@ class ThroughRealDispatcher(unittest.IsolatedAsyncioTestCase):
             out.clear()
             await dp.handle(cb(OWNER, "dialog", "adm"))
             self.assertTrue(any(o[0] == "callback" and "Управление Трибуной" in str(o[2]) for o in out), out)
-            await dp.handle(cb(5, "dialog", "ob:sp"))
-            await dp.handle(cb(5, "dialog", "t:sp:hockey:o"))
+            await dp.handle(cb(5, "dialog", "c:sp"))
+            await dp.handle(cb(5, "dialog", "t:sp:hockey"))
             store = club.load_members()
             self.assertEqual(store["members"]["5"]["sports"], ["hockey"])
             await dp.handle(UserRemoved.model_validate({"update_type": "user_removed", "timestamp": 1, "chat_id": GROUP, "user": u(5),

@@ -1,22 +1,28 @@
-"""«Своя Трибуна» / «Трибун» — клубный слой SPORTBOT/MAX: приветствие новых участников, личные интересы,
-карта интересов компании, пульт владельца (участники, публикации, автоматика, приоритеты, состояние).
+"""«Своя Трибуна» / «Трибун» — клубный слой SPORTBOT/MAX: приветствие новых участников, настройка интересов (три раздела),
+карта интересов компании, запросы «➕ Другое», реестр источников, учёт API и пульт владельца.
 
 Только MAX (maxapi): события UserAdded / UserRemoved / BotStarted, личные сообщения и callback-кнопки.
 Данные — JSON в /data (атомарная запись, копии). Ничего не публикуется в группу, кроме приветствия новому участнику
 и явно подтверждённых владельцем публикаций (черновик → предпросмотр → «📢 Опубликовать» → успешный ответ MAX).
-Персональные интересы наружу не публикуются: наружу идут только агрегаты (и только владельцу в личке)."""
+
+Личка обычного участника нужна ТОЛЬКО для настройки интересов: персональных спортивных сообщений нет, вся спортивная
+повестка — в группе. Интересы наружу не публикуются: только агрегаты и только владельцу в личке.
+Интересы НЕ влияют на публикации шести клубов SPORTBOT (афиша, утренние анонсы, результаты живут в sport_bot.py)."""
 import asyncio
 import datetime
 import hashlib
-import json
 import os
 import re
-import shutil
-import tempfile
 import uuid
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
+
+import costs
+import sources as src
+import tribun_catalog as C
+from tribun_io import (TribunDataError, atomic_write_json, backup_file, mask_secrets, read_strict,   # noqa: F401  (реэкспорт для sport_bot)
+                       utc_now)
 
 YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 
@@ -59,118 +65,22 @@ INVITE_TEXT = (
     "Матчи. Эмоции. Разборы. Своя компания. 🔥\n\n"
     "👉 Вступить:\n{link}"
 )
-
-ABOUT_TEXT = (
-    f"{GROUP_NAME} · {BOT_NAME}\n{SLOGAN}\n\n"
-    "Я Трибун — спортивный помощник нашей компании в MAX. Слежу за интересными матчами, расписанием и результатами, "
-    "учитываю интересы участников и не засоряю группу лишним.\n\n"
-    "⚙️ «Мои интересы» — выбери виды спорта, команды, спортсменов и турниры; менять можно в любой момент.\n"
-    "🔥 «Что сегодня у меня?» — события дня с учётом твоих интересов.\n\n"
-    "Твои интересы видишь только ты: в группе я их не публикую. Владельцу доступна лишь общая картина по компании."
-)
-
 # ============================================================
-# Каталоги выбора (стабильные ключи; подписи можно менять)
+# Разделы интересов и служебные константы
 # ============================================================
 
-SPORTS = [("hockey", "🏒", "Хоккей"), ("football", "⚽", "Футбол"), ("tennis", "🎾", "Теннис"), ("basketball", "🏀", "Баскетбол"),
-          ("motorsport", "🏎️", "Автоспорт"), ("martial", "🥊", "Единоборства"), ("winter", "⛷️", "Зимние виды")]
-TEAMS = [("avto", "Автомобилист", "hockey"), ("ska", "СКА", "hockey"), ("akbars", "Ак Барс", "hockey"),
-         ("sinara", "Синара", "football"), ("ural", "Урал", "football"), ("zenit", "Зенит", "football"),
-         ("spartak", "Спартак", "football"), ("real", "Реал Мадрид", "football"), ("arsenal", "Арсенал", "football"),
-         ("milan", "Милан", "football"), ("russia", "Сборная России", "*")]
-ATHLETES = [("verstappen", "Макс Ферстаппен", "motorsport"), ("hamilton", "Льюис Хэмилтон", "motorsport"),
-            ("alcaraz", "Карлос Алькарас", "tennis"), ("sinner", "Янник Синнер", "tennis"),
-            ("medvedev", "Даниил Медведев", "tennis"), ("ovechkin", "Александр Овечкин", "hockey")]
-COMPETITIONS = [("khl", "КХЛ", "hockey"), ("rpl", "РПЛ", "football"), ("cuprus", "Кубок России", "football"),
-                ("ucl", "Лига чемпионов", "football"), ("atp", "ATP/WTA", "tennis"), ("f1", "Формула-1", "motorsport"),
-                ("olymp", "Олимпиада", "winter"), ("wc", "Чемпионаты мира", "*")]
-CONTENT = [("matches", "🔥", "Важные матчи"), ("results", "🏁", "Результаты"), ("analysis", "🧠", "Разборы"),
-           ("stats", "📊", "Статистика"), ("news", "🗞", "Новости"), ("predictions", "🎯", "Прогнозы"), ("main", "⭐", "Только главное")]
-NOTIFY = [("all", "🔔", "Всё важное"), ("main", "⭐", "Только главное"), ("off", "🔕", "Без личных уведомлений")]
-
-CATS = {  # код категории → (поле профиля, заголовок, каталог)
-    "sp": ("sports", "Мои виды спорта"),
-    "tm": ("teams", "Мои команды"),
-    "at": ("athletes", "Мои спортсмены"),
-    "cp": ("competitions", "Мои турниры"),
-    "ct": ("content_preferences", "Что мне интересно"),
-}
-SPORT_BY_KEY = {k: (icon, name) for k, icon, name in SPORTS}
-CONTENT_BY_KEY = {k: (icon, name) for k, icon, name in CONTENT}
-NOTIFY_BY_KEY = {k: (icon, name) for k, icon, name in NOTIFY}
-CONTENT_NAME = {k: name for k, icon, name in CONTENT}
-NOTIFY_NAME = {"all": "всё важное", "main": "только главное", "off": "без личных уведомлений"}
-SPORT_FAMILY_TO_KEY = {"hockey": "hockey", "football": "football", "futsal": "football", "tennis": "tennis",
-                       "basketball": "basketball", "motorsport": "motorsport"}
-
-ONBOARDING_STEPS = ["sp", "ts", "cp", "ct", "nl"]
+CAT_TITLE = {"sp": "🏅 Виды спорта", "cp": "🏆 Чемпионаты", "cl": "❤️ Клубы"}
+FIELD = {"sp": "sports", "cp": "championships", "cl": "clubs"}          # код раздела → поле профиля
+NEXT_SECTION = {"sp": "cp", "cp": "cl"}
+OTHER_PROMPT = {"sp": "✍️ Напиши, какой ещё вид спорта тебе интересен (можно несколько — через запятую):",
+                "cp": "✍️ Напиши, какой ещё чемпионат тебе интересен (можно несколько — через запятую):",
+                "cl": "✍️ Напиши, какой ещё клуб тебе интересен (можно несколько — через запятую):"}
+SAVED_TEXT = "✅ Интересы сохранены"
+CAT_WORD = {C.CAT_SPORT: "спорт", C.CAT_CHAMP: "чемпионат", C.CAT_CLUB: "клуб"}
 ADMIN_PREFIXES = ("adm", "pub", "pr", "inv")
 MAX_CUSTOM_LEN = 60
 
 HIGH_SHARE, MEDIUM_SHARE = 0.5, 0.25
-
-
-# ============================================================
-# Хранилище: атомарная запись, копии, строгое чтение
-# ============================================================
-
-class TribunDataError(Exception):
-    def __init__(self, path, reason):
-        super().__init__(f"{os.path.basename(path)}: {reason}")
-        self.path, self.reason = path, reason
-
-
-def atomic_write_json(path: str, data) -> None:
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def backup_file(path: str, keep: int = 30, min_age_seconds: int = 300) -> None:
-    """Копия действующего файла перед перезаписью (не чаще раза в min_age_seconds, хранится последних keep)."""
-    if not os.path.exists(path):
-        return
-    try:
-        folder = os.path.join(os.path.dirname(path), "backups")
-        os.makedirs(folder, exist_ok=True)
-        prefix = os.path.splitext(os.path.basename(path))[0] + "-"
-        names = sorted(n for n in os.listdir(folder) if n.startswith(prefix) and n.endswith(".json"))
-        if names and (datetime.datetime.now().timestamp() - os.path.getmtime(os.path.join(folder, names[-1]))) < min_age_seconds:
-            return
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        shutil.copy2(path, os.path.join(folder, f"{prefix}{stamp}.json"))
-        for old in sorted(n for n in os.listdir(folder) if n.startswith(prefix) and n.endswith(".json"))[:-keep]:
-            os.unlink(os.path.join(folder, old))
-    except Exception as e:
-        print(f"[TRIBUN] не удалось сделать копию {path}: {e}")
-
-
-def read_strict(path: str, default):
-    """Нет файла → default. Файл повреждён → TribunDataError (не пустая база, ничего не перезаписывается)."""
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        raise TribunDataError(path, f"{type(e).__name__}: {e}")
-
-
-def mask_secrets(text: str) -> str:
-    return re.sub(r"[A-Za-z0-9_\-]{24,}", "***", text or "")
 
 
 def record_tick(data_dir: str, now: datetime.datetime | None = None) -> None:
@@ -238,21 +148,29 @@ def parse_custom(text: str) -> list:
     return items[:10]
 
 
-def item_key(text: str) -> str:
-    return "c" + hashlib.sha1(norm(text).encode("utf-8")).hexdigest()[:8]
-
-
 def now_default() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
 def new_profile(user_id: int, display_name: str, stamp: str) -> dict:
-    return {"user_id": user_id, "display_name": display_name, "sports": [], "teams": [], "athletes": [], "competitions": [],
-            "content_preferences": [], "notification_level": None, "onboarding_completed": False, "welcomed": False,
-            "active_in_group": False, "created_at": stamp, "updated_at": stamp,
+    return {"user_id": user_id, "display_name": display_name, "schema": 2, "sports": [], "championships": [], "clubs": [],
+            "onboarding_completed": False, "welcomed": False, "active_in_group": False, "created_at": stamp, "updated_at": stamp,
             # служебное для пульта владельца
             "ever_in_group": False, "joined_at": None, "joined_source": None, "left_at": None, "returned_at": None,
             "join_notified": False, "completion_notified": False, "interests_updated_at": None}
+
+
+def normalize_profile(profile: dict) -> dict:
+    """Профиль старого формата (release 1) читается без разрушительной миграции: недостающие поля новой модели добавляются, ничего
+    не удаляется (старые teams/athletes/competitions/content_preferences/notification_level остаются в файле нетронутыми и просто не
+    используются). Чемпионаты и клубы берутся из старых полей, только если точно совпали с каталогом."""
+    if "championships" not in profile:
+        profile["championships"] = [k for k in (C.match_catalog(C.CAT_CHAMP, v) for v in profile.get("competitions", [])) if k]
+    if "clubs" not in profile:
+        profile["clubs"] = [k for k in (C.match_catalog(C.CAT_CLUB, v) for v in profile.get("teams", [])) if k]
+    profile.setdefault("sports", [])
+    profile.setdefault("schema", 2)
+    return profile
 
 
 def strip_icon(label: str) -> str:
@@ -329,9 +247,9 @@ class Ctx:
 class Tribun:
     def __init__(self, bot, *, data_dir: str, group_chat_id: int, owner_id: Callable[[], int | None], version: str,
                  dry_run: bool = False, now: Callable[[], datetime.datetime] = now_default,
-                 events_for_day: Callable[[datetime.date], list] | None = None,
                  automation: Callable[[], list] | None = None, status: Callable[[], dict] | None = None,
-                 bot_username: str | None = None):
+                 bot_username: str | None = None, registry: src.SourceRegistry | None = None,
+                 tracker: costs.UsageTracker | None = None):
         self.bot = bot
         self.data_dir = data_dir
         self.group_chat_id = group_chat_id
@@ -339,14 +257,16 @@ class Tribun:
         self.version = version
         self.dry_run = dry_run
         self.now = now
-        self.events_for_day = events_for_day or (lambda day: [])
         self.automation = automation or (lambda: [])
         self.status = status or (lambda: {})
         self.bot_username = bot_username
+        self.registry = registry
+        self.tracker = tracker
         self.awaiting: dict = {}                      # ожидание текстового ввода (в памяти): user_id → состояние
         self.lock = asyncio.Lock()
         self.published_guard: set = set()             # id публикаций, уже отправленных в этом процессе
         self.members_path = os.path.join(data_dir, "tribun_members.json")
+        self.requests_path = os.path.join(data_dir, "tribun_requests.json")
         self.pubs_path = os.path.join(data_dir, "tribun_publications.json")
         self.prios_path = os.path.join(data_dir, "tribun_priorities.json")
         self._link_cache = (None, None)
@@ -384,6 +304,7 @@ class Tribun:
         elif display_name and display_name != profile.get("display_name"):
             profile["display_name"] = display_name              # смена имени не создаёт новый профиль (ключ — user_id)
             profile["updated_at"] = self.stamp()
+        normalize_profile(profile)                                # профиль старого формата читается без потери данных
         if active is not None and profile.get("active_in_group") != active:
             profile["active_in_group"] = active
             profile["updated_at"] = self.stamp()
@@ -503,15 +424,18 @@ class Tribun:
         return f"🔄 {profile['display_name']} вернулся на «Свою Трибуну»\n\n{tail}"
 
     def completion_card(self, profile: dict) -> str:
-        def lines(values, cat):
-            return "\n".join(values) if values else "—"
-        sports = "\n".join(self.value_label("sp", v) for v in profile["sports"]) or "—"
-        favs = lines(profile["teams"] + profile["athletes"], "tm")
-        comps = lines(profile["competitions"], "cp")
-        content = "\n".join(CONTENT_NAME.get(v, v).lower() for v in profile["content_preferences"]) or "—"
-        notify = NOTIFY_NAME.get(profile.get("notification_level"), "не выбрано")
-        return (f"✅ {profile['display_name']} настроил интересы\n\n{sports}\n\n❤️ Команды / спортсмены:\n{favs}\n\n"
-                f"🏆 Турниры:\n{comps}\n\n🔥 Интересует:\n{content}\n\n🔔 Личные уведомления:\n{notify}")
+        """Карточка владельцу: 🏅 Спорт / 🏆 Чемпионаты / ❤️ Клубы / ➕ Запросы."""
+        profile = normalize_profile(dict(profile))
+        mine = self.user_requests(self.load_requests(), profile["user_id"])
+        eff = self.effective(profile)
+
+        def block(title, code):
+            names = [self.label(code, k) for k in eff[code]] + [f"➕ {r['raw_text']}" for r in mine if r["category"] == C.CODE_TO_CAT[code]]
+            return f"{title}\n" + ("\n".join(names) if names else "—")
+        asked = "\n".join(f"{r['raw_text']} ({CAT_WORD[r['category']]})"
+                          for r in mine) or "—"
+        return (f"✅ {profile['display_name']} настроил интересы\n\n" + block("🏅 Спорт:", "sp") + "\n\n" + block("🏆 Чемпионаты:", "cp")
+                + "\n\n" + block("❤️ Клубы:", "cl") + f"\n\n➕ Запросы:\n{asked}")
 
     async def owner_join_notice(self, user_id: int) -> None:
         store = self.load_members()
@@ -662,12 +586,10 @@ class Tribun:
         """Человек открыл личный диалог с Трибуном (кнопка «Начать» / ссылка с start=interests)."""
         try:
             profile = await self.ensure_profile(user.user_id, display_name_of(user))
+            text, rows = self.main_menu(profile, self.is_owner(user.user_id))
         except TribunDataError as e:
             print(f"[TRIBUN] {e}")
             return
-        done = profile["onboarding_completed"]
-        text, rows = (self.main_menu(profile, self.is_owner(user.user_id)) if done and payload != "interests"
-                      else self.onboarding_intro(profile))
         await reply(text, rows)
 
     async def is_group_member(self, user_id: int) -> bool:
@@ -687,11 +609,10 @@ class Tribun:
             if state:
                 await self.handle_awaited(ctx, state)
                 return
-            text, rows = self.main_menu(profile, self.is_owner(ctx.user_id))
-            if not profile["onboarding_completed"]:
-                text += "\n\n👉 Настрой интересы — это занимает минуту."
-                rows = [[Btn("⚙️ Настроить интересы", "ob:sp")]] + rows
-            await ctx.reply(text, rows)
+            if self.is_owner(ctx.user_id) and (ctx.text or "").strip().casefold().startswith("/цена"):
+                await ctx.reply(self.price_command(ctx.text), None)
+                return
+            await ctx.reply(*self.main_menu(profile, self.is_owner(ctx.user_id)))
         except TribunDataError as e:
             print(f"[TRIBUN] {e}")
             await ctx.reply("⚠️ Данные Трибуны временно недоступны. Попробуй чуть позже.", None)
@@ -723,412 +644,308 @@ class Tribun:
 
     async def route(self, ctx: Ctx, head: str, payload: str) -> None:
         parts = payload.split(":")
-        self.awaiting.pop(ctx.user_id, None) if head not in ("add", "pr") else None
+        if head not in ("o", "pr"):
+            self.awaiting.pop(ctx.user_id, None)
         owner = self.is_owner(ctx.user_id)
         profile = await self.ensure_profile(ctx.user_id, ctx.display_name)
         if head in ("m", ""):
             await ctx.edit(*self.main_menu(profile, owner))
-        elif head == "about":
-            await ctx.edit(ABOUT_TEXT, [[Btn("🏠 Меню", "m")]])
-        elif head == "today":
-            await ctx.edit(*self.today_view(profile))
-        elif head == "me":
-            await ctx.edit(*self.interests_hub(profile))
-        elif head == "ob":
-            await ctx.edit(*self.onboarding_screen(profile, parts[1]))
-        elif head == "ed":
-            await ctx.edit(*(self.nl_edit_screen(profile) if parts[1] == "nl" else self.category_screen(profile, parts[1], "e")))
-        elif head == "t":                                     # t:<cat>:<key>:<mode>
-            await self.toggle(ctx, profile, parts[1], parts[2], parts[3])
-        elif head == "add":                                   # add:<cat>:<mode>
-            self.awaiting[ctx.user_id] = {"kind": "custom", "cat": parts[1], "mode": parts[2]}
-            await ctx.edit(self.add_prompt(parts[1]), [[Btn("⬅️ Отмена", self.back_payload(parts[1], parts[2]))]])
-        elif head == "nl":                                    # nl:<level>:<mode>
-            await self.set_notification(ctx, profile, parts[1], parts[2])
+        elif head == "c":                                     # c:<раздел>
+            await ctx.edit(*self.category_screen(profile, self.section(parts[1])))
+        elif head == "t":                                     # t:<раздел>:<ключ каталога>
+            await self.toggle(ctx, self.section(parts[1]), parts[2])
+        elif head == "rt":                                    # rt:<раздел>:<id запроса>
+            await self.toggle_request(ctx, self.section(parts[1]), parts[2])
+        elif head == "o":                                     # o:<раздел> — «➕ Другое»
+            code = self.section(parts[1])
+            self.awaiting[ctx.user_id] = {"kind": "other", "code": code}
+            await ctx.edit(OTHER_PROMPT[code], [[Btn("⬅️ Отмена", f"c:{code}")]])
+        elif head == "sv":
+            await self.save_interests(ctx)
         elif head == "inv":
             await ctx.edit(*await self.invite_view())
         elif head in ADMIN_PREFIXES:
             await self.route_admin(ctx, head, parts)
-        else:
+        else:                                                 # старые кнопки прежнего меню и всё неизвестное → главное меню
             await ctx.edit(*self.main_menu(profile, owner))
 
-    # ---- меню ---------------------------------------------------------------------------
+    @staticmethod
+    def section(code: str) -> str:
+        if code not in CAT_TITLE:
+            raise ValueError("неизвестный раздел")
+        return code
+
+    # ---- запросы «➕ Другое» -----------------------------------------------------------------------
+
+    def load_requests(self) -> dict:
+        data = read_strict(self.requests_path, {"items": []})
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise TribunDataError(self.requests_path, "неверная структура")
+        return data
+
+    def save_requests(self, data: dict) -> None:
+        backup_file(self.requests_path)
+        atomic_write_json(self.requests_path, data)
+
+    def add_request(self, data: dict, user_id: int, category: str, raw: str) -> tuple:
+        """Запрос участника: (category, raw_text, normalized_text, user_id, created_at, active). Повтор того же — не дубль, а возврат в active."""
+        normalized = C.normalize_request(raw)
+        for item in data["items"]:
+            if item["user_id"] == int(user_id) and item["category"] == category and item["normalized_text"] == normalized:
+                if not item["active"]:
+                    item["active"], item["updated_at"] = True, self.stamp()
+                    return item, True
+                return item, False
+        item = {"id": uuid.uuid4().hex[:8], "category": category, "raw_text": raw, "normalized_text": normalized,
+                "user_id": int(user_id), "created_at": self.stamp(), "active": True}
+        data["items"].append(item)
+        return item, True
+
+    def user_requests(self, data: dict, user_id: int, category: str | None = None) -> list:
+        return [i for i in data["items"] if i["user_id"] == int(user_id) and i["active"] and (category is None or i["category"] == category)]
+
+    # ---- выбор и зависимости ------------------------------------------------------------------------------
+
+    def stored_sports(self, profile: dict) -> list:
+        return [k for k, _, _, _ in C.SPORTS if k in profile.get("sports", [])]
+
+    def options(self, code: str, profile: dict) -> list:
+        """[(ключ, подпись)] — варианты раздела. Чемпионаты и клубы — только для выбранных видов спорта."""
+        sports = self.stored_sports(profile)
+        if code == "sp":
+            return [(k, f"{icon} {name}") for k, icon, name, _ in C.SPORTS]
+        if code == "cp":
+            return [(c[0], c[1]) for c in C.competitions_for(sports)]
+        return [(c[0], c[1]) for c in C.clubs_for(sports)]
+
+    def effective(self, profile: dict) -> dict:
+        """Что реально учитывается: убранный вид спорта скрывает свои чемпионаты/клубы (данные при этом не теряются)."""
+        sports = self.stored_sports(profile)
+        return {"sp": sports,
+                "cp": [c[0] for c in C.competitions_for(sports) if c[0] in profile.get("championships", [])],
+                "cl": [c[0] for c in C.clubs_for(sports) if c[0] in profile.get("clubs", [])]}
+
+    def is_complete(self, profile: dict, requests: list) -> bool:
+        """Профиль настроен = в каждом из трёх разделов есть выбор: вариант каталога или активный запрос «Другое»."""
+        eff = self.effective(profile)
+        wanted = {r["category"] for r in requests if r["active"]}
+        return all(eff[code] or C.CODE_TO_CAT[code] in wanted for code in ("sp", "cp", "cl"))
+
+    def label(self, code: str, key: str) -> str:
+        if code == "sp":
+            icon, name = C.SPORT_BY_KEY[key]
+            return f"{icon} {name}"
+        return C.COMP_BY_KEY[key][1] if code == "cp" else C.CLUB_BY_KEY[key][1]
+
+    def chosen_text(self, profile: dict, code: str, requests: list) -> str:
+        names = [self.label(code, k) for k in self.effective(profile)[code]]
+        names += [f"➕ {r['raw_text']}" for r in requests if r["category"] == C.CODE_TO_CAT[code] and r["active"]]
+        return ", ".join(names) if names else "пока ничего"
+
+    def mark_changed(self, profile: dict, requests: list) -> None:
+        profile["updated_at"] = profile["interests_updated_at"] = self.stamp()
+        profile["onboarding_completed"] = self.is_complete(profile, requests)
+
+    # ---- экраны личного меню -------------------------------------------------------------------------------
 
     def main_menu(self, profile: dict, owner: bool):
-        text = f"{GROUP_NAME} · {BOT_NAME}\n{SLOGAN}\n\nПривет, {profile['display_name']}! Выбирай 👇"
-        rows = [[Btn("🔥 Что сегодня у меня?", "today")], [Btn("⚙️ Мои интересы", "me")], [Btn("ℹ️ О Трибуне", "about")]]
+        requests = self.user_requests(self.load_requests(), profile["user_id"])
+        lines = [f"{GROUP_NAME} · {BOT_NAME}", SLOGAN, "", f"Привет, {profile['display_name']}!",
+                 "Отметь, что тебе интересно, — это нужно, чтобы Трибун знал вкусы компании. "
+                 "Матчи, афиши и результаты — в группе."]
+        if self.is_complete(profile, requests):
+            lines += ["", f"🏅 Виды спорта: {self.chosen_text(profile, 'sp', requests)}",
+                      f"🏆 Чемпионаты: {self.chosen_text(profile, 'cp', requests)}",
+                      f"❤️ Клубы: {self.chosen_text(profile, 'cl', requests)}"]
+        else:
+            lines += ["", "👉 Выбери хотя бы по одному пункту в каждом из трёх разделов."]
+        rows = [[Btn(CAT_TITLE["sp"], "c:sp")], [Btn(CAT_TITLE["cp"], "c:cp")], [Btn(CAT_TITLE["cl"], "c:cl")]]
         if owner:
-            rows += [[Btn("📨 Приглашение", "inv")], [Btn("🛠 Управление Трибуной", "adm")]]
-        return text, rows
+            rows.append([Btn("🛠 Управление Трибуной", "adm")])
+        return "\n".join(lines), rows
 
-    def onboarding_intro(self, profile: dict):
-        text = (f"{GROUP_NAME}\n\nПривет, {profile['display_name']}! Я Трибун 🤖\n"
-                "Давай за минуту настроим твои интересы: виды спорта, команды, спортсмены, турниры и что тебе интересно. "
-                "Потом всё можно поменять в «⚙️ Мои интересы».")
-        return text, [[Btn("▶️ Начать настройку", "ob:sp")], [Btn("🏠 Меню", "m")]]
-
-    # ---- опции категорий ---------------------------------------------------------------------
-
-    def selected_sports(self, profile: dict) -> set:
-        return set(profile["sports"])
-
-    def catalog(self, cat: str, profile: dict) -> list:
-        """[(key, label, value)] — варианты каталога, подходящие выбранным видам спорта (если не выбраны — все)."""
-        chosen = self.selected_sports(profile)
-
-        def fits(tag: str) -> bool:
-            return tag == "*" or not chosen or tag in chosen
-        if cat == "sp":
-            return [(k, f"{icon} {name}", k) for k, icon, name in SPORTS]
-        if cat == "tm":
-            return [(k, name, name) for k, name, tag in TEAMS if fits(tag)]
-        if cat == "at":
-            return [(k, name, name) for k, name, tag in ATHLETES if fits(tag)]
-        if cat == "cp":
-            return [(k, name, name) for k, name, tag in COMPETITIONS if fits(tag)]
-        if cat == "ct":
-            return [(k, f"{icon} {name}", k) for k, icon, name in CONTENT]
-        raise ValueError("неизвестная категория")
-
-    def value_label(self, cat: str, value: str) -> str:
-        if cat == "sp":
-            icon, name = SPORT_BY_KEY.get(value, ("➕", value))
-            return f"{icon} {name}"
-        if cat == "ct":
-            icon, name = CONTENT_BY_KEY.get(value, ("•", value))
-            return f"{icon} {name}"
-        return value
-
-    def canonical_value(self, cat: str, text: str) -> str:
-        """Известное название приводится к каноническому написанию каталога; неизвестное остаётся как написал человек."""
-        for key, label, value in self.catalog_full(cat):
-            names = [norm(value), norm(label)] + ([norm(SPORT_BY_KEY[key][1])] if cat == "sp" else [])
-            if norm(text) in names:
-                return value
-        return text
-
-    def catalog_full(self, cat: str) -> list:
-        return self.catalog(cat, {"sports": []})
-
-    def option_buttons(self, cat: str, profile: dict, mode: str) -> list:
-        field = CATS[cat][0]
-        selected = {norm(v) for v in profile[field]}
-        buttons, shown = [], set()
-        for key, label, value in self.catalog(cat, profile):
-            shown.add(norm(value))
-            mark = "✅ " if norm(value) in selected else ""
-            buttons.append(Btn(mark + label, f"t:{cat}:{key}:{mode}"))
-        for value in profile[field]:                                   # свои варианты, уже выбранные человеком
-            if norm(value) not in shown and not (cat in ("sp", "ct") and value in (SPORT_BY_KEY if cat == "sp" else CONTENT_BY_KEY)):
-                buttons.append(Btn("✅ " + self.value_label(cat, value), f"t:{cat}:{item_key(value)}:{mode}"))
-        return buttons
-
-    def resolve_option(self, cat: str, key: str, profile: dict):
-        for k, label, value in self.catalog_full(cat):
-            if k == key:
-                return value
-        for value in profile[CATS[cat][0]]:
-            if item_key(value) == key:
-                return value
-        return None
-
-    def add_prompt(self, cat: str) -> str:
-        return {"sp": "✍️ Напиши, какой ещё вид спорта тебе интересен (можно несколько — через запятую):",
-                "tm": "✍️ Напиши команды (по одной в строке или через запятую), например:\nАвтомобилист\nЗенит\nСборная России",
-                "at": "✍️ Напиши спортсменов (по одному в строке или через запятую), например:\nМакс Ферстаппен\nКарлос Алькарас",
-                "cp": "✍️ Напиши турниры (по одному в строке или через запятую):"}[cat]
-
-    def back_payload(self, cat: str, mode: str) -> str:
-        if mode == "o":
-            return "ob:" + ("ts" if cat in ("tm", "at") else {"sp": "sp", "cp": "cp", "ct": "ct"}[cat])
-        return f"ed:{cat}"
-
-    # ---- экраны выбора ------------------------------------------------------------------------
-
-    def selection_summary(self, cat: str, profile: dict) -> str:
-        values = profile[CATS[cat][0]]
-        return ", ".join(self.value_label(cat, v) for v in values) if values else "пока ничего"
-
-    def category_screen(self, profile: dict, cat: str, mode: str):
-        title = CATS[cat][1]
-        text = f"⚙️ {title}\n\nСейчас: {self.selection_summary(cat, profile)}\n\nНажимай, чтобы выбрать или убрать."
-        rows = grid(self.option_buttons(cat, profile, mode))
-        if cat in ("sp", "cp"):
-            rows.append([Btn("➕ Другое", f"add:{cat}:{mode}")])
-        elif cat == "tm":
-            rows.append([Btn("➕ Добавить команду", f"add:tm:{mode}")])
-        elif cat == "at":
-            rows.append([Btn("➕ Добавить спортсмена", f"add:at:{mode}")])
-        rows.append([Btn("✅ Готово", "me")] if mode == "e" else [])
-        return text, [r for r in rows if r]
-
-    def onboarding_screen(self, profile: dict, step: str):
-        n = ONBOARDING_STEPS.index(step) + 1
-        head = f"Шаг {n} из {len(ONBOARDING_STEPS)}"
-        prev_step = ONBOARDING_STEPS[n - 2] if n > 1 else None
-        next_step = ONBOARDING_STEPS[n] if n < len(ONBOARDING_STEPS) else None
-        nav = []
-        if prev_step:
-            nav.append(Btn("◀️ Назад", f"ob:{prev_step}"))
-        if next_step:
-            nav.append(Btn("Далее ▶️", f"ob:{next_step}"))
-        if step == "ts":
-            text = (f"{head} · Команды и спортсмены\n\nКоманды: {self.selection_summary('tm', profile)}\n"
-                    f"Спортсмены: {self.selection_summary('at', profile)}\n\nВыбирай несколько или добавь своё.")
-            rows = grid(self.option_buttons("tm", profile, "o")) + [[Btn("➕ Добавить команду", "add:tm:o")]] + \
-                grid(self.option_buttons("at", profile, "o")) + [[Btn("➕ Добавить спортсмена", "add:at:o")]]
-        elif step == "nl":
-            level = profile.get("notification_level")
-            text = f"{head} · Личные уведомления\n\nКак часто писать тебе в личку?"
-            rows = [[Btn(("✅ " if level == k else "") + f"{icon} {name}", f"nl:{k}:o")] for k, icon, name in NOTIFY]
-            nav = [Btn("◀️ Назад", f"ob:{prev_step}")]
+    def category_screen(self, profile: dict, code: str, note: str = ""):
+        requests = self.user_requests(self.load_requests(), profile["user_id"], C.CODE_TO_CAT[code])
+        chosen = set(self.effective(profile)[code])
+        options = self.options(code, profile)
+        text = f"{CAT_TITLE[code]}\n\nСейчас: {self.chosen_text(profile, code, self.user_requests(self.load_requests(), profile['user_id']))}\n\n"
+        if code != "sp" and not self.stored_sports(profile):
+            text += "Чемпионаты и клубы подбираются под выбранные виды спорта — сначала отметь вид спорта."
         else:
-            cat = {"sp": "sp", "cp": "cp", "ct": "ct"}[step]
-            titles = {"sp": "Виды спорта", "cp": "Турниры", "ct": "Что тебе интересно"}
-            text = f"{head} · {titles[step]}\n\nСейчас: {self.selection_summary(cat, profile)}\n\nМожно выбрать несколько."
-            rows = grid(self.option_buttons(cat, profile, "o"))
-            if cat in ("sp", "cp"):
-                rows.append([Btn("➕ Другое", f"add:{cat}:o")])
-        if nav:
-            rows.append(nav)
-        return text, rows
+            text += "Нажимай, чтобы выбрать или убрать."
+        buttons = [Btn(("✅ " if key in chosen else "") + label, f"t:{code}:{key}") for key, label in options]
+        buttons += [Btn(f"✅ ➕ {r['raw_text']}", f"rt:{code}:{r['id']}") for r in requests]
+        rows = grid(buttons)
+        if code != "sp" and not self.stored_sports(profile):
+            rows.append([Btn(CAT_TITLE["sp"], "c:sp")])
+        rows.append([Btn("➕ Другое", f"o:{code}")])
+        nav = [Btn("✅ Сохранить", "sv")]
+        if code in NEXT_SECTION:
+            nav.append(Btn("Дальше ▶️", f"c:{NEXT_SECTION[code]}"))
+        rows += [nav, [Btn("⬅️ Назад", "m")]]
+        return (f"{note}\n\n{text}" if note else text), rows
 
-    def interests_hub(self, profile: dict):
-        level = profile.get("notification_level")
-        notify = " ".join(NOTIFY_BY_KEY[level]) if level in NOTIFY_BY_KEY else "не выбрано"
-        text = (
-            "⚙️ Мои интересы\n\n"
-            f"🏅 Виды спорта: {self.selection_summary('sp', profile)}\n"
-            f"👥 Команды: {self.selection_summary('tm', profile)}\n"
-            f"⭐ Спортсмены: {self.selection_summary('at', profile)}\n"
-            f"🏆 Турниры: {self.selection_summary('cp', profile)}\n"
-            f"🎯 Что интересно: {self.selection_summary('ct', profile)}\n"
-            f"🔔 Личные уведомления: {notify}\n\n"
-            "Выбери, что изменить — остальное не трогаю.")
-        rows = [[Btn("🏅 Мои виды спорта", "ed:sp"), Btn("👥 Мои команды", "ed:tm")],
-                [Btn("⭐ Мои спортсмены", "ed:at"), Btn("🏆 Мои турниры", "ed:cp")],
-                [Btn("🎯 Что мне интересно", "ed:ct"), Btn("🔔 Личные уведомления", "ed:nl")],
-                [Btn("🔥 Что сегодня у меня?", "today"), Btn("🏠 Меню", "m")]]
-        return text, rows
+    # ---- изменения профиля ------------------------------------------------------------------------------------------
 
-    # ---- изменения профиля ------------------------------------------------------------------------
-
-    async def toggle(self, ctx: Ctx, profile: dict, cat: str, key: str, mode: str) -> None:
+    async def toggle(self, ctx: Ctx, code: str, key: str) -> None:
+        unavailable = False
         async with self.lock:
             store = self.load_members()
+            requests = self.load_requests()
             profile = self.touch(store, ctx.user_id)
-            value = self.resolve_option(cat, key, profile)
-            if value is None:
-                await ctx.edit("Этот вариант уже недоступен. Открой настройки заново.", [[Btn("⚙️ Мои интересы", "me")]])
-                return
-            field = CATS[cat][0]
-            kept = [v for v in profile[field] if norm(v) != norm(value)]
-            profile[field] = kept if len(kept) != len(profile[field]) else profile[field] + [value]
-            profile["updated_at"] = profile["interests_updated_at"] = self.stamp()
-            self.save_members(store)
-        if mode == "o":
-            step = "ts" if cat in ("tm", "at") else cat
-            await ctx.edit(*self.onboarding_screen(profile, step))
-        else:
-            await ctx.edit(*self.category_screen(profile, cat, "e"))
-
-    async def set_notification(self, ctx: Ctx, profile: dict, level: str, mode: str) -> None:
-        if level not in NOTIFY_BY_KEY:
+            if key not in {k for k, _ in self.options(code, profile)}:
+                unavailable = True
+            else:
+                field = FIELD[code]
+                profile[field] = [v for v in profile[field] if v != key] if key in profile[field] else profile[field] + [key]
+                self.mark_changed(profile, self.user_requests(requests, ctx.user_id))
+                self.save_members(store)
+        if unavailable:
+            await ctx.edit("Этот вариант сейчас недоступен. Открой раздел заново.", [[Btn(CAT_TITLE[code], f"c:{code}")]])
             return
+        await ctx.edit(*self.category_screen(profile, code))
+
+    async def toggle_request(self, ctx: Ctx, code: str, rid: str) -> None:
+        async with self.lock:
+            store = self.load_members()
+            requests = self.load_requests()
+            profile = self.touch(store, ctx.user_id)
+            item = next((i for i in requests["items"] if i["id"] == rid and i["user_id"] == ctx.user_id
+                         and i["category"] == C.CODE_TO_CAT[code]), None)
+            if item is not None:                                   # чужой запрос по id не тронуть
+                item["active"], item["updated_at"] = not item["active"], self.stamp()
+                self.save_requests(requests)
+                self.mark_changed(profile, self.user_requests(requests, ctx.user_id))
+                self.save_members(store)
+        await ctx.edit(*self.category_screen(profile, code))
+
+    async def save_interests(self, ctx: Ctx) -> None:
+        """«✅ Сохранить»: данные уже записаны при каждом выборе; здесь подтверждение и (один раз, при первом полном профиле) карточка владельцу."""
         async with self.lock:
             store = self.load_members()
             profile = self.touch(store, ctx.user_id)
-            profile["notification_level"] = level
-            profile["updated_at"] = profile["interests_updated_at"] = self.stamp()
-            first_completion = mode == "o" and not profile["onboarding_completed"]
-            if mode == "o":
-                profile["onboarding_completed"] = True
+            requests = self.user_requests(self.load_requests(), ctx.user_id)
+            profile["onboarding_completed"] = self.is_complete(profile, requests)
+            first = profile["onboarding_completed"] and not profile.get("completion_notified")
             self.save_members(store)
-        if first_completion:
+        if first:
             await self.owner_completion_notice(ctx.user_id)
-        if mode == "o":
-            await ctx.edit("✅ Запомнил!\n\nТеперь я буду учитывать твои интересы в работе «Своей Трибуны».",
-                           [[Btn("⚙️ Мои интересы", "me")], [Btn("🔥 Что сегодня у меня?", "today")]])
-        else:
-            await ctx.edit(*self.nl_edit_screen(profile))
-
-    def nl_edit_screen(self, profile: dict):
-        level = profile.get("notification_level")
-        rows = [[Btn(("✅ " if level == k else "") + f"{icon} {name}", f"nl:{k}:e")] for k, icon, name in NOTIFY]
-        rows.append([Btn("✅ Готово", "me")])
-        return "⚙️ Личные уведомления\n\nКак часто писать тебе в личку?", rows
+        text, rows = self.main_menu(profile, self.is_owner(ctx.user_id))
+        await ctx.edit(f"{SAVED_TEXT}\n\n{text}", rows)
 
     async def handle_awaited(self, ctx: Ctx, state: dict) -> None:
         kind = state["kind"]
-        if kind == "custom":
+        if kind == "other":
             self.awaiting.pop(ctx.user_id, None)
-            cat, mode = state["cat"], state["mode"]
+            code = state["code"]
+            category = C.CODE_TO_CAT[code]
             items = parse_custom(ctx.text)
             if not items:
                 self.awaiting[ctx.user_id] = state
-                await ctx.reply("Не понял. " + self.add_prompt(cat), [[Btn("⬅️ Отмена", self.back_payload(cat, mode))]])
+                await ctx.reply("Не понял. " + OTHER_PROMPT[code], [[Btn("⬅️ Отмена", f"c:{code}")]])
                 return
+            notes = []
             async with self.lock:
                 store = self.load_members()
+                requests = self.load_requests()
                 profile = self.touch(store, ctx.user_id)
-                field = CATS[cat][0]
-                added = []
-                for item in items:
-                    value = self.canonical_value(cat, item)
-                    if all(norm(v) != norm(value) for v in profile[field]):
-                        profile[field].append(value)
-                        added.append(value)
-                profile["updated_at"] = profile["interests_updated_at"] = self.stamp()
+                for raw in items:
+                    key = C.match_catalog(category, raw)
+                    if key:                                        # это уже есть в справочнике — обычный выбор, а не запрос
+                        if key not in profile[FIELD[code]]:
+                            profile[FIELD[code]].append(key)
+                        notes.append(f"{self.label(code, key)} — есть в списке, отметил")
+                    else:
+                        item, new = self.add_request(requests, ctx.user_id, category, raw)
+                        notes.append(f"{item['raw_text']} — запрос отправлен" if new else f"{item['raw_text']} — уже в запросах")
+                self.save_requests(requests)
+                self.mark_changed(profile, self.user_requests(requests, ctx.user_id))
                 self.save_members(store)
-            note = ("Добавил: " + ", ".join(added)) if added else "Это уже в списке."
-            if mode == "o":
-                text, rows = self.onboarding_screen(profile, "ts" if cat in ("tm", "at") else cat)
-            else:
-                text, rows = self.category_screen(profile, cat, "e")
-            await ctx.reply(f"✅ {note}\n\n{text}", rows)
+            await ctx.reply(*self.category_screen(profile, code, "✅ " + "\n✅ ".join(notes)))
             return
         if not self.is_owner(ctx.user_id):                      # дальше — только владелец
             self.awaiting.pop(ctx.user_id, None)
             return
         await self.handle_admin_text(ctx, state)
 
-    # ---- «Что сегодня у меня?» -----------------------------------------------------------------------------
-
-    def event_score(self, profile: dict, ev: dict, prios: list):
-        score, reasons = 0, []
-        club, rival, tour = norm(ev.get("club_name", "")), norm(ev.get("rival", "")), norm(ev.get("tournament", ""))
-        aliases = [norm(a) for a in ev.get("aliases", [])]
-        for team in profile["teams"]:
-            t = norm(team)
-            if t and (t in club or any(t == a or t in a for a in aliases) or t in rival):
-                score += 3
-                reasons.append(team)
-                break
-        for ath in profile["athletes"]:
-            a = norm(ath)
-            if a and (a in rival or a in club or a in tour):
-                score += 3
-                reasons.append(ath)
-                break
-        for comp in profile["competitions"]:
-            c = norm(comp)
-            if c and c in tour:
-                score += 2
-                reasons.append(comp)
-                break
-        if ev.get("sport_key") and ev["sport_key"] in profile["sports"]:
-            score += 1
-            reasons.append(SPORT_BY_KEY.get(ev["sport_key"], ("", ev["sport_key"]))[1])
-        boosted = False
-        for p in prios:
-            v = norm(p["value"])
-            if (p["type"] == "team" and (v in club or v in rival)) or (p["type"] == "competition" and v in tour) or \
-                    (p["type"] == "sport" and v == norm(ev.get("sport_key", ""))) or \
-                    (p["type"] == "event" and v and (v in club or v in rival or v in tour)):
-                boosted = True
-        return score + (1 if boosted else 0), reasons, boosted
-
-    def fmt_event(self, ev: dict) -> str:
-        line = f"{ev.get('icon', '🏟️')} {ev['club_name']} — {ev['rival']}\n   🗓 {ev.get('time_text') or 'время уточняется'}"
-        if ev.get("tournament"):
-            line += f" · {ev['tournament']}"
-        return line
-
-    def today_view(self, profile: dict):
-        today = self.now().astimezone(YEKB_TZ).date()
-        prios = self.active_priorities()
-        events = self.events_for_day(today)
-        has_interests = any(profile[f] for f in ("sports", "teams", "athletes", "competitions"))
-        head = f"🔥 Что сегодня у меня — {today:%d.%m.%Y}"
-        rows = [[Btn("⚙️ Мои интересы", "me"), Btn("🏠 Меню", "m")]]
-        if not events:
-            soon = []
-            for offset in range(1, 8):
-                day = today + datetime.timedelta(days=offset)
-                for ev in self.events_for_day(day):
-                    soon.append((day, ev))
-            text = f"{head}\n\nСегодня по моим источникам событий нет."
-            if soon:
-                scored = sorted(soon, key=lambda de: (-self.event_score(profile, de[1], prios)[0], de[0]))[:3]
-                text += "\n\nБлижайшее:\n" + "\n".join(f"{d:%d.%m} · " + self.fmt_event(ev).replace("\n   🗓 ", " · ") for d, ev in scored)
-            if not has_interests:
-                text += "\n\nНастрой интересы, чтобы я подсказывал именно твоё."
-            return text, rows
-        ranked = sorted(((self.event_score(profile, ev, prios), ev) for ev in events), key=lambda x: -x[0][0])
-        mine = [(sc, ev) for sc, ev in ranked if sc[1]]                 # совпавшие по личным интересам
-        rest = [(sc, ev) for sc, ev in ranked if not sc[1]]
-        lines = [head]
-        if mine:
-            lines += ["", "⭐ По твоим интересам:"] + [self.fmt_event(ev) + (" 🔝" if sc[2] else "") for sc, ev in mine]
-            if rest:
-                lines += ["", "Ещё сегодня у Трибуны:"] + [self.fmt_event(ev) + (" 🔝" if sc[2] else "") for sc, ev in rest]
-        else:
-            lines += ["", ("По твоим интересам на сегодня совпадений нет — вот что есть у Трибуны:" if has_interests
-                           else "Ты ещё не настроил интересы — вот что сегодня у Трибуны:")]
-            lines += [self.fmt_event(ev) + (" 🔝" if sc[2] else "") for sc, ev in ranked]
-        return "\n".join(lines), rows
-
     # ---- агрегат интересов ------------------------------------------------------------------------------------
 
     def active_profiles(self, store: dict) -> list:
         return [p for p in store["members"].values() if p.get("active_in_group")]
 
-    def interest_map(self, store: dict) -> dict:
+    def interest_map(self, store: dict, requests: dict | None = None) -> dict:
+        """Агрегат по участникам, ВСЁ ещё состоящим в группе. Убранный вид спорта скрывает свои чемпионаты/клубы (effective)."""
+        requests = requests or self.load_requests()
         active = self.active_profiles(store)
         total = len(active)
-        configured = sum(1 for p in active if p.get("onboarding_completed"))
+        by_user = {p["user_id"]: self.user_requests(requests, p["user_id"]) for p in active}
+        configured = sum(1 for p in active if self.is_complete(normalize_profile(p), by_user[p["user_id"]]))
+        tallies = {"sp": {}, "cp": {}, "cl": {}}
+        for p in active:
+            for code, keys in self.effective(normalize_profile(p)).items():
+                for key in keys:
+                    tallies[code][key] = tallies[code].get(key, 0) + 1
 
-        def tally(field: str, label_cat: str):
-            counts, labels = {}, {}
-            for p in active:
-                for v in {norm(x): x for x in p.get(field, [])}.values():
-                    k = norm(v)
-                    counts[k] = counts.get(k, 0) + 1
-                    labels.setdefault(k, self.value_label(label_cat, v))
-            ranked = sorted(counts.items(), key=lambda kv: (-kv[1], labels[kv[0]]))
-            return [(labels[k], n, interest_level(n, total)) for k, n in ranked]
-        return {"active": total, "configured": configured, "sports": tally("sports", "sp"), "teams": tally("teams", "tm"),
-                "athletes": tally("athletes", "at"), "competitions": tally("competitions", "cp"),
-                "content": tally("content_preferences", "ct")}
+        def ranked(code: str):
+            rows = [(self.label(code, k), n, interest_level(n, total)) for k, n in tallies[code].items()]
+            return sorted(rows, key=lambda r: (-r[1], r[0]))
+        groups = self.request_groups(store, requests)
+        return {"active": total, "configured": configured, "sports": ranked("sp"), "championships": ranked("cp"), "clubs": ranked("cl"),
+                "requests": len(groups), "keys": {code: dict(t) for code, t in tallies.items()}}
 
     def interest_map_text(self, store: dict) -> str:
         m = self.interest_map(store)
         total = m["active"]
         lines = ["👥 Интересы «Своей Трибуны»", "", f"Участников: {total}", f"Настроили профиль: {m['configured']}"]
         if m["sports"]:
-            lines += [""] + [f"{label} — {n} из {total}" for label, n, level in m["sports"][:8]]
-        for title, key in (("❤️ Команды:", "teams"), ("⭐ Спортсмены:", "athletes"), ("🏆 Турниры:", "competitions")):
-            if m[key]:
-                lines += ["", title] + [f"{label} — {n}" for label, n, level in m[key][:8]]
-        if m["content"]:
-            lines += ["", "🔥 Контент:"] + [f"{strip_icon(label)} — {n}" for label, n, level in m["content"][:8]]
+            lines += [""] + [f"{label} — {n}" for label, n, level in m["sports"]]
+        if m["championships"]:
+            lines += ["", "🏆 Чемпионаты:"] + [f"{label} — {n}" for label, n, level in m["championships"][:10]]
+        if m["clubs"]:
+            lines += ["", "❤️ Клубы:"] + [f"{label} — {n}" for label, n, level in m["clubs"][:10]]
         if not total:
             lines += ["", "Пока в группе нет участников с профилем."]
         elif not m["configured"]:
             lines += ["", "Никто ещё не настроил интересы."]
-        ed = self.editorial_summary(store)
-        for lvl, title in (("high", "Высокий"), ("medium", "Средний")):
-            parts = [f"{name}: {', '.join(ed[lvl][key])}" for key, name in (("sports", "виды спорта"), ("teams", "команды"),
-                                                                              ("athletes", "спортсмены"), ("competitions", "турниры"),
-                                                                              ("content", "контент")) if ed[lvl][key]]
-            if parts:
-                lines += ["", f"🎯 {title} интерес (для редакции): " + "; ".join(parts)]
-        lines += ["", "Считаются только участники в группе. От 50% — высокий, 25–49% — средний, ниже — нишевый. Карта пересчитывается сама."]
+        if m["requests"]:
+            lines += ["", f"➕ Запросов «Другое»: {m['requests']} — смотри «📝 Запросы участников»."]
+        lines += ["", "Считаются только участники, которые сейчас в группе."]
         return "\n".join(lines)
 
     def editorial_summary(self, store: dict) -> dict:
         """Данные для будущей редакционной логики: что вызывает высокий / средний / нишевый интерес у активных участников."""
         m = self.interest_map(store)
-        out = {lvl: {key: [label for label, n, level in m[key] if level == lvl]
-                     for key in ("sports", "teams", "athletes", "competitions", "content")} for lvl in ("high", "medium", "niche")}
+        out = {lvl: {key: [label for label, n, level in m[key] if level == lvl] for key in ("sports", "championships", "clubs")}
+               for lvl in ("high", "medium", "niche")}
         out["active"] = m["active"]
         return out
 
     def high_interest(self, store: dict | None = None) -> dict:
-        """high-interest sports / teams / athletes / competitions и предпочитаемые типы контента (≥50% активных участников)."""
+        """Виды спорта / чемпионаты / клубы с высоким интересом (≥50% активных участников)."""
         ed = self.editorial_summary(store or self.load_members())["high"]
-        return {"sports": ed["sports"], "teams": ed["teams"], "athletes": ed["athletes"], "competitions": ed["competitions"],
-                "preferred_content": ed["content"]}
+        return {"sports": ed["sports"], "championships": ed["championships"], "clubs": ed["clubs"]}
+
+    def request_groups(self, store: dict, requests: dict | None = None) -> list:
+        """Активные запросы «Другое» по нормализованному названию в разрезе раздела. Считаются только участники, ещё состоящие в группе;
+        имена наружу не отдаются."""
+        requests = requests or self.load_requests()
+        active_ids = {p["user_id"] for p in self.active_profiles(store)}
+        groups: dict = {}
+        for it in requests["items"]:
+            if not it["active"] or it["user_id"] not in active_ids:
+                continue
+            g = groups.setdefault((it["category"], it["normalized_text"]),
+                                  {"category": it["category"], "normalized": it["normalized_text"], "label": it["raw_text"],
+                                   "users": set(), "first": it["created_at"]})
+            g["users"].add(it["user_id"])
+            if it["created_at"] < g["first"]:
+                g["first"], g["label"] = it["created_at"], it["raw_text"]
+        out = [{**g, "count": len(g["users"]), "key": hashlib.sha1(f"{g['category']}|{g['normalized']}".encode()).hexdigest()[:8]}
+               for g in groups.values()]
+        for g in out:
+            del g["users"]
+        return sorted(out, key=lambda g: (-g["count"], g["normalized"]))
+
 
     # ---- приглашение ------------------------------------------------------------------------------------------
 
@@ -1229,14 +1046,15 @@ class Tribun:
                 print(f"[TRIBUN] публикация отправлена (message_id={mid}), но запись не сохранена: {e}")
             return "ok", pub
 
-    # ---- пульт владельца ----------------------------------------------------------------------------------------------
 
     def admin_hub(self):
         text = f"🛠 Управление Трибуной\n{GROUP_NAME} · {BOT_NAME}"
-        rows = [[Btn("👥 Интересы Трибуны", "adm:int"), Btn("👤 Участники", "adm:mem:0")],
-                [Btn("📣 Публикации", "pub:list"), Btn("🗓 Автоматика", "adm:auto")],
-                [Btn("⭐ Приоритеты", "pr:list"), Btn("📊 Состояние", "adm:state")],
-                [Btn("🔔 Уведомления", "adm:ns"), Btn("📨 Приглашение", "inv")], [Btn("🏠 Меню", "m")]]
+        rows = [[Btn("👤 Участники", "adm:mem:0"), Btn("👥 Интересы Трибуны", "adm:int")],
+                [Btn("📝 Запросы участников", "adm:rq"), Btn("🌐 Источники", "adm:src")],
+                [Btn("💰 API / расходы", "adm:api"), Btn("📣 Публикации", "pub:list")],
+                [Btn("🗓 Автоматика", "adm:auto"), Btn("⭐ Приоритеты", "pr:list")],
+                [Btn("📊 Состояние", "adm:state"), Btn("🔔 Уведомления", "adm:ns")],
+                [Btn("📨 Приглашение", "inv")], [Btn("🏠 Меню", "m")]]
         return text, rows
 
     async def route_admin(self, ctx: Ctx, head: str, parts: list) -> None:
@@ -1246,14 +1064,23 @@ class Tribun:
         back = [[Btn("🛠 Управление", "adm"), Btn("🏠 Меню", "m")]]
         if head == "adm":
             sub = parts[1] if len(parts) > 1 else ""
+            arg = parts[2] if len(parts) > 2 else ""
             if sub == "":
                 await ctx.edit(*self.admin_hub())
             elif sub == "int":
                 await ctx.edit(self.interest_map_text(self.load_members()), back)
             elif sub == "mem":
-                await ctx.edit(*self.members_view(int(parts[2]) if len(parts) > 2 else 0))
+                await ctx.edit(*self.members_view(int(arg) if arg else 0))
             elif sub == "mc":
-                await ctx.edit(*self.member_card(int(parts[2])))
+                await ctx.edit(*self.member_card(int(arg)))
+            elif sub == "rq":
+                await ctx.edit(*self.requests_view())
+            elif sub == "rqd":
+                await ctx.edit(*self.request_detail(parts[2], parts[3]))
+            elif sub == "src":
+                await ctx.edit(*self.sources_screen(arg))
+            elif sub == "api":
+                await ctx.edit(*self.api_screen(arg))
             elif sub == "ns":
                 await ctx.edit(*self.notify_settings_view())
             elif sub == "nt":
@@ -1273,9 +1100,10 @@ class Tribun:
 
     def members_view(self, page: int):
         store = self.load_members()
+        requests = self.load_requests()
         members = sorted(store["members"].values(), key=lambda p: (not p.get("active_in_group"), norm(p["display_name"])))
         active = [p for p in members if p.get("active_in_group")]
-        configured = sum(1 for p in active if p.get("onboarding_completed"))
+        configured = sum(1 for p in active if self.is_complete(normalize_profile(p), self.user_requests(requests, p["user_id"])))
         size = 8
         pages = max(1, (len(members) + size - 1) // size)
         page = max(0, min(page, pages - 1))
@@ -1283,7 +1111,8 @@ class Tribun:
                  f"⏳ Не настроили: {len(active) - configured}", ""]
         rows = []
         for i, p in enumerate(members[page * size:(page + 1) * size], page * size + 1):
-            state = ("🚪 вышел" if not p.get("active_in_group") else "✅ профиль" if p.get("onboarding_completed") else "⏳ не настроил")
+            done = self.is_complete(normalize_profile(p), self.user_requests(requests, p["user_id"]))
+            state = "🚪 вышел" if not p.get("active_in_group") else "✅ профиль" if done else "⏳ не настроил"
             lines.append(f"{i}. {p['display_name']} — {state}")
             rows.append([Btn(f"{i}. {p['display_name']}", f"adm:mc:{p['user_id']}")])
         if not members:
@@ -1303,21 +1132,22 @@ class Tribun:
         profile = self.load_members()["members"].get(str(uid))
         if profile is None:
             return "Участник не найден.", [[Btn("👤 Участники", "adm:mem:0")]]
+        profile = normalize_profile(dict(profile))
+        mine = self.user_requests(self.load_requests(), uid)
 
         def when(value):
             return f"{value[8:10]}.{value[5:7]}.{value[0:4]} {value[11:16]}" if value else "—"
 
-        def names(values, cat=None):
-            return ", ".join(values) if values else "—"
-        sports = ", ".join(SPORT_BY_KEY[v][1] if v in SPORT_BY_KEY else v for v in profile["sports"]) or "—"
-        sports = sports[:1].upper() + sports[1:].lower() if all(v in SPORT_BY_KEY for v in profile["sports"]) and sports != "—" else sports
-        content = ", ".join(CONTENT_NAME.get(v, v).lower() for v in profile["content_preferences"]) or "—"
+        def asked(cat):
+            return ", ".join(r["raw_text"] for r in mine if r["category"] == cat) or "—"
         source = {"event": "", "sync": " (обнаружен при подключении Трибуна)", "dialog": " (определён по личному диалогу)"}.get(profile.get("joined_source"), "")
+        eff = self.effective(profile)
         lines = [f"👤 {profile['display_name']}", "", "Статус:", "✅ В группе" if profile.get("active_in_group") else "🚪 Вышел из группы", "",
-                 "Профиль:", "✅ Настроен" if profile.get("onboarding_completed") else "⏳ Не настроен", "",
-                 f"🏒 Виды спорта:\n{sports}", "", f"❤️ Команды / спортсмены:\n{names(profile['teams'] + profile['athletes'])}", "",
-                 f"🏆 Турниры:\n{names(profile['competitions'])}", "", f"🔥 Контент:\n{content}", "",
-                 f"🔔 Уведомления:\n{NOTIFY_NAME.get(profile.get('notification_level'), '—')}", "",
+                 "Профиль:", "✅ Настроен" if self.is_complete(profile, mine) else "⏳ Не настроен", "",
+                 "🏅 Виды спорта:\n" + (", ".join(self.label("sp", k) for k in eff["sp"]) or "—"), "",
+                 "🏆 Чемпионаты:\n" + (", ".join(self.label("cp", k) for k in eff["cp"]) or "—"), "",
+                 "❤️ Клубы:\n" + (", ".join(self.label("cl", k) for k in eff["cl"]) or "—"), "",
+                 f"➕ Запросы «Другое»:\nспорт: {asked(C.CAT_SPORT)}\nчемпионаты: {asked(C.CAT_CHAMP)}\nклубы: {asked(C.CAT_CLUB)}", "",
                  f"Дата вступления:\n{when(profile.get('joined_at'))}{source}", "",
                  f"Последнее изменение профиля:\n{when(profile.get('interests_updated_at'))}", "", "Только просмотр: личные предпочтения участника не редактируются."]
         return "\n".join(lines), [[Btn("👤 К списку", "adm:mem:0"), Btn("🛠 Управление", "adm")]]
@@ -1333,6 +1163,258 @@ class Tribun:
                 rows.append([Btn(f"{'Выключить' if on else 'Включить'}: {title}", f"adm:nt:{key}")])
         rows.append([Btn("🛠 Управление", "adm"), Btn("🏠 Меню", "m")])
         return "\n".join(lines), rows
+
+    # ---- «📝 Запросы участников» ----------------------------------------------------------------------------------
+
+    ADMIN_BACK = [Btn("🛠 Управление", "adm"), Btn("🏠 Меню", "m")]
+
+    def requests_view(self):
+        store = self.load_members()
+        groups = self.request_groups(store)
+        lines = ["📝 Запросы участников", "", "Что участники попросили через «➕ Другое» (без имён). Запрос ничего не включает сам: "
+                 "новый источник, парсер или публикации появятся только по вашему решению.", ""]
+        rows = []
+        for cat, title in ((C.CAT_SPORT, CAT_TITLE["sp"]), (C.CAT_CHAMP, CAT_TITLE["cp"]), (C.CAT_CLUB, CAT_TITLE["cl"])):
+            mine = [g for g in groups if g["category"] == cat]
+            if mine:
+                lines += [title + ":"] + [f"{g['label']} — {g['count']}" for g in mine] + [""]
+                rows += [[Btn(f"{g['label']} — {g['count']}", f"adm:rqd:{C.CAT_TO_CODE[cat]}:{g['key']}")] for g in mine[:6]]
+        if not groups:
+            lines.append("Запросов пока нет.")
+        return "\n".join(lines).rstrip(), rows + [self.ADMIN_BACK]
+
+    def request_detail(self, code: str, key: str):
+        group = next((g for g in self.request_groups(self.load_members()) if g["key"] == key and C.CAT_TO_CODE[g["category"]] == code), None)
+        back = [[Btn("📝 Запросы", "adm:rq"), Btn("🛠 Управление", "adm")]]
+        if group is None:
+            return "Запрос не найден (возможно, уже снят участниками).", back
+        status, note = self.coverage_of_request(group["category"], group["normalized"])
+        if self.registry is None:
+            cover = "реестр источников не подключён"
+        else:
+            cover = f"{src.COVERAGE_ICON[status]} {status} — {src.COVERAGE_TEXT[status]}" + (f"\n   ({note})" if note else "")
+        verdict = ("Источников нет: добавлять или нет — решает владелец, автоматически ничего не подключается." if status == src.GAP
+                   else "Уже есть источник, но публикации по этому интересу сами не включаются.")
+        lines = ["📝 Запрос участников", "", f"Раздел: {CAT_TITLE[code]}", f"Название: {group['label']}", f"Нормализовано: {group['normalized']}",
+                 f"Активных запросивших: {group['count']}", f"Покрытие источниками: {cover}", "", f"Статус: {verdict}"]
+        return "\n".join(lines), back
+
+    def coverage_of_request(self, category: str, normalized: str) -> tuple:
+        if self.registry is None:
+            return src.GAP, ""
+        return self.registry.request_coverage(category, normalized)
+
+    # ---- «🌐 Источники» --------------------------------------------------------------------------------------------
+
+    def when_text(self, iso: str | None) -> str:
+        try:
+            return datetime.datetime.fromisoformat(iso).astimezone(YEKB_TZ).strftime("%d.%m %H:%M") if iso else "—"
+        except ValueError:
+            return "—"
+
+    def sport_status_line(self, sport_key: str) -> str:
+        reg = self.registry
+        status, note = reg.sport_coverage(sport_key)
+        name = C.SPORT_BY_KEY[sport_key][1]
+        if status == src.GAP:
+            return f"🟡 {name} — источников пока нет"
+        if status == src.FAILED:
+            return f"❌ {name} — источники не отвечают"
+        if status == src.FALLBACK_ONLY:
+            return f"🟡 {name} — только поиск, без прямого источника"
+        healths = [reg.health(d.source_id) for c in C.CLUBS if c[2] == sport_key for d in reg.serving_club(c[0]) if d.source_type != src.SEARCH and d.enabled]
+        if any(h in (src.DEGRADED, src.FAILED_HEALTH) for h in healths):
+            return f"🟡 {name} — есть сбои"
+        if any(h == src.OK for h in healths):
+            return f"✅ {name} — OK"
+        return f"✅ {name} — настроен, ещё не проверялся"
+
+    def uncovered_interests(self, store: dict) -> list:
+        """Интересы участников, у которых НЕТ рабочего источника (GAP/FAILED): выбранные из каталога и запросы «Другое»."""
+        reg = self.registry
+        if reg is None:
+            return []
+        m = self.interest_map(store)
+        out = []
+        for code, cat in (("sp", C.CAT_SPORT), ("cp", C.CAT_CHAMP), ("cl", C.CAT_CLUB)):
+            for key, n in m["keys"][code].items():
+                status, note = ((reg.sport_coverage(key) if code == "sp" else reg.competition_coverage(key) if code == "cp" else reg.club_coverage(key)))
+                if status in (src.GAP, src.FAILED):
+                    out.append({"category": cat, "label": self.label(code, key), "count": n, "status": status, "note": note, "kind": "catalog"})
+        for g in self.request_groups(store):
+            status, note = reg.request_coverage(g["category"], g["normalized"])
+            if status in (src.GAP, src.FAILED):
+                out.append({"category": g["category"], "label": g["label"], "count": g["count"], "status": status, "note": note, "kind": "request"})
+        return sorted(out, key=lambda x: (-x["count"], x["label"]))
+
+    def sources_screen(self, sub: str):
+        back = [[Btn("🌐 Источники", "adm:src"), Btn("🛠 Управление", "adm")]]
+        reg = self.registry
+        if reg is None:
+            return "🌐 Источники\n\nРеестр источников не подключён.", [self.ADMIN_BACK]
+        rows_ = reg.rows()
+        enabled = [r for r in rows_ if r["def"].enabled]
+        if sub == "cov":
+            lines = ["🏟 Покрытие", "", "Покрытие = что SPORTBOT реально отслеживает (шесть клубов), а не «весь спорт».", "", "Виды спорта:"]
+            for key, icon, name, _ in C.SPORTS:
+                st, note = reg.sport_coverage(key)
+                lines.append(f"{src.COVERAGE_ICON[st]} {name} — {src.COVERAGE_TEXT[st]}" + (f" ({note})" if note else ""))
+            lines += ["", "Чемпионаты:"]
+            for c in C.COMPETITIONS:
+                st, note = reg.competition_coverage(c[0])
+                lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
+            lines += ["", "Клубы:"]
+            for c in C.CLUBS:
+                st, note = reg.club_coverage(c[0])
+                lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
+            return "\n".join(lines), back
+        if sub == "all":
+            lines = ["🌍 Все источники", "", "Иерархия: официальный → прямой → агрегатор → медиа → поиск. Поиск (Tavily/OpenAI) и AI — не источники фактов: "
+                     "счёт всегда сверяется.", ""]
+            for r in rows_:
+                d, st = r["def"], r["state"]
+                tail = "" if d.enabled else " (выключен)"
+                lines.append(f"{src.HEALTH_ICON[r['health']] if d.enabled else '⏸'} {d.name}{tail}")
+                lines.append(f"   тип {d.source_type} · {', '.join(d.purpose)} · последний успех {self.when_text(st.get('last_success_at'))} · "
+                             f"ошибок подряд {st.get('consecutive_failures', 0)}")
+            return "\n".join(lines), back
+        if sub == "prob":
+            bad = [r for r in enabled if r["health"] in (src.DEGRADED, src.FAILED_HEALTH)]
+            lines = ["⚠️ Проблемы", ""]
+            for r in bad:
+                st = r["state"]
+                lines.append(f"{src.HEALTH_ICON[r['health']]} {r['def'].name}")
+                lines.append(f"   ошибок подряд {st.get('consecutive_failures', 0)} · последняя {self.when_text(st.get('last_failure_at'))}"
+                             f" · {st.get('last_error_short') or 'без текста'}")
+            if not bad:
+                lines.append("Проблем с источниками сейчас нет.")
+            return "\n".join(lines), back
+        if sub == "gap":
+            store = self.load_members()
+            gaps = self.uncovered_interests(store)
+            lines = ["🧩 Непокрытые интересы", "", "Участники выбрали или попросили, но надёжного источника нет. Ничего не подключается и не публикуется автоматически.", ""]
+            for g in gaps:
+                title = {C.CAT_SPORT: "вид спорта", C.CAT_CHAMP: "чемпионат", C.CAT_CLUB: "клуб"}[g["category"]]
+                lines.append(f"{src.COVERAGE_ICON[g['status']]} {g['label']} ({title}) — {g['count']} · "
+                             f"{'запрос «Другое»' if g['kind'] == 'request' else 'выбран из списка'}")
+            if not gaps:
+                lines.append("Непокрытых интересов нет.")
+            return "\n".join(lines), back
+        working = sum(1 for r in enabled if r["health"] == src.OK)
+        problem = sum(1 for r in enabled if r["health"] in (src.DEGRADED, src.FAILED_HEALTH))
+        unknown = sum(1 for r in enabled if r["health"] == src.UNKNOWN)
+        lines = ["🌐 Источники", ""] + [self.sport_status_line(key) for key, *_ in C.SPORTS]
+        lines += ["", f"✅ Рабочих источников: {working}", f"⚠️ С проблемами: {problem}", f"▫️ Ещё не проверялись: {unknown}",
+                  f"🧩 Непокрытых интересов: {len(self.uncovered_interests(self.load_members()))}"]
+        rows = [[Btn("🏟 Покрытие", "adm:src:cov"), Btn("🌍 Все источники", "adm:src:all")],
+                [Btn("⚠️ Проблемы", "adm:src:prob"), Btn("🧩 Непокрытые интересы", "adm:src:gap")], self.ADMIN_BACK]
+        return "\n".join(lines), rows
+
+    # ---- «💰 API / расходы» ----------------------------------------------------------------------------------------
+
+    @staticmethod
+    def num(n) -> str:
+        return f"{int(n):,}".replace(",", " ")
+
+    def provider_line(self, provider: str, s: dict | None) -> str:
+        title = costs.PROVIDER_TITLE[provider]
+        if not s or not (s["real"] or s["cached"] or s["failed"]):
+            return f"{title}: вызовов нет"
+        parts = [f"{self.num(s['real'])} вызовов"]
+        if s["units"]:
+            parts.append(f"кредитов {self.num(s['units'])}")
+        if s["input_tokens"] or s["output_tokens"]:
+            parts.append(f"токены {self.num(s['input_tokens'])} вх / {self.num(s['output_tokens'])} исх")
+        parts += [f"из кэша {self.num(s['cached'])}", f"ошибок {self.num(s['failed'])}"]
+        return f"{title}: " + " · ".join(parts)
+
+    def cost_line(self, summary: dict, providers=None) -> str:
+        totals, unknown, calls = {}, 0, 0
+        for p, s in summary["providers"].items():
+            if providers and p not in providers:
+                continue
+            calls += s["real"]
+            unknown += s["cost_unknown"]
+            for cur, amt in s["cost"].items():
+                totals[cur] = totals.get(cur, 0.0) + amt
+        if not calls:
+            return "Оценка стоимости: —"
+        money = " + ".join(f"{amt:.4f} {cur}" for cur, amt in sorted(totals.items()))
+        if not totals:
+            return "Оценка стоимости: неизвестна (цены не заданы)"
+        return f"Оценка стоимости: ≈ {money}" + (f"; для {unknown} вызовов цены нет — их стоимость неизвестна" if unknown else "")
+
+    def period_block(self, title: str, prefix: str, providers) -> list:
+        s = self.tracker.summary(prefix)
+        lines = [title] + [self.provider_line(p, s["providers"].get(p)) for p in providers]
+        return lines + [self.cost_line(s, providers)]
+
+    def api_screen(self, sub: str):
+        back = [[Btn("💰 API / расходы", "adm:api"), Btn("🛠 Управление", "adm")]]
+        tr = self.tracker
+        if tr is None:
+            return "💰 API / расходы\n\nУчёт API не подключён.", [self.ADMIN_BACK]
+        today = tr.day_key(self.now())
+        month = today[:7]
+        shown = [p for p in costs.PROVIDERS if p != "sports_api"]
+        head = ["💰 API / расходы", "", "Расход (вызовы, токены, кредиты) и оценка стоимости — разные вещи: стоимость считается только по заданной цене."]
+        if sub == "d":
+            return "\n".join(head + [""] + self.period_block(f"📅 Сегодня · {today}", today, shown)), back
+        if sub == "m":
+            return "\n".join(head + [""] + self.period_block(f"📆 Месяц · {month}", month, shown)), back
+        if sub in ("ai", "api"):
+            group = costs.AI_PROVIDERS if sub == "ai" else costs.API_PROVIDERS
+            title = "🧠 AI (DeepSeek, OpenAI)" if sub == "ai" else "🌐 Поисковые API (Tavily, будущие sports API)"
+            lines = head + ["", title, ""] + self.period_block(f"Сегодня · {today}", today, group) + [""] + self.period_block(f"Месяц · {month}", month, group)
+            return "\n".join(lines), back
+        if sub == "pur":
+            lines = head + ["", "🎯 Назначение вызовов (реальные / из кэша / ошибки)"]
+            for title, prefix in ((f"Сегодня · {today}", today), (f"Месяц · {month}", month)):
+                purposes = tr.summary(prefix)["purposes"]
+                lines += ["", title]
+                lines += [f"{costs.PURPOSE_TITLE.get(p, p)}: {v['real']} / {v['cached']} / {v['failed']}" for p, v in sorted(purposes.items())] or ["вызовов нет"]
+            return "\n".join(lines), back
+        if sub == "err":
+            s = tr.summary(month)
+            lines = head + ["", f"⚠️ Ошибки · {month}"]
+            lines += [f"{costs.PROVIDER_TITLE.get(p, p)} ×{n}: {msg or 'без текста'}" for p, msg, n in s["errors"][:8]]
+            if not s["errors"]:
+                lines.append("Ошибок вызовов нет.")
+            return "\n".join(lines), back
+        priced = [e for e in tr.pricing.entries() if e.get("currency")]
+        lines = head + [""] + self.period_block(f"📅 Сегодня · {today}", today, shown) + [""] + self.period_block(f"📆 Месяц · {month}", month, shown)
+        lines += ["", "Цены: " + (", ".join(f"{costs.PROVIDER_TITLE.get(e['provider'], e['provider'])} {e['model']}" for e in priced) if priced
+                                  else "не заданы — стоимость неизвестна. Задать: «/цена» в личке."),
+                  "", "Как экономим: факты находит код, не нейросеть; один матч — один поиск; одинаковые запросы берутся из кэша; "
+                  "DeepSeek — основной, OpenAI — только резерв; личных рассылок нет."]
+        rows = [[Btn("📅 Сегодня", "adm:api:d"), Btn("📆 Месяц", "adm:api:m")], [Btn("🧠 AI", "adm:api:ai"), Btn("🌐 API", "adm:api:api")],
+                [Btn("🎯 Назначение", "adm:api:pur"), Btn("⚠️ Ошибки", "adm:api:err")], self.ADMIN_BACK]
+        return "\n".join(lines), rows
+
+    def price_command(self, text: str) -> str:
+        """«/цена <провайдер> <модель> <вход за 1 млн токенов> <выход за 1 млн> <валюта>» или «/цена <провайдер> <модель> кредит <цена> <валюта>».
+        Без аргументов — текущие цены. Цены сами не придумываются: пока владелец не задал, стоимость «неизвестна»."""
+        if self.tracker is None:
+            return "Учёт API не подключён."
+        args = (text or "").split()[1:]
+        if not args:
+            lines = ["Цены (за 1 млн токенов; кредит — за единицу):"]
+            for e in self.tracker.pricing.entries():
+                price = (f"вход {e['input_price']} / выход {e['output_price']} {e['currency']}" if e.get("input_price") is not None
+                         else f"кредит {e['credit_price']} {e['currency']}" if e.get("credit_price") is not None else "не задана")
+                lines.append(f"• {e['provider']} {e['model']}: {price}")
+            lines += ["", "Задать: /цена deepseek deepseek-v4-flash 0.14 0.28 USD", "Кредиты: /цена tavily search кредит 0.008 USD"]
+            return "\n".join(lines)
+        try:
+            provider, model = args[0].lower(), args[1]
+            if args[2].casefold() in ("кредит", "credit"):
+                entry = self.tracker.pricing.set_price(provider, model, credit_price=float(args[3]), currency=args[4], now=self.now())
+            else:
+                entry = self.tracker.pricing.set_price(provider, model, input_price=float(args[2]), output_price=float(args[3]),
+                                                       currency=args[4], now=self.now())
+        except (ValueError, IndexError):
+            return "Не понял. Пример: /цена deepseek deepseek-v4-flash 0.14 0.28 USD"
+        return f"✅ Цена записана: {entry['provider']} {entry['model']} ({entry['currency']}). Пересчёт — для новых вызовов."
 
     def next_run_text(self, dt: datetime.datetime | None) -> str:
         return dt.astimezone(YEKB_TZ).strftime("%d.%m.%Y %H:%M") if dt else "—"
@@ -1461,8 +1543,8 @@ class Tribun:
         back = [Btn("🛠 Управление", "adm"), Btn("🏠 Меню", "m")]
         if sub == "list":
             items = self.active_priorities()
-            lines = ["⭐ Приоритеты", "", "Временный редакционный сигнал: поднимает команду/вид спорта/турнир/событие в «Что сегодня». "
-                     "Личные интересы участников не меняет.", ""]
+            lines = ["⭐ Приоритеты", "", "Временный редакционный сигнал для будущих публикаций (команда, вид спорта, турнир, событие). "
+                     "Личные интересы участников и прежнюю автоматику клубов не меняет.", ""]
             rows = []
             for i, it in enumerate(items):
                 until = datetime.datetime.fromisoformat(it["expires_at"]).astimezone(YEKB_TZ)
@@ -1477,7 +1559,7 @@ class Tribun:
             await ctx.edit("Что повысить в приоритете?", rows)
         elif sub == "type":
             self.awaiting[ctx.user_id] = {"kind": "prio_value", "type": parts[2]}
-            hint = {"team": "название команды", "sport": "вид спорта (hockey, football, tennis, basketball, motorsport, martial, winter)",
+            hint = {"team": "название команды", "sport": "вид спорта (футбол, хоккей, футзал, баскетбол)",
                     "competition": "название турнира", "event": "слово из названия события (команда/соперник/турнир)"}[parts[2]]
             await ctx.edit(f"✍️ Напиши {hint}:", [[Btn("⬅️ Отмена", "pr:list")]])
         elif sub == "dur":                                      # pr:dur:<id>:<days>
@@ -1601,3 +1683,4 @@ def build_keyboard(rows):
         if buttons:
             builder.row(*buttons)
     return [builder.as_markup()]
+
