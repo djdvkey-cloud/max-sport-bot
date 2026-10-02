@@ -59,7 +59,7 @@ def build_source_defs(clubs: list, openai_enabled: bool = False, search_domains:
         sport = {"futsal": "futsal", "football": "football", "hockey": "hockey"}.get(club["sport"], club["sport"])
         defs.append(SourceDef(source_id=f"calendar:{club['key']}", name=f"Календарь {domain} — {club['name']}", domain=domain, sport=sport,
                               source_type=DIRECT, purpose=(SCHEDULE, RESULT, CROSSCHECK), priority=2,
-                              competition=tuple(c[1] for c in C.COMPETITIONS if club["key"] in c[3]),
+                              competition=tuple(c[1] for c in C.COMPETITIONS if club["key"] in C.comp_club_keys(c[0])),
                               entity_ids=(club["key"],), urls=urls))
     keys = tuple(c["key"] for c in clubs)
     defs.append(SourceDef(source_id="search:tavily", name="Tavily Search (список доверенных доменов)", domain="api.tavily.com", sport=None,
@@ -187,8 +187,7 @@ class SourceRegistry:
         return COVERED, f"отслеживаются клубы: {names}"
 
     def competition_coverage(self, comp_key: str) -> tuple:
-        comp = C.COMP_BY_KEY[comp_key]
-        served = [k for k in comp[3] if self.serving_club(k)]
+        served = [k for k in C.comp_club_keys(comp_key) if self.serving_club(k)]
         if not served:
             return GAP, "ни один отслеживаемый клуб не играет в этом турнире"
         statuses = [self.club_coverage(k)[0] for k in served]
@@ -220,6 +219,8 @@ class SourceRegistry:
             if st in (GAP, FAILED, FALLBACK_ONLY):
                 gaps.append((C.CAT_CHAMP, comp[0], comp[1], st, note))
         for club in C.CLUBS:
+            if not self.serving_club(club[0]):
+                continue                                          # остальные клубы справочника не отслеживаются — отдельной строкой не нужны
             st, note = self.club_coverage(club[0])
             if st in (GAP, FAILED, FALLBACK_ONLY):
                 gaps.append((C.CAT_CLUB, club[0], club[1], st, note))

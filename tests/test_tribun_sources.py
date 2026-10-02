@@ -103,8 +103,9 @@ class RegistryModel(unittest.TestCase):
         self.assertEqual(self.reg.sport_coverage("basketball")[0], SRC.GAP)    # не утверждаем покрытие без источников
         self.assertEqual(self.reg.competition_coverage("vtb")[0], SRC.GAP)
         self.assertEqual(self.reg.competition_coverage("khl")[0], SRC.COVERED)
-        for club in C.CLUBS:
-            self.assertEqual(self.reg.club_coverage(club[0])[0], SRC.COVERED, club[0])
+        for key in ("avtomobilist", "sinara", "ural", "real", "arsenal", "milan"):
+            self.assertEqual(self.reg.club_coverage(key)[0], SRC.COVERED, key)
+        self.assertEqual(self.reg.club_coverage("zenit")[0], SRC.GAP)                  # клуб справочника, который SPORTBOT не отслеживает
         for _ in range(3):
             self.reg.record("calendar:avtomobilist", SRC.OUTCOME_FAILED, "x")
         self.assertEqual(self.reg.club_coverage("avtomobilist")[0], SRC.FAILED)
@@ -231,11 +232,11 @@ class OwnerScreens(TribunBase):
             await self.press(uid, "o:cp")
             await self.say(uid, "NBA" if uid == 5 else "НБА")
         await self.press(6, "o:cl")
-        await self.say(6, "Ювентус")
+        await self.say(6, "Бока Хуниорс")
         await self.press(OWNER, "adm:rq")
         text = self.last_text()
         self.assertIn("🏆 Чемпионаты:\nNBA — 2", text)
-        self.assertIn("❤️ Клубы:\nЮвентус — 1", text)
+        self.assertIn("❤️ Клубы:\nБока Хуниорс — 1", text)
         self.assertNotIn("Секретн", text)
         detail = [p for _, p in self.buttons() if p.startswith("adm:rqd:cp:")][0]
         await self.press(OWNER, detail)
@@ -252,7 +253,7 @@ class OwnerScreens(TribunBase):
         await self.tribun.on_user_removed(GROUP, user(6))
         await self.press(OWNER, "adm:rq")
         self.assertIn("NBA — 1", self.last_text())                           # вышедший не считается
-        self.assertNotIn("Ювентус", self.last_text())
+        self.assertNotIn("Бока Хуниорс", self.last_text())
 
     async def test_request_status_for_known_covered_interest(self):
         await self.join(5, "А")

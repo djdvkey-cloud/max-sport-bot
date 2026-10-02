@@ -98,6 +98,8 @@ class CompletionCard(OwnerBase):
     async def test_4_later_edits_send_no_extra_push(self):
         await self.finish_profile()
         count = len(self.owner_msgs())
+        await self.press(1, "c:cp")
+        await self.press(1, "t:cp:fnl1")                                       # добавил чемпионат
         await self.press(1, "c:cl")
         await self.press(1, "t:cl:real")                                       # убрал клуб
         await self.press(1, "t:cl:ural")                                       # добавил другой
@@ -131,15 +133,15 @@ class CompletionCard(OwnerBase):
         await self.press(1, "sv")
         self.assertTrue(self.last_text().startswith("✅ Интересы сохранены"))
         self.assertEqual(self.owner_msgs(), [])                                 # в трёх разделах пока ничего — карточки нет
-        for code, text in (("sp", "Теннис"), ("cp", "Ролан Гаррос"), ("cl", "Ювентус")):
+        for code, text in (("sp", "Теннис"), ("cp", "Ролан Гаррос"), ("cl", "Бока Хуниорс")):
             await self.press(1, f"o:{code}")
             await self.say(1, text)
         await self.press(1, "sv")
         card = self.owner_msgs()[0]
         self.assertIn("✅ Алексей настроил интересы", card)
         self.assertIn("🏅 Спорт:\n➕ Теннис", card)
-        self.assertIn("❤️ Клубы:\n➕ Ювентус", card)
-        self.assertIn("➕ Запросы:\nТеннис (спорт)\nРолан Гаррос (чемпионат)\nЮвентус (клуб)", card)
+        self.assertIn("❤️ Клубы:\n➕ Бока Хуниорс", card)
+        self.assertIn("➕ Запросы:\nТеннис (спорт)\nРолан Гаррос (чемпионат)\nБока Хуниорс (клуб)", card)
 
     async def test_undelivered_card_is_retried_by_flush(self):
         self.bot.fail_user = True
@@ -227,6 +229,8 @@ class AdminScreens(OwnerBase):
             self.assertNotIn(gone, text)
         self.assertNotIn("✏️", str(self.buttons()))                                # никаких кнопок редактирования чужих предпочтений
         self.clock.dt += datetime.timedelta(hours=5)
+        await self.press(1, "c:cp")
+        await self.press(1, "t:cp:fnl1")
         await self.press(1, "c:cl")
         await self.press(1, "t:cl:real")
         await self.press(1, "t:cl:ural")

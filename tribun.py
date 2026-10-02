@@ -72,6 +72,7 @@ INVITE_TEXT = (
 CAT_TITLE = {"sp": "🏅 Виды спорта", "cp": "🏆 Чемпионаты", "cl": "❤️ Клубы"}
 FIELD = {"sp": "sports", "cp": "championships", "cl": "clubs"}          # код раздела → поле профиля
 NEXT_SECTION = {"sp": "cp", "cp": "cl"}
+BACK_SECTION = {"sp": "m", "cp": "c:sp", "cl": "c:cp"}                    # «Назад»: клубы → чемпионаты → виды спорта → меню
 OTHER_PROMPT = {"sp": "✍️ Напиши, какой ещё вид спорта тебе интересен (можно несколько — через запятую):",
                 "cp": "✍️ Напиши, какой ещё чемпионат тебе интересен (можно несколько — через запятую):",
                 "cl": "✍️ Напиши, какой ещё клуб тебе интересен (можно несколько — через запятую):"}
@@ -710,20 +711,20 @@ class Tribun:
         return [k for k, _, _, _ in C.SPORTS if k in profile.get("sports", [])]
 
     def options(self, code: str, profile: dict) -> list:
-        """[(ключ, подпись)] — варианты раздела. Чемпионаты и клубы — только для выбранных видов спорта."""
-        sports = self.stored_sports(profile)
+        """[(ключ, подпись)] — варианты раздела: вид спорта → чемпионаты выбранных видов → клубы выбранных чемпионатов (union, без дублей)."""
         if code == "sp":
             return [(k, f"{icon} {name}") for k, icon, name, _ in C.SPORTS]
         if code == "cp":
-            return [(c[0], c[1]) for c in C.competitions_for(sports)]
-        return [(c[0], c[1]) for c in C.clubs_for(sports)]
+            return [(c[0], c[1]) for c in C.competitions_for(self.stored_sports(profile))]
+        return [(c[0], c[1]) for c in C.clubs_for_competitions(self.effective(profile)["cp"])]
 
     def effective(self, profile: dict) -> dict:
-        """Что реально учитывается: убранный вид спорта скрывает свои чемпионаты/клубы (данные при этом не теряются)."""
+        """Что реально учитывается. Убранный вид спорта скрывает свои чемпионаты, снятый чемпионат — клубы, выбранные только благодаря ему
+        (клуб из двух выбранных турниров остаётся). Данные при этом не теряются: вернул чемпионат — клубы снова активны."""
         sports = self.stored_sports(profile)
-        return {"sp": sports,
-                "cp": [c[0] for c in C.competitions_for(sports) if c[0] in profile.get("championships", [])],
-                "cl": [c[0] for c in C.clubs_for(sports) if c[0] in profile.get("clubs", [])]}
+        champs = [c[0] for c in C.competitions_for(sports) if c[0] in profile.get("championships", [])]
+        return {"sp": sports, "cp": champs,
+                "cl": [c[0] for c in C.clubs_for_competitions(champs) if c[0] in profile.get("clubs", [])]}
 
     def is_complete(self, profile: dict, requests: list) -> bool:
         """Профиль настроен = в каждом из трёх разделов есть выбор: вариант каталога или активный запрос «Другое»."""
@@ -769,20 +770,26 @@ class Tribun:
         chosen = set(self.effective(profile)[code])
         options = self.options(code, profile)
         text = f"{CAT_TITLE[code]}\n\nСейчас: {self.chosen_text(profile, code, self.user_requests(self.load_requests(), profile['user_id']))}\n\n"
-        if code != "sp" and not self.stored_sports(profile):
-            text += "Чемпионаты и клубы подбираются под выбранные виды спорта — сначала отметь вид спорта."
+        if code == "cp" and not self.stored_sports(profile):
+            text += "Чемпионаты подбираются под выбранные виды спорта — сначала отметь вид спорта."
+        elif code == "cl" and not self.effective(profile)["cp"]:
+            text += "Клубы подбираются под выбранные чемпионаты — сначала отметь чемпионат."
+        elif code != "sp" and not options:
+            text += "Для выбранного в справочнике пока ничего нет — можно оставить запрос через «➕ Другое»."
         else:
             text += "Нажимай, чтобы выбрать или убрать."
         buttons = [Btn(("✅ " if key in chosen else "") + label, f"t:{code}:{key}") for key, label in options]
         buttons += [Btn(f"✅ ➕ {r['raw_text']}", f"rt:{code}:{r['id']}") for r in requests]
         rows = grid(buttons)
-        if code != "sp" and not self.stored_sports(profile):
+        if code == "cp" and not self.stored_sports(profile):
             rows.append([Btn(CAT_TITLE["sp"], "c:sp")])
+        if code == "cl" and not self.effective(profile)["cp"]:
+            rows.append([Btn(CAT_TITLE["cp"], "c:cp")])
         rows.append([Btn("➕ Другое", f"o:{code}")])
         nav = [Btn("✅ Сохранить", "sv")]
         if code in NEXT_SECTION:
             nav.append(Btn("Дальше ▶️", f"c:{NEXT_SECTION[code]}"))
-        rows += [nav, [Btn("⬅️ Назад", "m")]]
+        rows += [nav, [Btn("⬅️ Назад", BACK_SECTION[code])]]
         return (f"{note}\n\n{text}" if note else text), rows
 
     # ---- изменения профиля ------------------------------------------------------------------------------------------
@@ -854,7 +861,9 @@ class Tribun:
                     if key:                                        # это уже есть в справочнике — обычный выбор, а не запрос
                         if key not in profile[FIELD[code]]:
                             profile[FIELD[code]].append(key)
-                        notes.append(f"{self.label(code, key)} — есть в списке, отметил")
+                        shown = key in {k for k, _ in self.options(code, profile)}
+                        notes.append(f"{self.label(code, key)} — есть в списке, отметил" + ("" if shown else
+                                     " (появится в выборе, когда отметишь " + ("вид спорта" if code == "cp" else "его чемпионат") + ")"))
                     else:
                         item, new = self.add_request(requests, ctx.user_id, category, raw)
                         notes.append(f"{item['raw_text']} — запрос отправлен" if new else f"{item['raw_text']} — уже в запросах")
@@ -1265,8 +1274,10 @@ class Tribun:
                 lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
             lines += ["", "Клубы:"]
             for c in C.CLUBS:
-                st, note = reg.club_coverage(c[0])
-                lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
+                if reg.serving_club(c[0]):
+                    st, note = reg.club_coverage(c[0])
+                    lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
+            lines.append("Остальные клубы справочника SPORTBOT не отслеживает — своих источников нет.")
             return "\n".join(lines), back
         if sub == "all":
             lines = ["🌍 Все источники", "", "Иерархия: официальный → прямой → агрегатор → медиа → поиск. Поиск (Tavily/OpenAI) и AI — не источники фактов: "

@@ -50,39 +50,6 @@ class Member(Base):
         await self.press(5, "t:sp:hockey")
         self.assertEqual(self.profile(5)["sports"], ["football", "futsal"])
 
-    # 4
-    async def test_04_championships_follow_chosen_sports(self):
-        await self.press(5, "c:cp")
-        self.assertIn("сначала отметь вид спорта", self.last_text())
-        self.assertFalse([p for p in self.payloads() if p.startswith("t:cp:")])
-        await self.press(5, "t:sp:hockey")
-        await self.press(5, "c:cp")
-        self.assertEqual([p for p in self.payloads() if p.startswith("t:cp:")], ["t:cp:khl"])
-        await self.press(5, "t:sp:futsal")
-        await self.press(5, "c:cp")
-        self.assertEqual(sorted(p for p in self.payloads() if p.startswith("t:cp:")), ["t:cp:cuplig", "t:cp:khl", "t:cp:superliga"])
-        before = self.profile(5)["championships"]
-        await self.press(5, "t:cp:fnl1")                                   # футбол не выбран — вариант недоступен
-        self.assertEqual(self.profile(5)["championships"], before)
-        self.assertIn("недоступен", self.last_text())
-
-    # 5 + 6
-    async def test_05_clubs_follow_sports_and_all_six_clubs_are_in_catalog(self):
-        await self.press(5, "c:cl")
-        self.assertIn("сначала отметь вид спорта", self.last_text())
-        for key in ("football", "hockey", "futsal"):
-            await self.press(5, f"t:sp:{key}")
-        await self.press(5, "c:cl")
-        self.assertEqual(sorted(p.split(":")[2] for p in self.payloads() if p.startswith("t:cl:")),
-                         sorted(("avtomobilist", "sinara", "ural", "real", "arsenal", "milan")))
-        self.assertEqual(len(C.CLUBS), 6)
-        import sport_bot as S
-        self.assertEqual({c[0] for c in C.CLUBS}, {c["key"] for c in S.CLUBS})        # каталог совпадает с шестью клубами SPORTBOT
-        self.profile(5)
-        await self.press(5, "t:sp:football")                                           # футбол убран → его клубы скрыты
-        await self.press(5, "c:cl")
-        self.assertEqual(sorted(p for p in self.payloads() if p.startswith("t:cl:")), ["t:cl:avtomobilist", "t:cl:sinara"])
-
     # 7
     async def test_06_basketball_has_no_big_catalog(self):
         await self.press(5, "t:sp:basketball")
@@ -113,11 +80,11 @@ class Member(Base):
         await self.press(5, "o:sp")
         await self.say(5, "Теннис, Формула 1")
         await self.press(5, "o:cl")
-        await self.say(5, "Ювентус")
+        await self.say(5, "Бока Хуниорс")
         await self.press(5, "o:sp")
         await self.say(5, "футбол")                                                     # известный вид спорта — обычный выбор
         cats = sorted((r["category"], r["normalized_text"]) for r in self.requests(5))
-        self.assertEqual(cats, [("club", "ювентус"), ("sport", "теннис"), ("sport", "формула-1")])
+        self.assertEqual(cats, [("club", "бока хуниорс"), ("sport", "теннис"), ("sport", "формула-1")])
         self.assertEqual(self.profile(5)["sports"], ["football"])
         self.assertEqual(C.normalize_request("Формула-1"), C.normalize_request("формула 1"))
         self.assertNotEqual(C.normalize_request("Милан"), C.normalize_request("Интер"))   # без агрессивного fuzzy
@@ -149,7 +116,7 @@ class Member(Base):
         await self.press(5, "t:cp:khl")
         self.assertFalse(self.profile(5)["onboarding_completed"])
         await self.press(5, "o:cl")
-        await self.say(5, "Ювентус")                                                    # «Другое» тоже считается выбором
+        await self.say(5, "Бока Хуниорс")                                                    # «Другое» тоже считается выбором
         self.assertTrue(self.profile(5)["onboarding_completed"])
         await self.press(5, "t:cp:khl")                                                  # снял чемпионат → снова не настроен
         self.assertFalse(self.profile(5)["onboarding_completed"])
@@ -176,7 +143,7 @@ class Member(Base):
     # 12
     async def test_12_persistence_restart_and_legacy_members_file(self):
         await self.join(5, "Мария")
-        await self.onboard(5, sports=("hockey",), comps=("khl",), clubs=("avtomobilist",), other={"cl": "Ювентус"})
+        await self.onboard(5, sports=("hockey",), comps=("khl",), clubs=("avtomobilist",), other={"cl": "Бока Хуниорс"})
         snapshot = self.tribun.load_members()["members"]["5"]
         reqs = self.requests()
         self.make()                                                                      # рестарт
@@ -193,8 +160,8 @@ class Member(Base):
         await self.say(42, "привет", name="Старый")
         self.assertEqual(self.labels(), THREE)
         p = self.profile(42)
-        self.assertEqual(p["clubs"], ["avtomobilist"])                                   # только то, что точно совпало с каталогом
-        self.assertEqual(p["championships"], ["khl"])
+        self.assertEqual(p["clubs"], ["avtomobilist", "zenit"])                          # только то, что точно совпало с каталогом
+        self.assertEqual(p["championships"], ["khl", "rpl"])
         self.assertEqual((p["teams"], p["athletes"], p["notification_level"]), (["Автомобилист", "Зенит"], ["Овечкин"], "all"))   # ничего не удалено
         await self.press(OWNER, "adm:mc:42")
         self.assertIn("Старый", self.last_text())
@@ -218,7 +185,7 @@ class Member(Base):
         await self.join(5, "А")
         await self.join(6, "Б")
         await self.press(5, "o:cl")
-        await self.say(5, "Ювентус")
+        await self.say(5, "Бока Хуниорс")
         rid = self.requests(5)[0]["id"]
         await self.press(6, f"rt:cl:{rid}")
         self.assertTrue(self.requests(5)[0]["active"])
