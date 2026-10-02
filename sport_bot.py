@@ -88,7 +88,9 @@ import tempfile
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from maxapi import Bot
+from maxapi import Bot, Dispatcher
+
+import tribun
 
 MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
 MAX_CHAT_ID = int(os.environ["MAX_CHAT_ID"])
@@ -215,7 +217,7 @@ TAVILY_INCLUDE_DOMAINS = [
 
 # --- Настройки v4: личные уведомления, афиша, контроль расписания --------------
 
-BOT_VERSION = "2026-10-01"
+BOT_VERSION = "2026-10-03"
 # Первая проверка результата — через RESULT_DELAY_HOURS после начала матча
 # (раньше 2,5 ч, теперь 2 ч). Цикл не ждёт полного интервала: планировщик
 # просыпается точно к этому моменту (см. seconds_until_next_event).
@@ -585,8 +587,9 @@ async def notify_startup(bot: Bot) -> None:
         summary = f"Состояние прочитать не удалось: {type(e).__name__}."
     sent = await admin_notify(
         bot,
-        f"✅ SPORTBOT запущен (версия {BOT_VERSION}).\n"
-        "Личные уведомления включены: пишу только при сбоях и когда всё восстановилось.\n" + summary,
+        f"✅ Трибун запущен (версия {BOT_VERSION}).\n"
+        "Личные уведомления включены: пишу только при сбоях и когда всё восстановилось.\n" + summary +
+        "\nЛичное меню Трибуна — напишите мне в личку (кнопки: «Что сегодня у меня?», «Мои интересы», «Управление Трибуной»).",
         silent=True,
     )
     if sent:
@@ -1609,13 +1612,13 @@ async def deliver_announcement(bot: Bot, state: dict, rec: dict, now: datetime.d
         if rec["status"] == "found":
             rec["status"] = "announced"
         save_state(state)
-        await clear_alert(bot, alert_key, f"✅ SPORTBOT\nАнонс матча {club['name']} отправлен.", now)
+        await clear_alert(bot, alert_key, f"✅ Трибун\nАнонс матча {club['name']} отправлен.", now)
     else:
         save_state(state)
         if not DRY_RUN:
             await raise_alert(
                 bot, alert_key,
-                f"⚠️ SPORTBOT\nНе удалось отправить в MAX анонс матча {club['name']}.\n"
+                f"⚠️ Трибун\nНе удалось отправить в MAX анонс матча {club['name']}.\n"
                 f"Следующая попытка будет автоматически.", now)
     return sent
 
@@ -1636,11 +1639,11 @@ async def run_morning(bot: Bot, now: datetime.datetime, clubs: list, *, with_int
             if not DRY_RUN:
                 await raise_alert(
                     bot, f"morning:{club['key']}",
-                    f"⚠️ SPORTBOT\nНе удалось проверить расписание на сегодня: {club['name']}.\n"
+                    f"⚠️ Трибун\nНе удалось проверить расписание на сегодня: {club['name']}.\n"
                     f"Повторю автоматически.", now)
             continue
         await clear_alert(bot, f"morning:{club['key']}",
-                          f"✅ SPORTBOT\nРасписание на сегодня получено: {club['name']}.", now)
+                          f"✅ Трибун\nРасписание на сегодня получено: {club['name']}.", now)
         if match:
             found.append((club, match))
 
@@ -2321,7 +2324,7 @@ async def job_check_results(bot: Bot, now: datetime.datetime | None = None) -> N
             if not DRY_RUN:
                 await raise_alert(
                     bot, f"nostart:{rec['match_id']}",
-                    f"⚠️ SPORTBOT\nНе удалось определить время начала матча {club['name']} — {rec['rival']}, "
+                    f"⚠️ Трибун\nНе удалось определить время начала матча {club['name']} — {rec['rival']}, "
                     f"результат автоматически искать не смогу.", now)
             continue
         if now < start + datetime.timedelta(hours=RESULT_DELAY_HOURS):
@@ -2334,7 +2337,7 @@ async def job_check_results(bot: Bot, now: datetime.datetime | None = None) -> N
             if not DRY_RUN:
                 await raise_alert(
                     bot, f"giveup:{rec['match_id']}",
-                    f"⚠️ SPORTBOT\nРезультат матча {club['name']} — {rec['rival']} так и не получен "
+                    f"⚠️ Трибун\nРезультат матча {club['name']} — {rec['rival']} так и не получен "
                     f"за {RESULT_GIVE_UP_HOURS} ч. Автоматический поиск остановлен.", now)
             continue
 
@@ -2365,7 +2368,7 @@ async def job_check_results(bot: Bot, now: datetime.datetime | None = None) -> N
                 if not DRY_RUN and now - since >= datetime.timedelta(minutes=CONFLICT_ALERT_AFTER_MINUTES):
                     await raise_alert(
                         bot, f"conflict:{rec['match_id']}",
-                        f"⚠️ SPORTBOT\nРезультат матча {club['name']} — {rec['rival']} требует проверки: "
+                        f"⚠️ Трибун\nРезультат матча {club['name']} — {rec['rival']} требует проверки: "
                         f"источники расходятся. В MAX ничего не отправлено, проверяю дальше.", now)
                 continue
             elif res["state"] == "error":
@@ -2374,7 +2377,7 @@ async def job_check_results(bot: Bot, now: datetime.datetime | None = None) -> N
                 if not DRY_RUN and rec["source_fail_ticks"] >= SOURCE_FAIL_ALERT_TICKS:
                     await raise_alert(
                         bot, f"srcfail:{rec['match_id']}",
-                        f"⚠️ SPORTBOT\nНе удаётся получить результат матча {club['name']} — {rec['rival']}: "
+                        f"⚠️ Трибун\nНе удаётся получить результат матча {club['name']} — {rec['rival']}: "
                         f"источники недоступны. Следующая попытка будет автоматически.", now)
                 continue
             else:  # матч ещё не завершён или результата нет
@@ -2382,7 +2385,7 @@ async def job_check_results(bot: Bot, now: datetime.datetime | None = None) -> N
                 if not DRY_RUN and age_hours >= RESULT_ALERT_AFTER_HOURS:
                     await raise_alert(
                         bot, f"nores:{rec['match_id']}",
-                        f"⚠️ SPORTBOT\nРезультат матча {club['name']} — {rec['rival']} пока не найден "
+                        f"⚠️ Трибун\nРезультат матча {club['name']} — {rec['rival']} пока не найден "
                         f"({RESULT_ALERT_AFTER_HOURS:g} ч после начала). Следующая попытка будет автоматически.", now)
                 print(f"[DEBUG] {club['name']}: результата пока нет, попробуем в следующий раз")
                 continue
@@ -2409,13 +2412,13 @@ async def publish_result(bot: Bot, state: dict, rec: dict, club: dict, now: date
         mid = rec["match_id"]
         await clear_alerts(
             bot, [f"send:{mid}", f"srcfail:{mid}", f"nores:{mid}", f"conflict:{mid}", f"giveup:{mid}"],
-            f"✅ SPORTBOT\nРезультат матча {club['name']} — {rec['rival']} получен и опубликован.", now)
+            f"✅ Трибун\nРезультат матча {club['name']} — {rec['rival']} получен и опубликован.", now)
         return True
     save_state(state)
     if not DRY_RUN:
         await raise_alert(
             bot, f"send:{rec['match_id']}",
-            f"⚠️ SPORTBOT\nРезультат матча {club['name']} — {rec['rival']} найден, но не удалось отправить "
+            f"⚠️ Трибун\nРезультат матча {club['name']} — {rec['rival']} найден, но не удалось отправить "
             f"его в MAX. Результат сохранён, повторю автоматически.", now)
     return False
 
@@ -2476,11 +2479,11 @@ async def job_weekly(bot: Bot, now: datetime.datetime | None = None) -> bool:
             if not DRY_RUN:
                 await raise_alert(
                     bot, f"weekly:{club['key']}:{monday}",
-                    f"⚠️ SPORTBOT\nНе удалось получить расписание недели: {club['name']}. "
+                    f"⚠️ Трибун\nНе удалось получить расписание недели: {club['name']}. "
                     f"Этот клуб не попадёт в афишу. Повторю автоматически.", now)
             continue
         await clear_alert(bot, f"weekly:{club['key']}:{monday}",
-                          f"✅ SPORTBOT\nРасписание недели получено: {club['name']}.", now)
+                          f"✅ Трибун\nРасписание недели получено: {club['name']}.", now)
         fresh = []
         for f in fixtures:
             if monday <= f["date"] <= sunday and not f["finished"] and not f["cancelled"]:
@@ -2507,14 +2510,172 @@ async def job_weekly(bot: Bot, now: datetime.datetime | None = None) -> bool:
     sent = await send_to_group(bot, text)
     if sent:
         save_last_weekly(monday)
-        await clear_alert(bot, f"weeklysend:{monday}", "✅ SPORTBOT\nНедельная афиша отправлена.", now)
+        await clear_alert(bot, f"weeklysend:{monday}", "✅ Трибун\nНедельная афиша отправлена.", now)
         return True
     if not DRY_RUN:
         await raise_alert(bot, f"weeklysend:{monday}",
-                          "⚠️ SPORTBOT\nНе удалось отправить недельную афишу в MAX. Повторю автоматически.", now)
+                          "⚠️ Трибун\nНе удалось отправить недельную афишу в MAX. Повторю автоматически.", now)
     return False
 
 
+
+
+# --- «Своя Трибуна»: данные для личного меню и пульта владельца --------------------
+
+TRIBUN_ENABLED = os.environ.get("TRIBUN_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+TRIBUN_RESTART_DELAY = 30            # пауза перед перезапуском слушателя MAX после сбоя, секунд
+
+
+def owner_user_id() -> int | None:
+    """Владелец — по стабильному MAX user_id (ADMIN_USER_ID / admin_config.json), не по имени и не по username."""
+    target = admin_target()
+    return target.get("user_id") if target else None
+
+
+def tribun_events_for_day(day: datetime.date) -> list:
+    """События дня из того, что бот уже знает (афиша недели + найденные утром матчи). Ничего не выдумывается."""
+    events, seen = [], set()
+
+    def add(club_key, rival, date_iso, time_str, zone, tournament):
+        club = club_by_key(club_key)
+        if not club or date_iso != day.isoformat():
+            return
+        ident = match_identity(club_key, date_iso, rival)
+        if ident in seen:
+            return
+        seen.add(ident)
+        events.append({"club_key": club_key, "club_name": club["name"], "icon": club["icon"], "aliases": club.get("aliases", []),
+                       "sport_key": tribun.SPORT_FAMILY_TO_KEY.get(sport_family(club)), "tournament": tournament or "",
+                       "rival": rival, "time_text": fmt_clock(time_str, zone), "date": date_iso})
+    try:
+        for e in load_schedule()["entries"]:
+            add(e.get("club_key"), e.get("rival", ""), e.get("date"), e.get("time"), e.get("zone"), e.get("tournament"))
+        for rec in load_state()["matches"].values():
+            add(rec.get("club_key"), rec.get("rival", ""), rec.get("match_date"), rec.get("time"), rec.get("zone"), rec.get("tournament"))
+    except Exception as e:
+        print(f"[TRIBUN] события дня недоступны: {type(e).__name__}: {e}")
+    return events
+
+
+def _fmt_ekb(value) -> str | None:
+    dt = parse_iso(value)
+    return dt.astimezone(YEKB_TZ).strftime("%d.%m.%Y %H:%M") if dt else None
+
+
+def tribun_automation() -> list:
+    """Существующие задачи планировщика: расписание, следующий запуск, последний успех/ошибка (Asia/Yekaterinburg)."""
+    now = utc_now().astimezone(YEKB_TZ)
+    jobs = tribun.read_job_status(DATA_DIR)
+    off = DRY_RUN
+
+    def stat(*names):
+        oks = [jobs.get(n, {}).get("last_ok") for n in names if jobs.get(n, {}).get("last_ok")]
+        errs = [(jobs[n].get("last_error"), jobs[n].get("error", "")) for n in names if jobs.get(n, {}).get("last_error")]
+        err = max(errs) if errs else None
+        last_ok = _fmt_ekb(max(oks)) if oks else None
+        last_err = f"{_fmt_ekb(err[0])} — {err[1]}" if err else None
+        if err and oks and max(oks) > err[0]:
+            last_err = f"была {_fmt_ekb(err[0])}, затем восстановилось"
+        return last_ok, last_err
+
+    today = now.date()
+    morning_today = datetime.datetime.combine(today, datetime.time(MORNING_HOUR), YEKB_TZ)
+    if load_last_morning_date() == today or now >= datetime.datetime.combine(today, datetime.time(MORNING_RETRY_UNTIL_HOUR), YEKB_TZ):
+        next_morning = morning_today + datetime.timedelta(days=1)
+    else:
+        next_morning = max(morning_today, now)
+    monday, _ = week_bounds(today)
+    days_to_weekly = (WEEKLY_WEEKDAY - today.weekday()) % 7
+    next_weekly = datetime.datetime.combine(today + datetime.timedelta(days=days_to_weekly), datetime.time(WEEKLY_HOUR), YEKB_TZ)
+    if days_to_weekly == 0:                                   # сегодня день афиши: задание срабатывает только в понедельник
+        if last_weekly_date() == monday:
+            next_weekly += datetime.timedelta(days=7)
+        elif now > next_weekly:
+            next_weekly = now                                 # время уже наступило, ждёт ближайшей проверки планировщика
+    try:
+        next_check = now + datetime.timedelta(seconds=seconds_until_next_event(utc_now()))
+    except Exception:
+        next_check = now + datetime.timedelta(seconds=CHECK_INTERVAL_SECONDS)
+    members = tribun_members_meta()
+    ok_m, err_m = stat("morning", "morning_retry", "announce_retry")
+    ok_w, err_w = stat("weekly")
+    ok_r, err_r = stat("results")
+    return [
+        {"name": "Утренний анонс матчей", "schedule": f"ежедневно в {MORNING_HOUR}:00 (повтор сорвавшегося до {MORNING_RETRY_UNTIL_HOUR}:00)",
+         "next": next_morning.strftime("%d.%m.%Y %H:%M"), "last_ok": ok_m or (load_last_morning_date() and f"{load_last_morning_date():%d.%m.%Y}"),
+         "last_error": err_m, "enabled": not off},
+        {"name": "Недельная афиша", "schedule": f"по понедельникам с {WEEKLY_HOUR}:00, раз в неделю",
+         "next": next_weekly.strftime("%d.%m.%Y %H:%M"), "last_ok": ok_w or (last_weekly_date() and f"неделя с {last_weekly_date():%d.%m.%Y}"),
+         "last_error": err_w, "enabled": not off},
+        {"name": "Проверка результатов матчей", "schedule": f"каждые {CHECK_INTERVAL_SECONDS // 60} мин; первая — через {RESULT_DELAY_HOURS:g} ч после начала матча",
+         "next": next_check.strftime("%d.%m.%Y %H:%M"), "last_ok": ok_r, "last_error": err_r, "enabled": not off},
+        {"name": "Сверка состава группы «Своя Трибуна»", "schedule": "при запуске и каждые 3 часа",
+         "next": "по таймеру внутри процесса", "last_ok": members.get("last_sync"), "last_error": None, "enabled": TRIBUN_ENABLED},
+    ]
+
+
+def tribun_members_meta() -> dict:
+    try:
+        return tribun.read_strict(os.path.join(DATA_DIR, "tribun_members.json"), {}).get("meta", {})
+    except Exception:
+        return {}
+
+
+def tribun_status() -> dict:
+    jobs = tribun.read_job_status(DATA_DIR)
+    oks = [(v.get("last_ok"), k) for k, v in jobs.items() if not k.startswith("_") and v.get("last_ok")]
+    errs = [(v.get("last_error"), f"{k}: {v.get('error', '')}") for k, v in jobs.items() if not k.startswith("_") and v.get("last_error")]
+    last_err = max(errs) if errs else None
+    sources = [f"DeepSeek: ключ {'задан' if DEEPSEEK_API_KEY else 'не задан'}", f"Tavily: ключ {'задан' if TAVILY_API_KEY else 'не задан'}",
+               f"OpenAI-резерв: {'включён' if OPENAI_API_KEY else 'не задан'}",
+               "Календари: sports.ru, superliga.rfs.ru (напрямую)"]
+    for key, rec in read_json_safe(ALERTS_FILE, {}).items():
+        if rec.get("active"):
+            sources.append(f"⚠️ активное предупреждение: {key.split(':')[0]}")
+    return {"running": True, "last_tick": _fmt_ekb(jobs.get("_tick")), "last_ok": _fmt_ekb(max(oks)[0]) if oks else None,
+            "last_error": f"{_fmt_ekb(last_err[0])} — {last_err[1]}" if last_err else None, "sources": sources}
+
+
+def build_tribun(bot: Bot) -> "tribun.Tribun":
+    return tribun.Tribun(bot, data_dir=DATA_DIR, group_chat_id=MAX_CHAT_ID, owner_id=owner_user_id, version=BOT_VERSION,
+                         dry_run=DRY_RUN, events_for_day=tribun_events_for_day, automation=tribun_automation, status=tribun_status)
+
+
+async def run_tribun(bot: Bot) -> list:
+    """Запускает слушатель MAX (приветствия, личное меню) и сверку состава группы. Любой сбой здесь НЕ должен останавливать
+    расписание анонсов и результатов: ошибки только в лог, слушатель перезапускается."""
+    tasks = []
+    try:
+        club = build_tribun(bot)
+        try:
+            me = await bot.get_me()
+            club.bot_username = os.environ.get("TRIBUN_BOT_USERNAME", "").strip() or getattr(me, "username", None)
+        except Exception as e:
+            club.bot_username = os.environ.get("TRIBUN_BOT_USERNAME", "").strip() or None
+            print(f"[TRIBUN] имя бота недоступно: {type(e).__name__}: {e}")
+        try:
+            await bot.delete_webhook()
+        except Exception as e:
+            print(f"[DEBUG] delete_webhook: {type(e).__name__}: {e}")
+        dp = Dispatcher()
+        club.register(dp)
+
+        async def polling():
+            while True:
+                try:
+                    await dp.start_polling(bot)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[TRIBUN] слушатель MAX остановился: {type(e).__name__}: {e}; перезапуск через {TRIBUN_RESTART_DELAY:g} с")
+                    await asyncio.sleep(TRIBUN_RESTART_DELAY)
+        tasks.append(asyncio.create_task(polling()))
+        tasks.append(asyncio.create_task(club.sync_loop()))
+        print(f"[TRIBUN] запущен: владелец {'настроен' if owner_user_id() else 'НЕ настроен'}, бот @{club.bot_username or '?'}")
+    except Exception as e:
+        print(f"[TRIBUN] не запущен: {type(e).__name__}: {e}")
+    return tasks
 
 
 # --- Отправка и точка входа -------------------------------------------------
@@ -2587,18 +2748,21 @@ async def scheduler_loop(bot: Bot) -> None:
         local = now.astimezone(YEKB_TZ)
         today = local.date()
         print(f"[DEBUG] тик планировщика: {local:%d.%m.%Y %H:%M}")
+        tribun.record_tick(DATA_DIR, now)
 
         async def guarded(name, coro):
             try:
                 await coro
+                tribun.record_job(DATA_DIR, name, True, now=now)
                 if loop_failures.pop(name, 0) >= SOURCE_FAIL_ALERT_TICKS:
-                    await clear_alert(bot, f"loop:{name}", "✅ SPORTBOT\nВнутренний сбой устранён, работаю в обычном режиме.", now)
+                    await clear_alert(bot, f"loop:{name}", "✅ Трибун\nВнутренний сбой устранён, работаю в обычном режиме.", now)
             except Exception as e:
                 loop_failures[name] = loop_failures.get(name, 0) + 1
                 print(f"[DEBUG] ошибка части «{name}»: {type(e).__name__}: {e}")
+                tribun.record_job(DATA_DIR, name, False, f"{type(e).__name__}: {e}", now=now)
                 if loop_failures[name] >= SOURCE_FAIL_ALERT_TICKS and not DRY_RUN:
                     await raise_alert(bot, f"loop:{name}",
-                                      "⚠️ SPORTBOT\nВнутренний сбой планировщика, часть задач не выполняется. "
+                                      "⚠️ Трибун\nВнутренний сбой планировщика, часть задач не выполняется. "
                                       "Повторяю автоматически.", now)
 
         monday, _ = week_bounds(today)
@@ -2657,9 +2821,12 @@ async def main():
             print(f"[DEBUG] test_openai: успех, ответ={reply!r}")
         except Exception as e:
             print(f"[DEBUG] test_openai: ОШИБКА {type(e).__name__}: {e}")
+    tribun_tasks = await run_tribun(bot) if TRIBUN_ENABLED else []
     try:
         await scheduler_loop(bot)
     finally:
+        for task in tribun_tasks:
+            task.cancel()
         session = getattr(bot, "session", None)
         if session is not None:
             close = getattr(session, "close", None)

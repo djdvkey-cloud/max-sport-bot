@@ -260,7 +260,7 @@ class ResultPublication(Base):
         self.assertEqual(self.bot.group, [cand["text"]])
         self.assertEqual(self.state()["matches"][r["match_id"]]["status"], "published")
         self.assertEqual(len(self.bot.admin), 2)
-        self.assertTrue(self.bot.admin[1]["text"].startswith("✅ SPORTBOT"))
+        self.assertTrue(self.bot.admin[1]["text"].startswith("✅ Трибун"))
         self.assertIn("опубликован", self.bot.admin[1]["text"])
         calls.assert_called_once()
 
@@ -422,15 +422,15 @@ class StateMigration(Base):
 
 class AdminNotifications(Base):
     async def test_alert_once_then_silent_then_single_recovery(self):
-        self.assertTrue(await S.raise_alert(self.bot, "k", "⚠️ SPORTBOT\nсбой"))
+        self.assertTrue(await S.raise_alert(self.bot, "k", "⚠️ Трибун\nсбой"))
         for _ in range(5):
-            self.assertFalse(await S.raise_alert(self.bot, "k", "⚠️ SPORTBOT\nсбой"))
+            self.assertFalse(await S.raise_alert(self.bot, "k", "⚠️ Трибун\nсбой"))
         self.assertEqual(len(self.bot.admin), 1)
-        await S.clear_alert(self.bot, "k", "✅ SPORTBOT\nвсё хорошо")
-        await S.clear_alert(self.bot, "k", "✅ SPORTBOT\nвсё хорошо")
-        self.assertEqual([m["text"] for m in self.bot.admin], ["⚠️ SPORTBOT\nсбой", "✅ SPORTBOT\nвсё хорошо"])
+        await S.clear_alert(self.bot, "k", "✅ Трибун\nвсё хорошо")
+        await S.clear_alert(self.bot, "k", "✅ Трибун\nвсё хорошо")
+        self.assertEqual([m["text"] for m in self.bot.admin], ["⚠️ Трибун\nсбой", "✅ Трибун\nвсё хорошо"])
         # новая проблема с тем же ключом после восстановления — снова одно сообщение
-        await S.raise_alert(self.bot, "k", "⚠️ SPORTBOT\nснова")
+        await S.raise_alert(self.bot, "k", "⚠️ Трибун\nснова")
         self.assertEqual(len(self.bot.admin), 3)
 
     async def test_no_recovery_if_problem_never_reached_admin(self):
@@ -1014,7 +1014,7 @@ class SourceConflicts(Base):
         await S.job_check_results(self.bot, self.T1 + datetime.timedelta(minutes=140))
         self.assertEqual(len(self.bot.group), 1)
         self.assertEqual(len(self.bot.admin), 2)
-        self.assertTrue(self.bot.admin[1]["text"].startswith("✅ SPORTBOT"))
+        self.assertTrue(self.bot.admin[1]["text"].startswith("✅ Трибун"))
 
     async def test_conflict_resolved_before_an_hour_sends_no_admin_messages(self):
         bad = ctx(("b.ru", "6 октября: Автомобилист 1:1 Амур"))
@@ -1104,7 +1104,7 @@ class Wiring(Base):
             await S.main()
         started.assert_awaited_once()
         self.assertEqual(len(self.bot.admin), 1)
-        self.assertIn("SPORTBOT запущен", self.bot.admin[0]["text"])
+        self.assertIn("Трибун запущен", self.bot.admin[0]["text"])
         self.assertEqual(self.bot.group, [])                         # в группу при старте ничего не уходит
 
     def test_maxapi_send_message_accepts_what_we_use(self):
