@@ -31,6 +31,7 @@ URL_NHL = "https://api-web.nhle.com/v1/schedule/{day}"
 URL_SUPERLIGA = "https://superliga.rfs.ru/"
 URL_CLUB = "https://www.sports.ru/football/club/{slug}/calendar/"
 URL_WIKI_UCL = "https://en.wikipedia.org/wiki/2026%E2%80%9327_UEFA_Champions_League_league_phase"
+PAGE_TTL = 120.0                       # кэш страниц матч-центра/API между проверками
 WIKI_TTL = 3600.0                      # страница Википедии тяжёлая (~2 МБ): не чаще раза в час
 
 # Первая лига 2026/27: id клуба каталога → slug страницы клуба на sports.ru (проверено: у всех 18 страница отдаёт 200 и название клуба)
@@ -141,11 +142,25 @@ class MatchFeed:
         self.fetch = fetch
         self.now = now or (lambda: datetime.datetime.now(datetime.timezone.utc))
         self._cache: dict = {}
+        self._page_cache: dict = {}
 
     # ---- один источник ------------------------------------------------------------------------------------------------------
 
     async def _get(self, url: str) -> tuple:
-        return await self.fetch(url)
+        """Страница источника; успешный ответ (200) живёт PAGE_TTL секунд: проверки результатов идут каждые 20 минут, а страницы весят до 2 МБ.
+        Сбои не кэшируются — следующий запрос идёт в сеть."""
+        now = self.now()
+        hit = self._page_cache.get(url)
+        if hit and (now - hit[0]).total_seconds() < PAGE_TTL:
+            return hit[1], hit[2]
+        status, body = await self.fetch(url)
+        if status == 200:
+            self._page_cache[url] = (now, status, body)
+        return status, body
+
+    def clear_cache(self) -> None:
+        self._page_cache.clear()
+        self._cache.clear()
 
     def _report(self, rep: SourceReport) -> SourceReport:
         hooks.source_event(rep.source_id, rep.outcome, rep.error)

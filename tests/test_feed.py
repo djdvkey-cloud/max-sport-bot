@@ -292,7 +292,9 @@ class HealthLoop(unittest.TestCase):
                 raise asyncio.CancelledError()
 
         async def go():
-            with mock.patch.object(S.tribun_feed, "smoke", fake_smoke), mock.patch.object(S.asyncio, "sleep", fake_sleep),                     mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a))):
+            with mock.patch.object(S.tribun_feed, "smoke", fake_smoke), mock.patch.object(S.asyncio, "sleep", fake_sleep), \
+                    mock.patch.object(S, "DYN_SELFCHECK", False), \
+                    mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a))):
                 try:
                     await S.feed_health_loop()
                 except asyncio.CancelledError:

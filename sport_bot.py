@@ -91,6 +91,11 @@ superliga.rfs.ru; Первая лига — страницы клубов sports
 (Суперлига). Баскетбол/ВТБ, Лига Европы и Лига конференций отложены (выбор в профилях сохраняется, но не показывается и не считается); прежняя
 автоматика шести клубов, включая матчи Милана в Лиге Европы, не затронута. Лига чемпионов сверяется с Википедией; в логе — строки [FEED] UCL.
 
+03.10.2026 (2026-10-03.7): ACTIVE CLUBS — все активные клубы всех участников группы получают то же обслуживание, что шесть исторических клубов (афиша —
+в общем понедельничном сообщении, утренний анонс и изменения, результаты): модуль dynamic.py, список пересчитывается из профилей на каждом тике, без деплоя.
+Шесть клубов остаются на прежнем контуре; матч с их участием динамика не трогает (одно сообщение, без дублей). Экран владельца «🎯 Активные клубы»,
+«📢 Тексты запуска»; обновлён встроенный текст приглашения. DYN_SELFCHECK=1: при старте dry-run контрольных клубов в логе ([DYN]), в группу ничего не уходит.
+
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
     DEEPSEEK_API_KEY, TAVILY_API_KEY
@@ -107,6 +112,7 @@ import datetime
 import json
 import os
 import random
+import sys
 import re
 import shutil
 import tempfile
@@ -115,6 +121,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from maxapi import Bot, Dispatcher
 
+import dynamic as tribun_dynamic
 import feed as tribun_feed
 import tribun
 import tribun_hooks as hooks
@@ -152,6 +159,7 @@ CHECK_INTERVAL_SECONDS = 20 * 60
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else "data")
 DATA_FILE = os.path.join(DATA_DIR, "today_matches.json")   # что сегодня играет и отправлен ли результат
 LAST_MORNING_FILE = os.path.join(DATA_DIR, "last_morning.txt")   # дедуп: утро уже было сегодня
+DYN_LAST_MORNING_FILE = os.path.join(DATA_DIR, "dyn_last_morning.txt")   # то же для динамического контура (активные клубы)
 # Утренний прогон (10:00 ЕКБ) должен пережить проверки результатов вплоть до
 # раннего утра следующих суток — поздние вечерние матчи (22:00+ мск) с учётом
 # RESULT_DELAY_HOURS проверяются уже ПОСЛЕ полуночи по Екатеринбургу, то есть
@@ -245,7 +253,7 @@ TAVILY_INCLUDE_DOMAINS = [
 
 # --- Настройки v4: личные уведомления, афиша, контроль расписания --------------
 
-BOT_VERSION = "2026-10-03.6"
+BOT_VERSION = "2026-10-03.7"
 # Первая проверка результата — через RESULT_DELAY_HOURS после начала матча
 # (раньше 2,5 ч, теперь 2 ч). Цикл не ждёт полного интервала: планировщик
 # просыпается точно к этому моменту (см. seconds_until_next_event).
@@ -641,6 +649,16 @@ def pick_intro(kind: str, rng=random) -> str:
     return phrases[idx]
 
 
+def mark_intro(day: datetime.date) -> None:
+    """Вводная фраза утра уже была сегодня (общая для обоих контуров: шести клубов и активных клубов) — второй раз не добавляется."""
+    meta = read_json_safe(META_FILE, {})
+    meta["intro_date"] = day.isoformat()
+    try:
+        atomic_write_json(META_FILE, meta)
+    except Exception as e:
+        print(f"[DEBUG] не удалось сохранить отметку о вводной фразе: {e}")
+
+
 def intro_kind(clubs: list) -> str:
     """Только футбол → football; только хоккей → hockey; оба вида → mixed."""
     families = {sport_family(c) for c in clubs}
@@ -941,12 +959,30 @@ def week_entry_sort_key(entry: dict):
     return (date, 0 if utc else 1, utc or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc))
 
 
+def dedupe_week_entries(entries: list) -> list:
+    """Матч двух клубов из афиши — одна строка: запись клуба А против Б и запись клуба Б против А в один день — один и тот же матч."""
+    out = []
+    for e in entries:
+        club_e = club_by_key(e["club_key"])
+        duplicate = False
+        for o in out:
+            club_o = club_by_key(o["club_key"])
+            if club_e and club_o and o["date"] == e["date"] \
+                    and team_name_matches(e["rival"], [club_o["name"], *club_o.get("aliases", [])]) \
+                    and team_name_matches(o["rival"], [club_e["name"], *club_e.get("aliases", [])]):
+                duplicate = True
+                break
+        if not duplicate:
+            out.append(e)
+    return out
+
+
 def format_weekly(entries: list) -> str | None:
     if not entries:
         return None
     lines = ["📅 Наши матчи на этой неделе"]
-    for e in sorted(entries, key=week_entry_sort_key):
-        club = club_by_key(e["club_key"])
+    for e in sorted(dedupe_week_entries(entries), key=week_entry_sort_key):
+        club = club_by_key(e["club_key"]) or {"icon": e.get("icon", "🏟"), "name": e.get("club_name", e["club_key"])}   # активные клубы вне sport_bot.CLUBS
         date = datetime.date.fromisoformat(e["date"])
         lines.append("")
         lines.append(f"{club['icon']} {club['name']} — {e['rival']}")
@@ -1742,6 +1778,7 @@ async def run_morning(bot: Bot, now: datetime.datetime, clubs: list, *, with_int
             if is_normal:
                 rec["announce_text"] = f"{intro}\n\n{rec['announce_text']}"
                 break
+        mark_intro(today)
 
     save_state(state)           # сначала фиксируем найденное, потом отправляем
     save_schedule(sched)
@@ -2550,6 +2587,15 @@ async def job_weekly(bot: Bot, now: datetime.datetime | None = None) -> bool:
         week_entries.extend(fresh)
     save_schedule(sched)
 
+    # активные клубы участников (динамический контур): те же правила, одно общее сообщение; сбой этой части не ломает афишу шести клубов
+    try:
+        dyn_entries, dyn_failed = await get_dynamic().weekly_entries(now, bot=bot)
+        week_entries.extend(dyn_entries)
+        failed.extend(sorted(dyn_failed))
+    except Exception as e:
+        print(f"[DEBUG] афиша активных клубов не получена: {type(e).__name__}: {e}")
+        failed.append("активные клубы")
+
     text = format_weekly(week_entries)
     if text is None:
         # матчей нет — ничего не отправляем; но если часть клубов не проверена, ещё раз попробуем позже
@@ -2622,9 +2668,9 @@ def tribun_automation() -> list:
     except Exception:
         next_check = now + datetime.timedelta(seconds=CHECK_INTERVAL_SECONDS)
     members = tribun_members_meta()
-    ok_m, err_m = stat("morning", "morning_retry", "announce_retry")
+    ok_m, err_m = stat("morning", "morning_retry", "announce_retry", "dyn_morning", "dyn_morning_retry", "dyn_announce_retry")
     ok_w, err_w = stat("weekly")
-    ok_r, err_r = stat("results")
+    ok_r, err_r = stat("results", "dyn_results")
     return [
         {"name": "Утренний анонс матчей", "schedule": f"ежедневно в {MORNING_HOUR}:00 (повтор сорвавшегося до {MORNING_RETRY_UNTIL_HOUR}:00)",
          "next": next_morning.strftime("%d.%m.%Y %H:%M"), "last_ok": ok_m or (load_last_morning_date() and f"{load_last_morning_date():%d.%m.%Y}"),
@@ -2664,7 +2710,7 @@ def tribun_status() -> dict:
 def build_tribun(bot: Bot) -> "tribun.Tribun":
     return tribun.Tribun(bot, data_dir=DATA_DIR, group_chat_id=MAX_CHAT_ID, owner_id=owner_user_id, version=BOT_VERSION,
                          dry_run=DRY_RUN, automation=tribun_automation, status=tribun_status,
-                         registry=hooks.REGISTRY, tracker=hooks.TRACKER)
+                         registry=hooks.REGISTRY, tracker=hooks.TRACKER, legacy_clubs={c["key"] for c in CLUBS})
 
 
 def setup_tribun_hooks() -> None:
@@ -2700,14 +2746,41 @@ async def tribun_tick_alerts(bot: Bot, now: datetime.datetime) -> None:
             hooks.GUARD.alerts.clear()
 
 
+DYNAMIC = None
+
+
+def get_dynamic() -> "tribun_dynamic.Dynamic":
+    """Динамический контур активных клубов (афиша, утро, изменения, результаты). Один экземпляр на процесс: у него кэш страниц источников."""
+    global DYNAMIC
+    if DYNAMIC is None:
+        DYNAMIC = tribun_dynamic.Dynamic(sys.modules[__name__])
+    return DYNAMIC
+
+
+def load_dyn_last_morning():
+    try:
+        with open(DYN_LAST_MORNING_FILE, "r", encoding="utf-8") as f:
+            return datetime.date.fromisoformat(f.read().strip())
+    except Exception:
+        return None
+
+
+def save_dyn_last_morning(day: datetime.date) -> None:
+    os.makedirs(os.path.dirname(DYN_LAST_MORNING_FILE), exist_ok=True)
+    with open(DYN_LAST_MORNING_FILE, "w", encoding="utf-8") as f:
+        f.write(day.isoformat())
+
+
 FEED_HEALTH_INTERVAL = float(os.environ.get("FEED_HEALTH_INTERVAL", "21600"))      # проверка источников турниров: при старте и затем раз в 6 часов
 FEED_HEALTH_FIRST_DELAY = 20.0
+DYN_SELFCHECK = os.environ.get("DYN_SELFCHECK", "1").strip().lower() in ("1", "true", "yes")      # при старте: dry-run обслуживания контрольных клубов (в группу ничего не уходит)
 
 
 async def feed_health_loop() -> None:
     """Реальные запросы ко всем источникам турниров с сервера бота: здоровье источников → реестр (экран «Источники»), итог → лог.
     Только чтение; сбой проверки не влияет на расписание анонсов и результатов."""
     await asyncio.sleep(FEED_HEALTH_FIRST_DELAY)
+    first_done = False
     while True:
         try:
             for line in await tribun_feed.smoke(tribun_feed.MatchFeed()):
@@ -2716,6 +2789,15 @@ async def feed_health_loop() -> None:
             raise
         except Exception as e:
             print(f"[FEED] проверка источников не выполнена: {type(e).__name__}: {e}")
+        if DYN_SELFCHECK and not first_done:
+            first_done = True
+            try:
+                for line in await get_dynamic().controls_log(utc_now()):
+                    print(line)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[DYN] контрольная проверка не выполнена: {type(e).__name__}: {e}")
         await asyncio.sleep(FEED_HEALTH_INTERVAL)
 
 
@@ -2810,6 +2892,10 @@ def seconds_until_next_event(now: datetime.datetime, interval: int = CHECK_INTER
         delta = (start + datetime.timedelta(hours=RESULT_DELAY_HOURS) - now).total_seconds()
         if 0 < delta < best:
             best = delta + 1
+    try:
+        best = get_dynamic().next_result_delta(now, best)
+    except Exception as e:
+        print(f"[DEBUG] ближайшая проверка активных клубов не определена: {type(e).__name__}: {e}")
     return max(5.0, best)
 
 
@@ -2820,6 +2906,7 @@ async def scheduler_loop(bot: Bot) -> None:
     проверок и неотправленных анонсов → проверка результатов. Сбой одной части
     не останавливает остальные; повторяющийся сбой цикла — одно уведомление."""
     last_morning = load_last_morning_date()
+    dyn_last_morning = load_dyn_last_morning()
     loop_failures: dict = {}
     while True:
         now = utc_now()
@@ -2855,9 +2942,20 @@ async def scheduler_loop(bot: Bot) -> None:
                 save_last_morning_date(today)
             await guarded("morning", morning_part())
 
+        if local.hour == MORNING_HOUR and dyn_last_morning != today:                 # после шести клубов: общая вводная фраза не дублируется
+            async def dyn_morning_part():
+                nonlocal dyn_last_morning
+                await get_dynamic().morning(bot, now)
+                dyn_last_morning = today
+                save_dyn_last_morning(today)
+            await guarded("dyn_morning", dyn_morning_part())
+
         await guarded("morning_retry", retry_failed_morning(bot, now))
+        await guarded("dyn_morning_retry", get_dynamic().retry_morning(bot, now))
         await guarded("announce_retry", retry_unsent_announcements(bot, now))
+        await guarded("dyn_announce_retry", get_dynamic().retry_unsent(bot, now))
         await guarded("results", job_check_results(bot, now))
+        await guarded("dyn_results", get_dynamic().results(bot, now))
         await guarded("tribun_alerts", tribun_tick_alerts(bot, now))
 
         await asyncio.sleep(seconds_until_next_event(utc_now()))
