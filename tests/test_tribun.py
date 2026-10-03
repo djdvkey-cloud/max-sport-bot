@@ -439,15 +439,11 @@ class InvitationAutomationState(Base):
         await self.press(OWNER, "inv")
         text = self.last_text()
         self.assertIn("<ССЫЛКА НА ГРУППУ>", text)
-        self.assertEqual(text, "🏟️ Заходи на Свою Трибуну!\n\n"
-                               "Выбирай клубы, за которые болеешь — 🤖 Трибун будет следить за их матчами вместе с остальными.\n\n"
-                               "⚽ Футбол · 🏒 Хоккей · 🥅 Футзал\n\n"
-                               "👥 Зови своих друзей-болельщиков тоже — здесь каждый добавляет свои команды.\n\n"
-                               "Матчи. Эмоции. Своя компания.\n\n"
-                               "👉 Вступить:\n<ССЫЛКА НА ГРУППУ>\n\n"
+        self.assertEqual(text, "👉 Вступить в «Свою Трибуну»:\n<ССЫЛКА НА ГРУППУ>\n\n"
+                               "👥 Перешли приглашение своим друзьям-болельщикам.\n\n"
                                "⚠️ MAX не отдал боту ссылку на группу — замени <ССЫЛКА НА ГРУППУ> на свою invite-ссылку.")      # реальная проблема — предупреждение ПОСЛЕ текста
-        self.assertTrue(text.startswith("🏟️ Заходи на Свою Трибуну!"))
-        self.assertLess(len(T.INVITE_TEXT.format(link="x")), 500)                       # короткий текст для пересылки
+        self.assertTrue(text.startswith("👉 Вступить в «Свою Трибуну»:"))
+        self.assertLess(len(T.INVITE_TEXT.format(link="x")), 200)                       # короткий текст под карточкой MAX
         for gone in ("баскетбол", "Баскетбол", "теннис", "Теннис", "автоспорт", "Автоспорт", "спортсмен", "прогноз", "разбор", "Разбор", "лента"):
             self.assertNotIn(gone, text)
         self.assertEqual(self.bot.group(), [])                              # приглашение не публикуется
@@ -455,14 +451,13 @@ class InvitationAutomationState(Base):
     async def test_invitation_uses_real_group_link_when_max_gives_it(self):
         self.bot.chat_link = "https://max.ru/join/abc123"
         await self.press(OWNER, "inv")
-        self.assertEqual(self.last_text(), "🏟️ Заходи на Свою Трибуну!\n\n"
-                                           "Выбирай клубы, за которые болеешь — 🤖 Трибун будет следить за их матчами вместе с остальными.\n\n"
-                                           "⚽ Футбол · 🏒 Хоккей · 🥅 Футзал\n\n"
-                                           "👥 Зови своих друзей-болельщиков тоже — здесь каждый добавляет свои команды.\n\n"
-                                           "Матчи. Эмоции. Своя компания.\n\n"
-                                           "👉 Вступить:\nhttps://max.ru/join/abc123")                 # готовое сообщение целиком, без служебных строк
+        self.assertEqual(self.last_text(), "👉 Вступить в «Свою Трибуну»:\nhttps://max.ru/join/abc123\n\n"
+                                           "👥 Перешли приглашение своим друзьям-болельщикам.")        # под карточкой MAX — только ссылка и одна строка про друзей
         for service in ("📨 Приглашение", "для пересылки", "в группу не публикуется", "подставлена автоматически", "✅", "⚠️", "ℹ️"):
             self.assertNotIn(service, self.last_text())
+        for repeated in ("Заходи на Свою Трибуну", "Футбол", "Хоккей", "Футзал", "Матчи. Эмоции", "Трибун будет следить"):    # текст карточки не повторяется
+            self.assertNotIn(repeated, self.last_text())
+        self.assertEqual(self.last_text().count("\n"), 3)                                         # три строки + пустая между ссылкой и «Перешли…»
         self.assertEqual(self.bot.group(), [])
         self.assertEqual([lbl for lbl, _ in self.buttons()], ["🛠 Управление", "🏠 Меню"])
 

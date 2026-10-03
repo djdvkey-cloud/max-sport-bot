@@ -94,9 +94,10 @@ class LaunchTexts(Base):
             low = text.lower()
             for gone in ("баскетбол", "теннис", "автоспорт", "спортсмен", "прогноз", "разбор", "ai-", "ии-"):
                 self.assertNotIn(gone, low, (name, gone))
-        for text in (T.INVITE_TEXT.format(link="x"), T.GROUP_DESCRIPTION_TEXT, T.PINNED_TEXT, T.HOOK_TEXT):
+        for text in (T.GROUP_DESCRIPTION_TEXT, T.PINNED_TEXT, T.HOOK_TEXT):
             self.assertIn("⚽", text)
             self.assertLess(len(text), 3900)
+        self.assertEqual(T.INVITE_TEXT, "👉 Вступить в «Свою Трибуну»:\n{link}\n\n👥 Перешли приглашение своим друзьям-болельщикам.")      # карточку MAX не дублирует
 
     async def test_owner_sees_texts_and_nothing_is_published(self):
         await self.press(OWNER, "adm")
