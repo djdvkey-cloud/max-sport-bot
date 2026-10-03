@@ -33,7 +33,24 @@ YEKB_TZ = ZoneInfo("Asia/Yekaterinburg")
 GROUP_NAME = "🏟️ Своя Трибуна"
 BOT_NAME = "🤖 Трибун"
 SLOGAN = "Матчи. Эмоции. Разборы. Своя компания."
-INVITE_PLACEHOLDER = "<ССЫЛКА НА ГРУППУ>"
+# Ссылка-приглашение берётся ТОЛЬКО из настройки приложения TRIBUN_INVITE_URL (рабочая ссылка из интерфейса MAX). Поле chat.link, которое отдаёт MAX API,
+# уже оказывалось НЕРАБОЧЕЙ ссылкой — для приглашений оно не используется ни как источник, ни как запасной вариант; в коде ссылок на группу нет.
+INVITE_URL_ENV = "TRIBUN_INVITE_URL"
+INVITE_URL_RE = re.compile(r"^https://max\.ru/join/[A-Za-z0-9_\-]{10,}$")
+INVITE_NOT_CONFIGURED = "⚠️ Ссылка-приглашение не настроена."
+
+
+def invite_url() -> str | None:
+    """Настроенная ссылка-приглашение или None (не задана / не похожа на ссылку-приглашение MAX). Читается при каждом обращении."""
+    value = os.environ.get(INVITE_URL_ENV, "").strip()
+    return value if INVITE_URL_RE.match(value) else None
+
+
+def invite_warning() -> str:
+    raw = os.environ.get(INVITE_URL_ENV, "").strip()
+    detail = (f"Значение {INVITE_URL_ENV} не похоже на ссылку-приглашение MAX (https://max.ru/join/…)." if raw
+              else f"Задай настройку {INVITE_URL_ENV} в Amvera: рабочая ссылка-приглашение из интерфейса MAX (https://max.ru/join/…).")
+    return f"{INVITE_NOT_CONFIGURED}\n\n{detail}"
 
 WELCOME_TEXT = (
     "🏟️ Добро пожаловать на «Свою Трибуну», {name}!\n\n"
@@ -74,7 +91,6 @@ PINNED_TEXT = (
     "Даже если за клуб болеешь только ты — он такой же участник нашей Трибуны, как все остальные.\n\n"
     "Матчи. Эмоции. Своя компания."
 )
-JOIN_LINK = "https://max.ru/join/22mxKdkXVvWHUpBiXQrp1a2zcClhNynt4BAVd-2waWk"
 HOOK_TEXT = (
     "🏟️ Заходи на Свою Трибуну\n\n"
     "Мы делаем спортивную группу не про безликую новостную ленту, а про наши команды и наши матчи.\n\n"
@@ -86,7 +102,7 @@ HOOK_TEXT = (
     "Здесь нет команды «важнее», потому что за неё болеет больше людей. Каждый выбранный клуб имеет одинаковый приоритет.\n\n"
     "⚽ Футбол · 🏒 Хоккей · 🥅 Футзал\n\n"
     "Матчи. Эмоции. Своя компания.\n\n"
-    "Ссылка:\n" + JOIN_LINK
+    "Ссылка:\n{link}"
 )
 # ============================================================
 # Разделы интересов и служебные константы
@@ -294,7 +310,6 @@ class Tribun:
         self.requests_path = os.path.join(data_dir, "tribun_requests.json")
         self.pubs_path = os.path.join(data_dir, "tribun_publications.json")
         self.prios_path = os.path.join(data_dir, "tribun_priorities.json")
-        self._link_cache = (None, None)
 
     # ---- роль -----------------------------------------------------------------
 
@@ -947,7 +962,7 @@ class Tribun:
         return ("📢 Тексты запуска (для ручной вставки в MAX; бот их не публикует)\n\n"
                 f"1️⃣ Описание группы\n\n{GROUP_DESCRIPTION_TEXT}\n\n"
                 f"2️⃣ Закреп\n\n{PINNED_TEXT}\n\n"
-                f"3️⃣ Зазывалка\n\n{HOOK_TEXT}")
+                f"3️⃣ Зазывалка\n\n{HOOK_TEXT.format(link=invite_url() or INVITE_NOT_CONFIGURED)}")
 
     def active_clubs_text(self) -> str:
         """ACTIVE CLUBS = все активные клубы всех участников, которые сейчас в группе (учитывается только активный каталог пилота).
@@ -1009,28 +1024,12 @@ class Tribun:
 
     # ---- приглашение ------------------------------------------------------------------------------------------
 
-    async def group_link(self) -> str | None:
-        link, at = self._link_cache
-        if link and at and (self.now() - at).total_seconds() < 3600:
-            return link
-        try:
-            chat = await self.bot.get_chat_by_id(self.group_chat_id)
-            link = getattr(chat, "link", None)
-        except Exception as e:
-            print(f"[TRIBUN] ссылка на группу недоступна: {type(e).__name__}: {mask_secrets(str(e))}")
-            return None
-        if link:
-            self._link_cache = (link, self.now())
-        return link or None
-
     async def invite_view(self):
-        link = await self.group_link()
-        body = INVITE_TEXT.format(link=link or INVITE_PLACEHOLDER)
-        # С рабочей ссылкой экран — ТОЛЬКО готовое сообщение для пересылки (никаких служебных строк). Предупреждение показывается лишь при реальной
-        # проблеме (MAX не отдал ссылку) и стоит ПОСЛЕ текста, чтобы начало сообщения оставалось готовым к копированию.
-        if not link:
-            body += f"\n\n⚠️ MAX не отдал боту ссылку на группу — замени {INVITE_PLACEHOLDER} на свою invite-ссылку."
-        return body, [[Btn("🛠 Управление", "adm"), Btn("🏠 Меню", "m")]]
+        """Только настроенная ссылка TRIBUN_INVITE_URL; поле ссылки группы из MAX API не используется. Нет настройки — одно понятное предупреждение, никакой
+        найденной автоматически ссылки. Ничего не публикуется в группу."""
+        url = invite_url()
+        text = INVITE_TEXT.format(link=url) if url else invite_warning()
+        return text, [[Btn("🛠 Управление", "adm"), Btn("🏠 Меню", "m")]]
 
     # ---- приоритеты -------------------------------------------------------------------------------------------
 

@@ -2833,6 +2833,7 @@ async def run_tribun(bot: Bot) -> list:
         tasks.append(asyncio.create_task(polling()))
         tasks.append(asyncio.create_task(club.sync_loop()))
         print(f"[TRIBUN] запущен: владелец {'настроен' if owner_user_id() else 'НЕ настроен'}, бот @{club.bot_username or '?'}")
+        print(f"[TRIBUN] ссылка-приглашение ({tribun.INVITE_URL_ENV}): {tribun.invite_url() or 'НЕ НАСТРОЕНА'}")
     except Exception as e:
         print(f"[TRIBUN] не запущен: {type(e).__name__}: {e}")
     return tasks

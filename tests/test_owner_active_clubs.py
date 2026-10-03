@@ -85,7 +85,7 @@ class LaunchTexts(Base):
         self.assertIn("📅 по понедельникам — матчи наших клубов на неделю\n🔔 в день матча — напоминание\n"
                       "⚠️ сообщаем о переносах, отменах и изменении времени\n🏁 после игры — результат", T.PINNED_TEXT)
         self.assertIn("вид спорта → чемпионат → клубы.", T.PINNED_TEXT)
-        self.assertTrue(T.HOOK_TEXT.endswith("Ссылка:\nhttps://max.ru/join/22mxKdkXVvWHUpBiXQrp1a2zcClhNynt4BAVd-2waWk"))
+        self.assertTrue(T.HOOK_TEXT.endswith("Ссылка:\n{link}"))                       # ссылка подставляется из TRIBUN_INVITE_URL, в тексте её нет
         self.assertIn("За Зенит? Добавляй Зенит.\nЗа Реал? Будет Реал.\nЗа клуб NHL или КХЛ? Выбирай его.", T.HOOK_TEXT)
 
     def test_public_texts_mention_only_pilot_directions(self):
