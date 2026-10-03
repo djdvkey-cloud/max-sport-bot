@@ -1272,7 +1272,12 @@ class Tribun:
             lines += ["", "Чемпионаты:"]
             for c in C.COMPETITIONS:
                 st, note = reg.competition_coverage(c[0])
-                lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
+                served = [C.CLUB_BY_KEY[k][1] for k in C.comp_club_keys(c[0]) if reg.serving_club(k)]
+                if st == src.GAP or not served:
+                    lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
+                else:                                              # частичное покрытие: только отслеживаемые клубы, не весь турнир
+                    verb = "покрываются" if len(served) > 1 else "покрывается"
+                    lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {verb}: {', '.join(served)}")
             lines += ["", "Клубы:"]
             for c in C.CLUBS:
                 if reg.serving_club(c[0]):

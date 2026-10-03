@@ -94,6 +94,26 @@ class CatalogIsNotCoverage(Base):
         self.assertIn("Аякс (клуб) — 1 · выбран из списка", self.last_text())
         self.assertIn("Лига конференций (чемпионат) — 1", self.last_text())
 
+    async def test_competition_coverage_lists_only_tracked_clubs_not_whole_tournament(self):
+        await self.press(OWNER, "adm:src:cov")
+        text = self.last_text()
+        comps = text.split("Чемпионаты:\n", 1)[1].split("\n\nКлубы:", 1)[0].splitlines()
+        by_name = {l[2:].split(" — ")[0].strip(): l for l in comps}
+        self.assertEqual(by_name["КХЛ"], "✅ КХЛ — покрывается: Автомобилист")
+        self.assertEqual(by_name["АПЛ"], "✅ АПЛ — покрывается: Арсенал")
+        self.assertEqual(by_name["Ла Лига"], "✅ Ла Лига — покрывается: Реал Мадрид")
+        self.assertEqual(by_name["Серия А"], "✅ Серия А — покрывается: Милан")
+        self.assertEqual(by_name["Первая лига"], "✅ Первая лига — покрывается: Урал")
+        self.assertEqual(by_name["Лига Европы"], "✅ Лига Европы — покрывается: Милан")
+        self.assertEqual(by_name["Лига чемпионов"], "✅ Лига чемпионов — покрываются: Арсенал, Реал Мадрид")
+        self.assertTrue(by_name["Суперлига"].startswith("✅ Суперлига — покрывается: "))
+        self.assertIn("Синара", by_name["Суперлига"])
+        for gap in ("NHL", "Лига конференций", "Единая лига ВТБ"):
+            self.assertEqual(by_name[gap], f"⚠️ {gap} — надёжного источника нет")
+        self.assertTrue(any(n.startswith("РПЛ") and "надёжного источника нет" in l and l.startswith("⚠️") for n, l in by_name.items()))
+        self.assertNotIn("есть рабочий источник", "\n".join(comps))
+        self.assertIn("✅ Автомобилист — есть рабочий источник", text.split("Клубы:\n", 1)[1])
+
 
 if __name__ == "__main__":
     unittest.main()
