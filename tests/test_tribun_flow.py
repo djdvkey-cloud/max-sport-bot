@@ -68,16 +68,18 @@ class Flow(Base):
         await self.press(5, "c:cp")
         self.assertIn("Единая лига ВТБ", self.shown("cp"))
 
-    async def test_futsal_catalog_is_minimal_and_has_sinara(self):
+    async def test_futsal_superliga_clubs_include_sinara(self):
         await self.pick(5, sports=("futsal",), comps=("superliga",))
         await self.press(5, "c:cl")
-        self.assertEqual(self.shown("cl"), ["Синара", "➕ Другое"])
+        self.assertEqual(len(self.keys("cl")), 12)
+        self.assertIn("Синара", self.shown("cl"))
+        self.assertNotIn("Автомобилист", self.shown("cl"))
 
     # ---------- клубы ----------
     async def test_only_khl_gives_only_khl_clubs(self):
         await self.pick(5, sports=("hockey", "football"), comps=("khl",))
         await self.press(5, "c:cl")
-        self.assertEqual(sorted(self.keys("cl")), sorted(C.SEASONS["khl"]))
+        self.assertEqual(sorted(self.keys("cl")), sorted(C.comp_club_keys("khl")))
         self.assertIn("Автомобилист", self.shown("cl"))
         self.assertNotIn("Бостон Брюинз", self.shown("cl"))
         self.assertNotIn("Реал Мадрид", self.shown("cl"))
@@ -85,14 +87,14 @@ class Flow(Base):
     async def test_only_nhl_gives_only_nhl_clubs(self):
         await self.pick(5, sports=("hockey",), comps=("nhl",))
         await self.press(5, "c:cl")
-        self.assertEqual(sorted(self.keys("cl")), sorted(C.SEASONS["nhl"]))
+        self.assertEqual(sorted(self.keys("cl")), sorted(C.comp_club_keys("nhl")))
         self.assertEqual(len(self.keys("cl")), 32)
         self.assertNotIn("Автомобилист", self.shown("cl"))
 
     async def test_laliga_gives_only_laliga_clubs(self):
         await self.pick(5, sports=("football", "hockey"), comps=("laliga",))
         await self.press(5, "c:cl")
-        self.assertEqual(sorted(self.keys("cl")), sorted(C.SEASONS["laliga"]))
+        self.assertEqual(sorted(self.keys("cl")), sorted(C.comp_club_keys("laliga")))
         self.assertIn("Реал Мадрид", self.shown("cl"))
         for other in ("Арсенал", "Милан", "Автомобилист"):
             self.assertNotIn(other, self.shown("cl"))
@@ -102,7 +104,7 @@ class Flow(Base):
         await self.press(5, "c:cl")
         keys = self.keys("cl")
         self.assertEqual(len(keys), len(set(keys)))
-        self.assertEqual(set(keys), set(C.SEASONS["apl"]) | set(C.SEASONS["ucl"]))
+        self.assertEqual(set(keys), set(C.comp_club_keys("apl")) | set(C.comp_club_keys("ucl")))
         self.assertEqual(keys.count("arsenal"), 1)                                       # клуб из двух турниров — одна кнопка
         self.assertIn("Бавария", self.shown("cl"))                                       # клуб только ЛЧ
         self.assertIn("real", keys)
@@ -110,22 +112,22 @@ class Flow(Base):
 
     async def test_unselecting_championship_deactivates_only_its_unique_clubs(self):
         await self.join(5, "Мария")
-        await self.onboard(5, sports=("football",), comps=("apl", "uel"), clubs=("aston_villa", "crystal_palace"))
+        await self.onboard(5, sports=("football",), comps=("apl", "ucl"), clubs=("aston_villa", "chelsea"))
         m = self.tribun.interest_map(self.tribun.load_members())
-        self.assertEqual([x[0] for x in m["clubs"]], ["Астон Вилла", "Кристал Пэлас"])
+        self.assertEqual([x[0] for x in m["clubs"]], ["Астон Вилла", "Челси"])
         await self.press(5, "c:cp")
         await self.press(5, "t:cp:apl")                                                  # сняли АПЛ
         m = self.tribun.interest_map(self.tribun.load_members())
-        self.assertEqual([x[0] for x in m["clubs"]], ["Астон Вилла"])                    # Кристал Пэлас — только АПЛ → неактивен; Вилла осталась через ЛЕ
-        self.assertEqual([x[0] for x in m["championships"]], ["Лига Европы"])
-        self.assertEqual(self.profile(5)["clubs"], ["aston_villa", "crystal_palace"])    # выбор сохранён
+        self.assertEqual([x[0] for x in m["clubs"]], ["Астон Вилла"])                    # Челси — только АПЛ → неактивен; Вилла осталась через ЛЧ
+        self.assertEqual([x[0] for x in m["championships"]], ["Лига чемпионов"])
+        self.assertEqual(self.profile(5)["clubs"], ["aston_villa", "chelsea"])           # выбор сохранён
         await self.press(5, "c:cl")
-        self.assertNotIn("crystal_palace", self.keys("cl"))
+        self.assertNotIn("chelsea", self.keys("cl"))
         self.assertIn("✅ Астон Вилла", [l for l, _ in self.buttons()])
         await self.press(5, "c:cp")
         await self.press(5, "t:cp:apl")                                                  # вернули — клуб снова активен
         m = self.tribun.interest_map(self.tribun.load_members())
-        self.assertEqual([x[0] for x in m["clubs"]], ["Астон Вилла", "Кристал Пэлас"])
+        self.assertEqual([x[0] for x in m["clubs"]], ["Астон Вилла", "Челси"])
 
     async def test_aggregation_counts_only_active_choices_in_owner_screen(self):
         await self.join(1, "А")
@@ -165,19 +167,20 @@ class Flow(Base):
         return len(self.tribun.load_requests()["items"])
 
     # ---------- каталог и сезоны ----------
-    def test_six_clubs_sit_in_their_competitions_without_invented_europe(self):
-        where = {k: {c for c in C.SEASONS if k in C.SEASONS[c]} for k in ("avtomobilist", "sinara", "ural", "real", "arsenal", "milan")}
+    def test_six_clubs_sit_in_their_competitions_2026_27(self):
+        where = {k: {c for c in C.SEASONS if k in C.comp_club_keys(c)} for k in ("avtomobilist", "sinara", "ural", "real", "arsenal", "milan")}
         self.assertEqual(where["avtomobilist"], {"khl"})
         self.assertEqual(where["sinara"], {"superliga"})
         self.assertEqual(where["ural"], {"fnl1"})
         self.assertEqual(where["real"], {"laliga", "ucl"})
         self.assertEqual(where["arsenal"], {"apl", "ucl"})
-        self.assertEqual(where["milan"], {"seriea"})                                    # в еврокубке не придумываем
+        self.assertEqual(where["milan"], {"seriea", "uel"})                             # Милан — в Лиге Европы 2026/27 (UEFA.com)
         for key in where:
             self.assertIn(key, C.CLUB_BY_KEY)
 
     def test_catalog_is_consistent(self):
-        for comp, clubs in C.SEASONS.items():
+        for comp in C.SEASONS:
+            clubs = C.comp_club_keys(comp)
             self.assertIn(comp, C.COMP_BY_KEY)
             self.assertEqual(len(clubs), len(set(clubs)), comp)
             for k in clubs:
@@ -189,7 +192,7 @@ class Flow(Base):
 
     async def test_next_season_roster_is_replaced_without_touching_the_interface(self):
         await self.pick(5, sports=("football",), comps=("ucl",))
-        with mock.patch.dict(C.SEASONS, {"ucl": ["milan", "zenit"]}):
+        with mock.patch.dict(C.SEASONS, {"ucl": {**C.SEASONS["ucl"], "clubs": ["milan", "zenit"]}}):
             await self.press(5, "c:cl")
             self.assertEqual(set(self.keys("cl")), {"milan", "zenit"})
 

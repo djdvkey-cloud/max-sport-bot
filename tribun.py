@@ -1264,7 +1264,8 @@ class Tribun:
         rows_ = reg.rows()
         enabled = [r for r in rows_ if r["def"].enabled]
         if sub == "cov":
-            lines = ["🏟 Покрытие", "", "Покрытие = что SPORTBOT реально отслеживает (шесть клубов), а не «весь спорт».", "", "Виды спорта:"]
+            lines = ["🏟 Покрытие", "", "Покрытие = что SPORTBOT реально отслеживает (шесть клубов), а не «весь спорт».",
+                     f"Каталог выбора: сезон {C.CURRENT_SEASON}, проверен {C.VERIFIED_AT}. Клуб в каталоге ≠ источник его расписания: «есть в каталоге + GAP» — нормальное состояние.", "", "Виды спорта:"]
             for key, icon, name, _ in C.SPORTS:
                 st, note = reg.sport_coverage(key)
                 lines.append(f"{src.COVERAGE_ICON[st]} {name} — {src.COVERAGE_TEXT[st]}" + (f" ({note})" if note else ""))
