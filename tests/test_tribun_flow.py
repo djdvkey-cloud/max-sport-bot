@@ -40,8 +40,7 @@ class Flow(Base):
     async def test_football_list_is_exactly_agreed(self):
         await self.press(5, "t:sp:football")
         await self.press(5, "c:cp")
-        self.assertEqual(self.shown("cp"), ["РПЛ / Премьер-лига", "Первая лига", "АПЛ", "Ла Лига", "Серия А", "Лига чемпионов", "Лига Европы",
-                                            "Лига конференций", "➕ Другое"])
+        self.assertEqual(self.shown("cp"), ["РПЛ / Премьер-лига", "Первая лига", "АПЛ", "Ла Лига", "Серия А", "Лига чемпионов", "➕ Другое"])
 
     async def test_russian_cup_is_gone_everywhere(self):
         self.assertNotIn("Кубок России", [c[1] for c in C.COMPETITIONS])
@@ -64,9 +63,11 @@ class Flow(Base):
         self.assertIn("Суперлига", self.shown("cp"))
         self.assertNotIn("Единая лига ВТБ", self.shown("cp"))
         await self.press(5, "c:sp")
-        await self.press(5, "t:sp:basketball")
+        await self.press(5, "t:sp:basketball")                                        # баскетбола в пилоте нет: нажатие старой кнопки ничего не включает
+        self.assertIn("недоступен", self.last_text())
+        self.assertNotIn("basketball", self.profile(5)["sports"])
         await self.press(5, "c:cp")
-        self.assertIn("Единая лига ВТБ", self.shown("cp"))
+        self.assertNotIn("Единая лига ВТБ", self.shown("cp"))
 
     async def test_futsal_superliga_clubs_include_sinara(self):
         await self.pick(5, sports=("futsal",), comps=("superliga",))
@@ -179,13 +180,13 @@ class Flow(Base):
             self.assertIn(key, C.CLUB_BY_KEY)
 
     def test_catalog_is_consistent(self):
-        for comp in C.SEASONS:
+        for comp in C.COMP_BY_KEY:
             clubs = C.comp_club_keys(comp)
             self.assertIn(comp, C.COMP_BY_KEY)
             self.assertEqual(len(clubs), len(set(clubs)), comp)
             for k in clubs:
                 self.assertIn(k, C.CLUB_BY_KEY, (comp, k))
-        self.assertEqual(set(C.SEASONS), set(C.COMP_BY_KEY))
+        self.assertEqual(set(C.SEASONS), set(C.COMP_BY_KEY) | C.DEFERRED_KEYS)
         names = [c[1] for c in C.CLUBS]
         self.assertEqual(len(names), len(set(names)))                                    # названия клубов однозначны
         self.assertTrue(C.CURRENT_SEASON)

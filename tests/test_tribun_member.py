@@ -42,7 +42,7 @@ class Member(Base):
     async def test_03_sports_multiselect_with_other(self):
         await self.press(5, "c:sp")
         self.assertEqual([l for l in self.labels() if l not in ("✅ Сохранить", "Дальше ▶️", "⬅️ Назад")],
-                         ["⚽ Футбол", "🏒 Хоккей", "🥅 Футзал", "🏀 Баскетбол", "➕ Другое"])
+                         ["⚽ Футбол", "🏒 Хоккей", "🥅 Футзал", "➕ Другое"])
         for key in ("football", "hockey", "futsal"):
             await self.press(5, f"t:sp:{key}")
         self.assertEqual(self.profile(5)["sports"], ["football", "hockey", "futsal"])
@@ -51,13 +51,15 @@ class Member(Base):
         self.assertEqual(self.profile(5)["sports"], ["football", "futsal"])
 
     # 7
-    async def test_06_basketball_has_no_big_catalog(self):
-        await self.press(5, "t:sp:basketball")
+    async def test_06_basketball_is_deferred_not_a_catalog_choice(self):
+        await self.press(5, "t:sp:basketball")                                        # старая кнопка: «вариант недоступен», выбор не записывается
+        self.assertIn("недоступен", self.last_text())
+        self.assertEqual(self.profile(5)["sports"], [])
         await self.press(5, "c:cl")
         self.assertFalse([p for p in self.payloads() if p.startswith("t:cl:")])
         self.assertIn("o:cl", self.payloads())
         await self.press(5, "c:cp")
-        self.assertEqual([p for p in self.payloads() if p.startswith("t:cp:")], ["t:cp:vtb"])
+        self.assertEqual([p for p in self.payloads() if p.startswith("t:cp:")], [])
 
     # 8
     async def test_07_other_is_a_request_not_support(self):

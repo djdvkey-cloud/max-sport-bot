@@ -41,6 +41,42 @@ class HockeyAndBasketball(unittest.TestCase):
         a = pick(matches, "avtomobilist", "amur")
         self.assertEqual((a["score_home"], a["score_away"], a["method"]), (3, 0, "ОСНОВНОЕ"))
 
+    def test_overtime_and_shootout_mark_stands_next_to_the_winners_score(self):
+        # живая страница 03.10 (КХЛ): при победе ХОЗЯЕВ пометка «б/от» идёт ПЕРЕД счётом, при победе гостей — ПОСЛЕ (см. «Нефтехимик 4:5 от Барыс»)
+        matches, stats = day_matches("hockey", "hockey_2026-10-03_evening.txt", "2026-10-03")
+        khl = [m for m in matches if m["competition"] == "khl"]
+        self.assertEqual(len(khl), 5)                                                       # раньше блок КХЛ терялся целиком
+        self.assertEqual(stats["skipped_records"], 0)
+        a = pick(matches, "cska_h", "dinamo_msk_h")
+        self.assertEqual((a["score_home"], a["score_away"], a["method"], a["status"]), (4, 3, "БУЛЛИТЫ", M.FINISHED))
+        b = pick(matches, "ska", "admiral")
+        self.assertEqual((b["score_home"], b["score_away"], b["method"]), (6, 5, "БУЛЛИТЫ"))
+        c = pick(matches, "severstal", "shanghai")
+        self.assertEqual((c["score_home"], c["score_away"], c["method"]), (2, 1, "ОТ"))
+        d = pick(matches, "dinamo_mn_h", "lokomotiv_h")
+        self.assertEqual((d["score_home"], d["score_away"], d["method"]), (4, 3, "ОСНОВНОЕ"))
+        e = pick(matches, "sochi_h", "torpedo_h")
+        self.assertEqual((e["status"], e["score_home"], e["score_away"]), (M.LIVE, 0, 3))
+        away_win = day_matches("hockey", "hockey_2026-10-02.txt", "2026-10-02")[0]
+        self.assertEqual(pick(away_win, "neftekhimik_h", "barys")["method"], "ОТ")           # пометка после счёта по-прежнему читается
+
+    def test_one_unreadable_record_does_not_lose_the_rest_of_the_block(self):
+        lines = ["FONBET Чемпионат КХЛ 2026/2027", "(1)", "17:00", "Завершен", "СКА", "4", ":", "3", "Адмирал",
+                 "18:00", "Завершен", "???", "странная", "запись", "без", "счёта",
+                 "19:00", "Завершен", "Авангард", "2", ":", "1", "Лада",
+                 "НХЛ 2026/2027", "01:30", "Завершен", "Детройт", "0", ":", "2", "Рейнджерс"]
+        matches, stats = M.parse_sportsru_day("hockey", "\n".join(lines), datetime.date(2026, 10, 3), source_url="u", retrieved_at=NOW)
+        self.assertEqual([(m["home_team_id"], m["away_team_id"]) for m in matches], [("ska", "admiral"), ("avangard", "lada"), ("nhl_det", "nhl_nyr")])
+        self.assertEqual(stats["skipped_records"], 1)                                        # потеря видна в статистике (и в логе через отчёт источника)
+
+    def test_record_that_fails_to_parse_does_not_abort_the_block(self):
+        lines = ["FONBET Чемпионат КХЛ 2026/2027", "17:00", "Завершен", "СКА", "4", ":", "3", "Адмирал",
+                 "18:30", "Завершен", "7", ":", "1",
+                 "19:00", "Завершен", "Авангард", "2", ":", "1", "Лада"]
+        matches, stats = M.parse_sportsru_day("hockey", "\n".join(lines), datetime.date(2026, 10, 3), source_url="u", retrieved_at=NOW)
+        self.assertEqual([(m["home_team_id"], m["away_team_id"]) for m in matches], [("ska", "admiral"), ("avangard", "lada")])
+        self.assertGreaterEqual(stats["skipped_records"], 1)
+
     def test_khl_live_and_future_matches(self):
         matches, _ = day_matches("hockey", "hockey_2026-10-03.txt", "2026-10-03")
         live = pick(matches, "severstal", "shanghai")

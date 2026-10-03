@@ -1,10 +1,11 @@
 """Оркестратор расписаний и результатов «Трибуна»: турнир → цепочка источников → единый список матчей.
 
 Цепочка по турнирам (PRIMARY → CROSSCHECK; Tavily/OpenAI/DeepSeek остаются только в прежней автоматике шести клубов — источником факта они не являются):
-  КХЛ, ВТБ                        sports.ru матч-центр (дата) — один запрос на вид спорта и день отдаёт ВСЕ матчи турнира
+  КХЛ                             sports.ru матч-центр (дата) — один запрос на вид спорта и день отдаёт ВСЕ матчи турнира
   NHL                             официальный API api-web.nhle.com (OFFICIAL) ← сверка со sports.ru матч-центром
-  РПЛ, АПЛ, Ла Лига, Серия А,     sports.ru матч-центр (футбол)
-  ЛЧ, ЛЕ, ЛК
+  РПЛ, АПЛ, Ла Лига, Серия А      sports.ru матч-центр (футбол)
+  Лига чемпионов                  sports.ru матч-центр (футбол) ← сверка с Википедией (независимо; UEFA.com отдаёт только JS-оболочку)
+  (отложено: ВТБ, ЛЕ, ЛК — адаптеры в коде остаются, но в пилотный каталог, опрос и покрытие не входят)
   Первая лига                     страницы клубов sports.ru (общего календаря без JS у sports.ru нет, fnl.pro — Next.js без публичного HTML)
   Суперлига (футзал)              superliga.rfs.ru — общий календарь лиги на главной (OFFICIAL)
 Ошибка источника ≠ «матчей нет»: сбой фиксируется в отчёте и в реестре источников, матчи этого источника не подставляются «пустым списком».
@@ -22,12 +23,15 @@ import tribun_catalog as C
 import tribun_hooks as hooks
 
 UA = "Mozilla/5.0 (compatible; SportBot/1.0; +sport-bot)"        # как в прежнем fetch_url_direct (SPORTBOT)
+UA_WIKI = "SportBot/1.0 (+https://github.com/djdvkey-cloud/max-sport-bot)"      # политика Викимедиа: описательный User-Agent со ссылкой, обычный браузерный/общий получает 403
 FETCH_TIMEOUT = 20
 
 URL_CENTER = "https://www.sports.ru/{sport}/match/{day}/"
 URL_NHL = "https://api-web.nhle.com/v1/schedule/{day}"
 URL_SUPERLIGA = "https://superliga.rfs.ru/"
 URL_CLUB = "https://www.sports.ru/football/club/{slug}/calendar/"
+URL_WIKI_UCL = "https://en.wikipedia.org/wiki/2026%E2%80%9327_UEFA_Champions_League_league_phase"
+WIKI_TTL = 3600.0                      # страница Википедии тяжёлая (~2 МБ): не чаще раза в час
 
 # Первая лига 2026/27: id клуба каталога → slug страницы клуба на sports.ru (проверено: у всех 18 страница отдаёт 200 и название клуба)
 FNL1_SLUGS = {
@@ -42,7 +46,8 @@ CENTER_COMPETITIONS = {"khl": "hockey", "nhl": "hockey", "vtb": "basketball", "r
                        "seriea": "football", "ucl": "football", "uel": "football", "uecl": "football"}
 
 # Порядок доверия при слиянии одного матча из нескольких источников (раньше = главнее)
-PRECEDENCE = ("nhl:api", "rfs:superliga", "sportsru:center:hockey", "sportsru:center:football", "sportsru:center:basketball", "sportsru:club:football")
+PRECEDENCE = ("nhl:api", "rfs:superliga", "sportsru:center:hockey", "sportsru:center:football", "sportsru:center:basketball", "sportsru:club:football",
+              "wikipedia:ucl")
 
 OK, EMPTY, FAILED = "ok", "confirmed_empty", "failed"
 
@@ -61,7 +66,8 @@ async def default_fetch(url: str) -> tuple:
     """→ (HTTP-статус | None, тело). Сетевая ошибка = (None, описание). Редиректы разрешены, капча/403 видны по статусу."""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers={"User-Agent": UA}, timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT)) as resp:
+            async with session.get(url, headers={"User-Agent": UA_WIKI if "wikipedia.org" in url else UA},
+                                   timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT)) as resp:
                 raw = await resp.read()
                 return resp.status, raw.decode("utf-8", errors="ignore")
     except (asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -115,8 +121,13 @@ def merge_matches(batches: list) -> list:
             agree = all(x["status"] == main["status"] and x["score_home"] == main["score_home"] and x["score_away"] == main["score_away"] for x in others)
             score_conflict = any(main["status"] == M.FINISHED and x["status"] == M.FINISHED
                                  and (x["score_home"], x["score_away"]) != (main["score_home"], main["score_away"]) for x in others)
+            time_differs = any(main["status"] == M.SCHEDULED and x["status"] == M.SCHEDULED and main["kickoff"] and x["kickoff"]
+                               and main["kickoff"] != x["kickoff"] for x in others)
             if score_conflict:
                 main["confidence"], main["trusted"] = "conflict", False
+            elif agree and time_differs:
+                main["confidence"], main["trusted"] = "time_differs", True      # дата совпала, время начала источники называют по-разному
+                main["other_kickoffs"] = {x["source_id"]: x["kickoff"] for x in others if x["kickoff"]}
             elif agree:
                 main["confidence"], main["trusted"] = "confirmed", True
             else:
@@ -155,7 +166,9 @@ class MatchFeed:
         if not matches and stats["raw_blocks"] == 0 and not (sanity and sanity(html_to_text(body) if text else body)):
             return [], self._report(SourceReport(source_id, FAILED, error="вёрстка изменилась: страница не распознана", url=url))
         outcome = OK if matches else EMPTY
-        return matches, self._report(SourceReport(source_id, outcome, matches=len(matches), unknown_teams=stats["unknown_teams"], url=url))
+        skipped = stats.get("skipped_records", 0)
+        note = f"пропущено нераспознанных записей: {skipped}" if skipped else None             # источник отработал, но часть записей не разобралась — виден в логе
+        return matches, self._report(SourceReport(source_id, outcome, error=note, matches=len(matches), unknown_teams=stats["unknown_teams"], url=url))
 
     @staticmethod
     def _center_page_ok(text: str) -> bool:
@@ -178,6 +191,18 @@ class MatchFeed:
         ref = now.astimezone(M.EKB).date()
         return await self._run("rfs:superliga", URL_SUPERLIGA,
                                lambda t: M.parse_superliga_calendar(t, ref, source_url=URL_SUPERLIGA, retrieved_at=now))
+
+    async def wiki_ucl(self) -> tuple:
+        """Все 144 матча фазы лиги из Википедии (сверка ЛЧ). Кэш на час: страница тяжёлая, а данные для сверки меняются редко."""
+        now = self.now()
+        hit = self._cache.get("wiki_ucl")
+        if hit and (now - hit[0]).total_seconds() < WIKI_TTL:
+            return hit[1], hit[2]
+        matches, rep = await self._run("wikipedia:ucl", URL_WIKI_UCL,
+                                       lambda t: M.parse_wikipedia_ucl(t, source_url=URL_WIKI_UCL, retrieved_at=now), text=False)
+        if rep.outcome != FAILED:
+            self._cache["wiki_ucl"] = (now, matches, rep)
+        return matches, rep
 
     async def fnl1_club(self, club_id: str) -> tuple:
         now = self.now()
@@ -205,6 +230,8 @@ class MatchFeed:
             add(self.nhl(day), {"nhl"})
         if "superliga" in wanted:
             add(self.superliga(), {"superliga"})
+        if "ucl" in wanted:
+            add(self.wiki_ucl(), {"ucl"})
         if "fnl1" in wanted:
             for club_id in (sorted(set(clubs) & set(FNL1_SLUGS)) if clubs is not None else sorted(FNL1_SLUGS)):
                 add(self.fnl1_club(club_id), {"fnl1"})
@@ -227,14 +254,16 @@ class MatchFeed:
 
     @staticmethod
     def aggregate_interests(profiles: list) -> dict:
-        """Активные участники группы → агрегат без имён: {'clubs': {club_id: n}, 'competitions': {comp: n}, 'sports': {sport: n}, 'members': N}."""
+        """Активные участники группы → агрегат без имён: {'clubs': {club_id: n}, 'competitions': {comp: n}, 'sports': {sport: n}, 'members': N}.
+        Учитывается только то, что есть в АКТИВНОМ каталоге (C.effective_selection): выбор баскетбола, ВТБ, ЛЕ, ЛК остаётся в профиле, но не считается."""
         agg = {"clubs": {}, "competitions": {}, "sports": {}, "members": 0}
         for p in profiles:
             if not p.get("active_in_group"):
                 continue
             agg["members"] += 1
-            for key, bucket in (("clubs", "clubs"), ("championships", "competitions"), ("sports", "sports")):
-                for v in p.get(key, []) or []:
+            eff = C.effective_selection(p)
+            for code, bucket in (("cl", "clubs"), ("cp", "competitions"), ("sp", "sports")):
+                for v in eff[code]:
                     agg[bucket][v] = agg[bucket].get(v, 0) + 1
         return agg
 
@@ -253,8 +282,8 @@ class MatchFeed:
             by_comp = agg["competitions"].get(m["competition"], 0)
             interested = max(by_club, by_comp)
             if interested:
-                out.append({**m, "interested": interested})
-        return sorted(out, key=lambda m: (-m["interested"], m["kickoff"] or datetime.datetime.max.replace(tzinfo=M.UTC)))
+                out.append({**m, "interested": interested, "club_fans": by_club})
+        return sorted(out, key=lambda m: (-m["interested"], -m["club_fans"], m["kickoff"] or datetime.datetime.max.replace(tzinfo=M.UTC)))
 
 
 SMOKE_OFFSETS = (0, 1, 7)          # сегодня, завтра и через неделю (в выходные там матчи футбольных лиг — иначе футбол проверяется только на «пусто»)
@@ -293,4 +322,40 @@ async def smoke(f: MatchFeed, now: datetime.datetime | None = None, offsets=SMOK
         lines.append(f"[FEED] {day} матчей по турнирам: " + (", ".join(f"{k}={v['n']}" + (f" (сверено {v['confirmed']})" if v["confirmed"] else "")
                                                                + (f" КОНФЛИКТ {v['conflict']}" if v["conflict"] else "") for k, v in sorted(per.items())) or "нет")
                      + (f"; турниры без ответа источников: {sorted(res.failed_competitions)}" if res.failed_competitions else ""))
+    lines += await ucl_probe(f, now)
+    return lines
+
+
+async def ucl_probe(f: MatchFeed, now: datetime.datetime | None = None, past: int = 3, future: int = 2) -> list:
+    """Живая проверка Лиги чемпионов с сервера бота: последние сыгранные игровые дни и ближайшие будущие (дни берутся из независимого источника —
+    Википедии, а не из того, что проверяем). По каждому дню: сколько матчей, сколько клубов распознано, неопознанные, сверка с Википедией и примеры результатов."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    today = now.astimezone(M.MSK).date()
+    wiki, rep = await f.wiki_ucl()
+    if rep.outcome == FAILED:
+        return [f"[FEED] UCL: календарь Википедии недоступен ({rep.error}) — игровые дни не определены"]
+    played = sorted({m["day"] for m in wiki if m["status"] == M.FINISHED and m["day"] <= today})[-past:]
+    upcoming = sorted({m["day"] for m in wiki if m["status"] == M.SCHEDULED and m["day"] >= today})[:future]
+    lines = [f"[FEED] UCL: игровые дни по Википедии — сыграны {[str(d) for d in played]}, впереди {[str(d) for d in upcoming]}"]
+    names = {k: C.CLUB_BY_KEY[k][1] for k in C.comp_club_keys("ucl") if k in C.CLUB_BY_KEY}
+    for day in played + upcoming:
+        res = await f.collect(day, competitions={"ucl"})
+        ms = [m for m in res.matches if m["competition"] == "ucl"]
+        ids = {m["home_team_id"] for m in ms} | {m["away_team_id"] for m in ms}
+        unknown = sorted({n for r in res.reports for _c, n in r.unknown_teams})
+        confirmed = sum(m["confidence"] == "confirmed" for m in ms)
+        conflict = sum(m["confidence"] == "conflict" for m in ms)
+        time_diff = sum(m["confidence"] == "time_differs" for m in ms)
+        sample = "; ".join(f"{names.get(m['home_team_id'], m['home_team'])} {m['score_home']}:{m['score_away']} {names.get(m['away_team_id'], m['away_team'])}"
+                           for m in ms if m["status"] == M.FINISHED)[:240]
+        times = "; ".join(f"{names.get(m['home_team_id'], m['home_team'])}—{names.get(m['away_team_id'], m['away_team'])} "
+                          f"{m['kickoff'].astimezone(M.MSK).strftime('%H:%M')} мск" for m in ms if m["kickoff"] and m["status"] == M.SCHEDULED)[:240]
+        diffs = "; ".join(f"{names.get(m['home_team_id'], m['home_team'])}—{names.get(m['away_team_id'], m['away_team'])}: {m['source_id']} "
+                          f"{m['kickoff'].astimezone(M.MSK).strftime('%H:%M')} мск, " + ", ".join(f"{sid} {k.astimezone(M.MSK).strftime('%H:%M')} мск"
+                                                                                                for sid, k in m.get("other_kickoffs", {}).items())
+                          for m in ms if m["confidence"] == "time_differs")
+        lines.append(f"[FEED] UCL {day}: матчей {len(ms)}, клубов распознано {len(ids - {None})}, неопознанных {len(unknown)} {unknown}, "
+                     f"сверено с Википедией {confirmed}, расхождений времени {time_diff}, конфликтов {conflict}, источники без ответа: {sorted(res.failed_competitions)}"
+                     + (f" | результаты: {sample}" if sample else "") + (f" | расписание: {times}" if times else "")
+                     + (f" | РАСХОЖДЕНИЕ ВРЕМЕНИ: {diffs}" if diffs else ""))
     return lines

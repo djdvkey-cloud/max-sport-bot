@@ -721,10 +721,7 @@ class Tribun:
     def effective(self, profile: dict) -> dict:
         """Что реально учитывается. Убранный вид спорта скрывает свои чемпионаты, снятый чемпионат — клубы, выбранные только благодаря ему
         (клуб из двух выбранных турниров остаётся). Данные при этом не теряются: вернул чемпионат — клубы снова активны."""
-        sports = self.stored_sports(profile)
-        champs = [c[0] for c in C.competitions_for(sports) if c[0] in profile.get("championships", [])]
-        return {"sp": sports, "cp": champs,
-                "cl": [c[0] for c in C.clubs_for_competitions(champs) if c[0] in profile.get("clubs", [])]}
+        return C.effective_selection(profile)
 
     def is_complete(self, profile: dict, requests: list) -> bool:
         """Профиль настроен = в каждом из трёх разделов есть выбор: вариант каталога или активный запрос «Другое»."""
@@ -1266,29 +1263,34 @@ class Tribun:
         rows_ = reg.rows()
         enabled = [r for r in rows_ if r["def"].enabled]
         if sub == "cov":
+            verdict = {src.COVERED: "полное покрытие", src.PARTIAL: "частичное покрытие", src.GAP: "надёжного источника нет",
+                       src.FAILED: "источник не работает", src.FALLBACK_ONLY: "только поиск/резерв"}
             lines = ["🏟 Покрытие", "", "Покрытие = что SPORTBOT реально умеет получать: расписание и результаты по каждому клубу чемпионата.",
                      f"Каталог выбора: сезон {C.CURRENT_SEASON}, проверен {C.VERIFIED_AT}. Клуб в каталоге ≠ источник расписания: клуб может быть в каталоге, но иметь GAP.",
-                     "✅ полное · 🟡 частичное · ⚠️ GAP · ❌ источник сломан", "", "Виды спорта:"]
+                     "✅ полное · 🟡 частичное · ⚠️ GAP · ❌ источник сломан", ""]
             for key, icon, name, _ in C.SPORTS:
                 st, note = reg.sport_coverage(key)
-                lines.append(f"{src.COVERAGE_ICON[st]} {name} — {note}" if st != src.GAP else f"{src.COVERAGE_ICON[st]} {name} — {src.COVERAGE_TEXT[st]}")
+                lines.append(f"{icon} {name} — {verdict[st]}")
             lines += ["", "Чемпионаты:"]
-            pending = []
-            for c in C.COMPETITIONS:
-                m = reg.competition_matrix(c[0])
-                icon = src.COVERAGE_ICON[m["status"]]
-                if m["status"] == src.GAP:
-                    lines.append(f"{icon} {c[1]} — {src.COVERAGE_TEXT[m['status']]}")
-                    continue
-                tail = " (источник сломан)" if m["status"] == src.FAILED else ""
-                lines.append(f"{icon} {c[1]} — {m['covered']}/{m['total']} клубов · {m['primary']}{' + сверка' if m['crosscheck'] else ''}{tail}")
-                pending += [f"{C.CLUB_BY_KEY[k][1]} ({c[1]})" for k in m["pending"]]
+            pending, checked = [], []
+            for key, _icon, _name, _ in C.SPORTS:
+                for c in (x for x in C.COMPETITIONS if x[2] == key):
+                    m = reg.competition_matrix(c[0])
+                    if m["status"] == src.GAP:
+                        lines.append(f"{src.COVERAGE_ICON[m['status']]} {c[1]} — {verdict[m['status']]}")
+                        continue
+                    lines.append(f"{src.COVERAGE_ICON[m['status']]} {c[1]} — {m['covered']}/{m['total']}" + (" (источник сломан)" if m["status"] == src.FAILED else ""))
+                    pending += [f"{C.CLUB_BY_KEY[k][1]} ({c[1]})" for k in m["pending"] if k in C.CLUB_BY_KEY]
+                    if m["crosscheck"]:
+                        checked.append(c[1])
             if pending:
                 lines += ["", "Ждут первого матча в источнике (название не проверено): " + ", ".join(pending) + "."]
             total = len(C.CLUBS)
             covered = sum(1 for c in C.CLUBS if reg.club_coverage(c[0])[0] in (src.COVERED, src.FALLBACK_ONLY))
-            lines += ["", f"Клубы каталога: покрыто {covered} из {total}.",
-                      "Автоматика SPORTBOT по шести клубам (Автомобилист, Синара, Урал, Арсенал, Реал Мадрид, Милан) работает как прежде.",
+            lines += ["", f"Клубы каталога: покрыто {covered} из {total}."]
+            if checked:
+                lines.append("Сверка с независимым источником: " + ", ".join(checked) + ".")
+            lines += ["Автоматика SPORTBOT по шести клубам (Автомобилист, Синара, Урал, Арсенал, Реал Мадрид, Милан) работает как прежде.",
                       "«➕ Другое» может оставаться GAP — это нормально."]
             return "\n".join(lines), back
         if sub == "all":
@@ -1582,7 +1584,7 @@ class Tribun:
             await ctx.edit("Что повысить в приоритете?", rows)
         elif sub == "type":
             self.awaiting[ctx.user_id] = {"kind": "prio_value", "type": parts[2]}
-            hint = {"team": "название команды", "sport": "вид спорта (футбол, хоккей, футзал, баскетбол)",
+            hint = {"team": "название команды", "sport": "вид спорта (футбол, хоккей, футзал)",
                     "competition": "название турнира", "event": "слово из названия события (команда/соперник/турнир)"}[parts[2]]
             await ctx.edit(f"✍️ Напиши {hint}:", [[Btn("⬅️ Отмена", "pr:list")]])
         elif sub == "dur":                                      # pr:dur:<id>:<days>

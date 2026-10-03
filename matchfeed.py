@@ -107,12 +107,12 @@ def _plain(token: str) -> bool:
     return not (TIME_RE.match(token) or token.isdigit() or _is_status(token) or token in ("Трансляция", "превью", ":", "-", "–"))
 
 
-def _finish(recs: list, raw_blocks: int) -> tuple:
+def _finish(recs: list, raw_blocks: int, skipped: int = 0) -> tuple:
     """Матчи без единого клуба каталога (квалификации еврокубков, чужие клубы) отбрасываются и считаются; если известен только один клуб,
     матч остаётся, а второй попадает в unknown_teams (признак устаревшей таблицы алиасов)."""
     kept = [m for m in recs if m["home_team_id"] or m["away_team_id"]]
     unknown = sorted({(m["competition"], name) for m in kept for name, tid in ((m["home_team"], m["home_team_id"]), (m["away_team"], m["away_team_id"])) if tid is None})
-    return kept, {"raw_blocks": raw_blocks, "matches": len(kept), "dropped_unknown": len(recs) - len(kept), "unknown_teams": unknown}
+    return kept, {"raw_blocks": raw_blocks, "matches": len(kept), "dropped_unknown": len(recs) - len(kept), "skipped_records": skipped, "unknown_teams": unknown}
 
 
 def parse_sportsru_day(sport: str, text: str, day: datetime.date, *, source_url: str, retrieved_at: datetime.datetime) -> tuple:
@@ -121,13 +121,14 @@ def parse_sportsru_day(sport: str, text: str, day: datetime.date, *, source_url:
     Футбол: «Турнир / Страна / [Статус] Хозяева / Гости / ЧЧ:ММ | счёт / счёт / Трансляция».
     Хоккей и баскетбол: «Турнир 2026/2027 / ЧЧ:ММ / Статус / Хозяева / a / : / b / [от|б] / Гости» (или «превью» вместо счёта)."""
     lines = clean_lines(text)
+    skipped = 0
     if sport == "football":
         recs, raw = _parse_football_day(lines, day, source_url, retrieved_at)
     elif sport in ("hockey", "basketball"):
-        recs, raw = _parse_season_day(sport, lines, day, source_url, retrieved_at)
+        recs, raw, skipped = _parse_season_day(sport, lines, day, source_url, retrieved_at)
     else:
         raise SourceFormatError(f"неизвестный вид спорта {sport}")
-    return _finish(recs, raw)
+    return _finish(recs, raw, skipped)
 
 
 def _football_status_day(token: str, day: datetime.date) -> datetime.date:
@@ -176,13 +177,51 @@ def _parse_football_day(lines: list, day, source_url, retrieved_at) -> tuple:
     return out, blocks
 
 
+SHOOTOUT_MARKS = ("от", "б", "бул")
+
+
+def _is_season_header(lines: list, k: int) -> bool:
+    return bool(SEASON_HEADER_RE.match(lines[k])) and k + 1 < len(lines) and bool(TIME_RE.match(lines[k + 1]) or re.match(r"^\(\d+\)$", lines[k + 1]))
+
+
+def _season_record(lines: list, i: int):
+    """Запись хоккея/баскетбола с позиции времени: «ЧЧ:ММ / [статус] / Хозяева / [от|б] / a / : / b / [от|б] / Гости» (или «превью» вместо счёта).
+    Пометка овертайма/буллитов стоит рядом со СЧЁТОМ победителя: если выиграли хозяева — перед счётом, если гости — после. → (запись | None, позиция)."""
+    n = len(lines)
+    time_str = lines[i]
+    j = i + 1
+    status_tok = None
+    if j < n and _is_status(lines[j]):
+        status_tok = lines[j]
+        j += 1
+    if j >= n or not _plain(lines[j]):
+        return None, j
+    home = lines[j]
+    j += 1
+    score_h = score_a = method = None
+    if j < n and lines[j].lower() in SHOOTOUT_MARKS and j + 3 < n and lines[j + 1].isdigit() and lines[j + 2] == ":":
+        method = "ОТ" if lines[j].lower() == "от" else "БУЛЛИТЫ"
+        j += 1
+    if j + 2 < n and lines[j].isdigit() and lines[j + 1] == ":" and lines[j + 2].isdigit():
+        score_h, score_a = int(lines[j]), int(lines[j + 2])
+        j += 3
+    elif j < n and lines[j] == "превью":
+        j += 1
+    if j < n and lines[j].lower() in SHOOTOUT_MARKS:
+        method = "ОТ" if lines[j].lower() == "от" else "БУЛЛИТЫ"
+        j += 1
+    if j >= n or not _plain(lines[j]):
+        return None, j
+    return (time_str, status_tok, home, lines[j], score_h, score_a, method), j + 1
+
+
 def _parse_season_day(sport: str, lines: list, day, source_url, retrieved_at) -> tuple:
     n = len(lines)
-    out, blocks = [], 0
+    out, blocks, skipped = [], 0, 0
     i = 0
     while i < n:
         m = SEASON_HEADER_RE.match(lines[i])
-        if not m or i + 1 >= n or not (TIME_RE.match(lines[i + 1]) or re.match(r"^\(\d+\)$", lines[i + 1])):
+        if not m or not _is_season_header(lines, i):
             i += 1
             continue
         header = m.group("name")
@@ -191,32 +230,23 @@ def _parse_season_day(sport: str, lines: list, day, source_url, retrieved_at) ->
         i += 1
         if i < n and re.match(r"^\(\d+\)$", lines[i]):
             i += 1
-        while i < n and TIME_RE.match(lines[i]):
-            time_str = lines[i]
-            j = i + 1
-            status_tok = None
-            if j < n and _is_status(lines[j]):
-                status_tok = lines[j]
-                j += 1
-            if j >= n or not _plain(lines[j]):
-                i = j
+        while i < n:
+            if not TIME_RE.match(lines[i]):
+                # не время: либо конец блока, либо лишние строки внутри блока — ищем следующее время в окне до 6 строк, не пересекая заголовок турнира
+                k = i
+                while k < n and k < i + 6 and not TIME_RE.match(lines[k]) and not _is_season_header(lines, k):
+                    k += 1
+                if k > i and k < n and TIME_RE.match(lines[k]):
+                    skipped += 1
+                    i = k
+                    continue
+                break
+            rec, j = _season_record(lines, i)
+            if rec is None:                                    # запись не разобралась: считаем и идём дальше, блок не бросаем
+                skipped += 1
+                i = max(j, i + 1)
                 continue
-            home = lines[j]
-            j += 1
-            score_h = score_a = method = None
-            if j + 2 < n and lines[j].isdigit() and lines[j + 1] == ":" and lines[j + 2].isdigit():
-                score_h, score_a = int(lines[j]), int(lines[j + 2])
-                j += 3
-            elif j < n and lines[j] == "превью":
-                j += 1
-            if j < n and lines[j].lower() in ("от", "б", "бул"):
-                method = "ОТ" if lines[j].lower() == "от" else "БУЛЛИТЫ"
-                j += 1
-            if j >= n or not _plain(lines[j]):
-                i = j
-                continue
-            away = lines[j]
-            j += 1
+            time_str, status_tok, home, away, score_h, score_a, method = rec
             if entry is not None:
                 kind = _status_kind(status_tok) if status_tok else (FINISHED if score_h is not None else SCHEDULED)
                 if kind in (FINISHED, LIVE) and score_h is None:
@@ -228,7 +258,7 @@ def _parse_season_day(sport: str, lines: list, day, source_url, retrieved_at) ->
                                       score_home=score_h, score_away=score_a, method=method if kind == FINISHED else None,
                                       source_id=f"sportsru:center:{sport}", source_url=source_url, retrieved_at=retrieved_at))
             i = j
-    return out, blocks
+    return out, blocks, skipped
 
 
 # ---- NHL: официальный API ----------------------------------------------------------------------------------------------------
@@ -332,6 +362,79 @@ def parse_superliga_calendar(text: str, ref: datetime.date, *, source_url: str, 
         i = j + 2
     unknown = sorted({("superliga", name) for mm in out for name, tid in ((mm["home_team"], mm["home_team_id"]), (mm["away_team"], mm["away_team_id"])) if tid is None})
     return out, {"raw_blocks": rows, "matches": len(out), "unknown_teams": unknown}
+
+
+# ---- Лига чемпионов: Википедия (независимый источник сверки; UEFA.com отдаёт только JS-оболочку без данных) ---------------------------
+
+WIKI_BOX_SPLIT = 'class="footballbox"'
+WIKI_DATE_RE = re.compile(r'class="bday dtstart published updated itvstart">(\d{4})-(\d{2})-(\d{2})<')
+WIKI_TIME_RE = re.compile(r'<div class="ftime">(.*?)</div>', re.S)
+WIKI_LOCAL_RE = re.compile(r"\((\d{1,2}):(\d{2})\s*UTC([+\-\u2212])(\d{1,2})(?::(\d{2}))?\)")
+WIKI_SCORE_RE = re.compile(r"^(\d{1,2})\s*[\u2013\-]\s*(\d{1,2})$")
+
+
+def _strip_tags(fragment: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", fragment).replace("\xa0", " ").replace("&amp;", "&")).strip()
+
+
+def _last_sunday(year: int, month: int) -> datetime.date:
+    d = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1) if month < 12 else datetime.date(year, 12, 31)
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def _central_european_offset(day: datetime.date) -> int:
+    """Время UEFA на страницах Википедии — CET/CEST: летнее (UTC+2) с последнего воскресенья марта по последнее воскресенье октября."""
+    return 2 if _last_sunday(day.year, 3) <= day < _last_sunday(day.year, 10) else 1
+
+
+def parse_wikipedia_ucl(html: str, *, source_url: str, retrieved_at: datetime.datetime) -> tuple:
+    """Таблица матчей фазы лиги: блоки footballbox «дата / время CET(CEST) [(местное UTC±N)] / хозяева / счёт «a–b» или «v» / гости»."""
+    boxes = html.split(WIKI_BOX_SPLIT)[1:]
+    if not boxes:
+        raise SourceFormatError("Википедия: блоки матчей не найдены")
+    out, unknown = [], set()
+    for box in boxes:
+        date_m, time_m = WIKI_DATE_RE.search(box), WIKI_TIME_RE.search(box)
+        home_m = re.search(r'<th class="fhome"[^>]*>(.*?)</th>', box, re.S)
+        away_m = re.search(r'<th class="faway"[^>]*>(.*?)</th>', box, re.S)
+        score_m = re.search(r'<th class="fscore"[^>]*>(.*?)</th>', box, re.S)
+        if not (date_m and home_m and away_m and score_m):
+            continue
+        day = datetime.date(int(date_m.group(1)), int(date_m.group(2)), int(date_m.group(3)))
+        home, away = _strip_tags(home_m.group(1)), _strip_tags(away_m.group(1))
+        ids = [A.ALIASES["wiki:ucl"].get(A.norm(n)) for n in (home, away)]
+        for name, tid in zip((home, away), ids):
+            if tid is None:
+                unknown.add(("ucl", name))
+        kickoff = None
+        if time_m:
+            text = _strip_tags(time_m.group(1))
+            local = WIKI_LOCAL_RE.search(text)
+            first = re.match(r"^(\d{1,2}):(\d{2})", text)
+            if local:
+                sign = -1 if local.group(3) in ("-", "\u2212") else 1
+                offset = sign * (int(local.group(4)) * 60 + int(local.group(5) or 0))
+                kickoff = (datetime.datetime(day.year, day.month, day.day, int(local.group(1)), int(local.group(2)))
+                           - datetime.timedelta(minutes=offset)).replace(tzinfo=UTC)
+            elif first:
+                kickoff = (datetime.datetime(day.year, day.month, day.day, int(first.group(1)), int(first.group(2)))
+                           - datetime.timedelta(hours=_central_european_offset(day))).replace(tzinfo=UTC)
+        score_text = _strip_tags(score_m.group(1))
+        sc = WIKI_SCORE_RE.match(score_text)
+        if sc:
+            status, sh, sa = FINISHED, int(sc.group(1)), int(sc.group(2))
+        elif score_text.lower().startswith(("postponed", "p-p")):
+            status, sh, sa = POSTPONED, None, None
+        elif score_text.lower().startswith(("cancelled", "canceled")):
+            status, sh, sa = CANCELLED, None, None
+        elif score_text.lower() == "v":
+            status, sh, sa = SCHEDULED, None, None
+        else:
+            continue                                                       # нестандартная запись (допвремя/пенальти и т. п.) — не гадаем
+        out.append(make_match(sport="football", competition="ucl", season=C.CURRENT_SEASON, home=home, away=away, kickoff=kickoff, tz="UTC",
+                              status=status, score_home=sh, score_away=sa, method="ОСНОВНОЕ" if status == FINISHED else None,
+                              source_id="wikipedia:ucl", source_url=source_url, retrieved_at=retrieved_at, home_id=ids[0], away_id=ids[1], day=day))
+    return out, {"raw_blocks": len(boxes), "matches": len(out), "dropped_unknown": 0, "unknown_teams": sorted(unknown)}
 
 
 # ---- Первая лига: страница клуба sports.ru (общего календаря лиги, доступного без JS, у sports.ru нет) ---------------------------

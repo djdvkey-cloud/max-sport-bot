@@ -46,6 +46,19 @@ for _c in ("ucl", "uel", "uecl"):
     _OVERRIDES[_c] = _EURO
 
 
+# Английские названия клубов лиги чемпионов 2026/27 в Википедии (независимый источник сверки) → id каталога. Названия сняты с реальной страницы
+# «2026–27 UEFA Champions League league phase» (36 команд).
+WIKI_UCL = {
+    "AEK Athens": "aek", "Arsenal": "arsenal", "Aston Villa": "aston_villa", "Atlético Madrid": "atletico", "Barcelona": "barcelona",
+    "Bayern Munich": "bayern", "Bodø/Glimt": "bodo", "Borussia Dortmund": "dortmund", "Club Brugge": "club_brugge", "Como": "como",
+    "Fenerbahçe": "fenerbahce", "Feyenoord": "feyenoord", "Galatasaray": "galatasaray", "Inter Milan": "inter", "LASK": "lask", "Lens": "lens",
+    "Lille": "lille", "Liverpool": "liverpool", "Manchester City": "man_city", "Manchester United": "man_united", "Napoli": "napoli",
+    "PSV Eindhoven": "psv", "Paris Saint-Germain": "psg", "Porto": "porto", "RB Leipzig": "leipzig", "Real Betis": "betis",
+    "Real Madrid": "real", "Roma": "roma", "Sabah": "sabah", "Shakhtar Donetsk": "shakhtar", "Slavia Prague": "slavia",
+    "Slovan Bratislava": "slovan", "Sporting CP": "sporting", "VfB Stuttgart": "stuttgart", "Viking": "viking", "Villarreal": "villarreal",
+}
+
+
 def norm(name: str) -> str:
     s = (name or "").lower().replace("ё", "е")
     s = re.sub(r"[«»\"'’′`]", "", s)
@@ -55,7 +68,7 @@ def norm(name: str) -> str:
 
 
 def _plain_name(key: str) -> str:
-    return re.sub(r"\s*\(.*?\)", "", C.CLUB_BY_KEY[key][1])
+    return re.sub(r"\s*\(.*?\)", "", C.NAME_BY_KEY[key])
 
 
 def _build() -> dict:
@@ -76,3 +89,5 @@ ALIASES = _build()
 
 def resolve(comp: str, name: str):
     return ALIASES.get(comp, {}).get(norm(name))
+
+ALIASES["wiki:ucl"] = {norm(name): key for name, key in WIKI_UCL.items()}

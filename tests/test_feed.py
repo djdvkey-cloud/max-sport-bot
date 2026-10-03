@@ -133,6 +133,15 @@ class Chain(unittest.TestCase):
         nhl_calls = [u for u in fetch.calls if "api-web.nhle.com" in u]
         self.assertEqual(nhl_calls, ["https://api-web.nhle.com/v1/schedule/2026-10-02"])
 
+    def test_skipped_records_are_visible_in_the_source_report(self):
+        page = "\n".join(["Хоккей", "Матчи 3 октября", "Все матчи", "FONBET Чемпионат КХЛ 2026/2027", "17:00", "Завершен", "???", "странная", "запись",
+                          "19:00", "Завершен", "Авангард", "2", ":", "1", "Лада"])
+        f, _ = feed_with(routes_ok(**{"/hockey/match/2026-10-03/": (200, page)}))
+        res = run(f.collect(D3, competitions={"khl"}))
+        rep = res.reports[0]
+        self.assertEqual((rep.outcome, rep.matches), (F.OK, 1))
+        self.assertEqual(rep.error, "пропущено нераспознанных записей: 1")
+
     def test_collect_asks_only_sources_for_requested_competitions(self):
         f, fetch = feed_with(routes_ok())
         run(f.collect(D3, competitions={"vtb"}))
@@ -221,11 +230,15 @@ class Interests(unittest.TestCase):
         self.assertTrue(all(m["interested"] == 2 for m in khl))                              # два участника следят за КХЛ
         self.assertEqual([m["interested"] for m in rows], sorted((m["interested"] for m in rows), reverse=True))
 
-    def test_watchlist_by_club_only(self):
+    def test_watchlist_puts_followed_club_first_within_the_same_interest(self):
         f, _ = feed_with(routes_ok())
-        rows = run(f.watchlist([{"active_in_group": True, "sports": [], "championships": [], "clubs": ["avtomobilist"]}], datetime.date(2026, 10, 4)))
-        self.assertEqual([(m["home_team_id"], m["away_team_id"]) for m in rows], [("avtomobilist", "amur")])
-        self.assertEqual(rows[0]["interested"], 1)
+        profile = {"active_in_group": True, "sports": ["hockey"], "championships": ["khl"], "clubs": ["avtomobilist"]}
+        rows = run(f.watchlist([profile], datetime.date(2026, 10, 4)))
+        self.assertEqual({m["competition"] for m in rows}, {"khl"})
+        self.assertEqual(len(rows), 3)
+        self.assertEqual((rows[0]["home_team_id"], rows[0]["away_team_id"]), ("avtomobilist", "amur"))
+        self.assertEqual(rows[0]["club_fans"], 1)
+        self.assertTrue(all(m["club_fans"] == 0 for m in rows[1:]))
 
     def test_empty_group_asks_nothing(self):
         f, fetch = feed_with(routes_ok())

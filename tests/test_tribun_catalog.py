@@ -16,7 +16,8 @@ class Snapshot(unittest.TestCase):
         return {c for c in C.SEASONS if club in C.comp_club_keys(c)}
 
     def test_every_competition_is_season_2026_27_with_source_metadata(self):
-        self.assertEqual(set(C.SEASONS), set(C.COMP_BY_KEY))
+        self.assertEqual(set(C.SEASONS), set(C.COMP_BY_KEY) | C.DEFERRED_KEYS)                  # отложенные турниры хранят снимок, но не показываются
+        self.assertEqual(C.DEFERRED_KEYS, {"uel", "uecl", "vtb"})
         self.assertEqual(C.CURRENT_SEASON, "2026/27")
         for key, snap in C.SEASONS.items():
             info = C.season_info(key)
@@ -59,11 +60,14 @@ class Snapshot(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
         self.assertEqual(set(keys), set(C.comp_club_keys("apl")) | set(C.comp_club_keys("ucl")))
         self.assertEqual(keys.count("arsenal"), 1)
-        for comp in C.SEASONS:
+        for comp in C.COMP_BY_KEY:
             ks = C.comp_club_keys(comp)
             self.assertEqual(len(ks), len(set(ks)), comp)
             for k in ks:
                 self.assertIn(k, C.CLUB_BY_KEY)
+        only_deferred = {k for comp in C.DEFERRED_KEYS for k in C.comp_club_keys(comp)} - {k for comp in C.COMP_BY_KEY for k in C.comp_club_keys(comp)}
+        self.assertTrue(only_deferred)
+        self.assertEqual(only_deferred & set(C.CLUB_BY_KEY), set())                              # клубы только отложенных турниров в каталог выбора не попадают
         names = [c[1] for c in C.CLUBS]
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(len({c[0] for c in C.CLUBS}), len(C.CLUBS))
@@ -76,13 +80,14 @@ class CatalogIsNotCoverage(Base):
         return super().make(owner=owner, registry=self.reg, **kw)
 
     def test_catalog_club_without_source_is_gap_and_tracked_clubs_follow_new_tournaments(self):
-        for key in ("zenit", "bayern", "nhl_bos", "uralmash"):                     # штатные клубы каталога обязаны иметь источник
+        for key in ("zenit", "bayern", "nhl_bos", "juventus"):                     # штатные клубы каталога обязаны иметь источник
             self.assertIn(key, C.CLUB_BY_KEY)
             self.assertEqual(self.reg.club_coverage(key)[0], SRC.COVERED, key)
         self.assertEqual(self.reg.club_coverage("milan")[0], SRC.COVERED)
-        for comp in ("uel", "uecl", "nhl", "ucl", "khl"):
+        for comp in C.COMP_BY_KEY:
             self.assertEqual(self.reg.competition_coverage(comp)[0], SRC.COVERED, comp)
-        self.assertEqual(self.reg.competition_coverage("vtb")[0], SRC.PARTIAL)
+        for comp in C.DEFERRED_KEYS:                                                  # отложенные направления в активном покрытии не участвуют
+            self.assertEqual(self.reg.competition_coverage(comp)[0], SRC.GAP, comp)
 
     async def test_owner_sees_catalog_snapshot_and_gap_for_selected_catalog_club(self):
         await self.join(5, "А")
@@ -93,18 +98,32 @@ class CatalogIsNotCoverage(Base):
         self.assertNotIn("Аякс", self.last_text())                                  # штатный клуб и чемпионат больше не GAP
         self.assertNotIn("Лига конференций", self.last_text())
 
+    async def test_partial_competition_is_shown_as_partial_with_pending_clubs(self):
+        from unittest import mock
+        import club_aliases as A
+        with mock.patch.dict(A.UNVERIFIED, {"ucl": {"sabah"}}):
+            await self.press(OWNER, "adm:src:cov")
+        text = self.last_text()
+        self.assertIn("🟡 Лига чемпионов — 35/36", text)
+        self.assertIn("⚽ Футбол — частичное покрытие", text)
+        self.assertIn("🏒 Хоккей — полное покрытие", text)
+        self.assertIn("Ждут первого матча в источнике (название не проверено): Сабах (Лига чемпионов).", text)
+
     async def test_coverage_screen_shows_club_counts_per_competition(self):
         await self.press(OWNER, "adm:src:cov")
         text = self.last_text()
         comps = text.split("Чемпионаты:\n", 1)[1].split("\n\n", 1)[0].splitlines()
         by_name = {l[2:].split(" — ")[0].strip(): l for l in comps}
         expected = {"КХЛ": "22/22", "NHL": "32/32", "РПЛ / Премьер-лига": "16/16", "Первая лига": "18/18", "АПЛ": "20/20", "Ла Лига": "20/20",
-                    "Серия А": "20/20", "Лига чемпионов": "36/36", "Лига Европы": "36/36", "Лига конференций": "36/36", "Суперлига": "12/12"}
+                    "Серия А": "20/20", "Лига чемпионов": "36/36", "Суперлига": "12/12"}
+        self.assertEqual(set(by_name), set(expected))                                  # ровно девять чемпионов пилота
         for name, ratio in expected.items():
-            self.assertTrue(by_name[name].startswith(f"✅ {name} — {ratio} клубов"), by_name[name])
-        self.assertTrue(by_name["Единая лига ВТБ"].startswith("🟡 Единая лига ВТБ — 11/12 клубов"))
-        self.assertNotIn("есть рабочий источник", "\n".join(comps))                 # без обещаний «весь турнир» там, где покрыто не всё
-        self.assertIn("Ждут первого матча в источнике (название не проверено): Астана (баскетбол) (Единая лига ВТБ).", text)
+            self.assertEqual(by_name[name], f"✅ {name} — {ratio}")
+        for line in ("⚽ Футбол — полное покрытие", "🏒 Хоккей — полное покрытие", "🥅 Футзал — полное покрытие"):
+            self.assertIn(line, text)
+        for gone in ("Баскетбол", "ВТБ", "Лига Европы", "Лига конференций", "Астана", "Ждут первого матча"):
+            self.assertNotIn(gone, text)
+        self.assertIn("Сверка с независимым источником: Лига чемпионов, NHL.", text)
         self.assertIn("Автоматика SPORTBOT по шести клубам", text)
 
 

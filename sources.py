@@ -52,15 +52,16 @@ class SourceDef:
 
 
 def adapter_source_defs() -> list:
-    """Источники-адаптеры турниров (feed.py): один источник отдаёт все клубы турнира, парсеров «на клуб» нет."""
-    football = ("rpl", "apl", "laliga", "seriea", "ucl", "uel", "uecl")
+    """АКТИВНЫЕ источники-адаптеры пилотного каталога (feed.py): один источник отдаёт все клубы турнира, парсеров «на клуб» нет."""
+    football = ("rpl", "apl", "laliga", "seriea", "ucl")
     return [
         SourceDef("sportsru:center:football", "Sports.ru — матч-центр (футбол)", "sports.ru", "football", AGGREGATOR, (SCHEDULE, RESULT, LIVE), 2,
                   competition=tuple(C.COMP_BY_KEY[k][1] for k in football), urls=("https://www.sports.ru/football/match/",), comp_keys=football, live=True),
+        SourceDef("wikipedia:ucl", "Википедия — Лига чемпионов 2026/27 (сверка)", "en.wikipedia.org", "football", MEDIA, (SCHEDULE, RESULT, CROSSCHECK), 4,
+                  competition=("Лига чемпионов",), urls=("https://en.wikipedia.org/wiki/2026%E2%80%9327_UEFA_Champions_League_league_phase",),
+                  comp_keys=("ucl",)),
         SourceDef("sportsru:center:hockey", "Sports.ru — матч-центр (хоккей)", "sports.ru", "hockey", AGGREGATOR, (SCHEDULE, RESULT, LIVE, CROSSCHECK), 2,
                   competition=("КХЛ", "NHL"), urls=("https://www.sports.ru/hockey/match/",), comp_keys=("khl", "nhl"), live=True),
-        SourceDef("sportsru:center:basketball", "Sports.ru — матч-центр (баскетбол)", "sports.ru", "basketball", AGGREGATOR, (SCHEDULE, RESULT, LIVE), 2,
-                  competition=("Единая лига ВТБ",), urls=("https://www.sports.ru/basketball/match/",), comp_keys=("vtb",), live=True),
         SourceDef("nhl:api", "NHL — официальный API (api-web.nhle.com)", "api-web.nhle.com", "hockey", OFFICIAL, (SCHEDULE, RESULT, LIVE, CROSSCHECK), 1,
                   competition=("NHL",), urls=("https://api-web.nhle.com/v1/schedule/",), comp_keys=("nhl",), live=True),
         SourceDef("rfs:superliga", "Суперлига — официальный сайт superliga.rfs.ru", "superliga.rfs.ru", "futsal", OFFICIAL, (SCHEDULE, RESULT), 1,
@@ -68,6 +69,11 @@ def adapter_source_defs() -> list:
         SourceDef("sportsru:club:football", "Sports.ru — страницы клубов (Первая лига)", "sports.ru", "football", AGGREGATOR, (SCHEDULE, RESULT), 2,
                   competition=("Первая лига",), urls=("https://www.sports.ru/football/club/",), comp_keys=("fnl1",)),
     ]
+
+
+# ОТЛОЖЕНО (не в пилоте, в реестр и покрытие не входит, опроса нет): адаптеры матч-центра для Лиги Европы, Лиги конференций (футбол) и ВТБ (баскетбол)
+# работают в matchfeed.py/feed.py. Чтобы вернуть направление: перенести турнир из C.DEFERRED_COMPETITIONS в C.COMPETITIONS и добавить сюда его SourceDef.
+DEFERRED_ADAPTERS = {"uel": "sportsru:center:football", "uecl": "sportsru:center:football", "vtb": "sportsru:center:basketball"}
 
 
 def build_source_defs(clubs: list, openai_enabled: bool = False, search_domains: list | None = None) -> list:

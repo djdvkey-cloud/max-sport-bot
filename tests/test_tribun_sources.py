@@ -97,18 +97,18 @@ class RegistryModel(unittest.TestCase):
         self.assertEqual(crit, ["calendar:ural"])                              # другие клубы не затронуты, поиск сам по себе не критичен
 
     def test_coverage_statuses(self):
-        self.assertEqual(self.reg.sport_coverage("football")[0], SRC.COVERED)
-        self.assertEqual(self.reg.sport_coverage("hockey")[0], SRC.COVERED)
-        self.assertEqual(self.reg.sport_coverage("futsal")[0], SRC.COVERED)
-        self.assertEqual(self.reg.sport_coverage("basketball")[0], SRC.PARTIAL)    # 11 из 12: клуб, ещё не игравший в источнике, не засчитывается
-        self.assertEqual(self.reg.competition_coverage("vtb")[0], SRC.PARTIAL)
-        self.assertEqual(self.reg.competition_coverage("vtb")[1], "11/12 клубов")
-        for comp, total in (("khl", 22), ("nhl", 32), ("rpl", 16), ("fnl1", 18), ("apl", 20), ("laliga", 20), ("seriea", 20), ("ucl", 36), ("uel", 36),
-                            ("uecl", 36), ("superliga", 12)):
+        for sport in ("football", "hockey", "futsal"):
+            self.assertEqual(self.reg.sport_coverage(sport)[0], SRC.COVERED, sport)
+        for comp, total in (("khl", 22), ("nhl", 32), ("rpl", 16), ("fnl1", 18), ("apl", 20), ("laliga", 20), ("seriea", 20), ("ucl", 36), ("superliga", 12)):
             self.assertEqual(self.reg.competition_coverage(comp), (SRC.COVERED, f"{total}/{total} клубов"), comp)
-        for key in ("avtomobilist", "sinara", "ural", "real", "arsenal", "milan", "zenit", "nhl_bos", "ajax", "uralmash"):
+        for comp in ("uel", "uecl", "vtb"):                                            # отложены: в активном реестре адаптеров нет
+            self.assertEqual(self.reg.competition_coverage(comp)[0], SRC.GAP, comp)
+        for key in ("avtomobilist", "sinara", "ural", "real", "arsenal", "milan", "zenit", "nhl_bos", "bayern", "juventus"):
             self.assertEqual(self.reg.club_coverage(key)[0], SRC.COVERED, key)
-        self.assertEqual(self.reg.club_coverage("astana_b")[0], SRC.GAP)                # название не встречалось в реальных данных
+        self.assertEqual(self.reg.catalog_gaps(), [])                                    # весь пилотный каталог покрыт
+        self.assertTrue(self.reg.competition_matrix("ucl")["crosscheck"])
+        self.assertTrue(self.reg.competition_matrix("nhl")["crosscheck"])
+        self.assertFalse(self.reg.competition_matrix("khl")["crosscheck"])
         for _ in range(3):
             self.reg.record("calendar:avtomobilist", SRC.OUTCOME_FAILED, "x")
         self.assertEqual(self.reg.club_coverage("avtomobilist")[0], SRC.COVERED)         # КХЛ дополнительно закрыт матч-центром sports.ru
@@ -118,9 +118,23 @@ class RegistryModel(unittest.TestCase):
         self.assertEqual(self.reg.competition_coverage("khl")[0], SRC.FAILED)
         self.assertEqual(self.reg.competition_coverage("nhl")[0], SRC.COVERED)           # у NHL есть официальный API
         gaps = {g[2]: g[3] for g in self.reg.catalog_gaps()}
-        self.assertEqual(gaps.get("Единая лига ВТБ"), SRC.PARTIAL)
-        self.assertEqual(gaps.get("Астана (баскетбол)"), SRC.GAP)
         self.assertEqual(gaps.get("КХЛ"), SRC.FAILED)
+        self.assertNotIn("Единая лига ВТБ", gaps)
+
+    def test_sport_without_catalog_clubs_is_gap_not_covered(self):
+        self.assertEqual(self.reg.sport_coverage("basketball")[0], SRC.GAP)               # отложенный вид спорта: клубов в каталоге нет — покрытие не утверждается
+
+    def test_club_not_yet_seen_in_real_data_is_not_counted_and_competition_is_partial(self):
+        # механизм «ждёт первого матча»: клуб с алиасом, но без подтверждения в реальных данных источника, покрытым не считается
+        from unittest import mock
+        import club_aliases as A
+        with mock.patch.dict(A.UNVERIFIED, {"ucl": {"sabah"}}):
+            self.assertEqual(self.reg.club_coverage("sabah")[0], SRC.GAP)
+            m = self.reg.competition_matrix("ucl")
+            self.assertEqual((m["status"], m["covered"], m["total"], m["pending"]), (SRC.PARTIAL, 35, 36, ["sabah"]))
+            self.assertEqual(self.reg.competition_coverage("ucl"), (SRC.PARTIAL, "35/36 клубов"))
+            self.assertEqual([g[2] for g in self.reg.catalog_gaps()], ["Лига чемпионов", "Сабах"])
+        self.assertEqual(self.reg.competition_coverage("ucl")[0], SRC.COVERED)
 
     def test_fallback_only_when_only_search_serves(self):
         reg = SRC.SourceRegistry(self.tmp, [d for d in SRC.build_source_defs(S.CLUBS)
@@ -194,8 +208,9 @@ class OwnerScreens(TribunBase):
     async def test_sources_screen_shows_sports_and_does_not_claim_basketball(self):
         await self.press(OWNER, "adm:src")
         text = self.last_text()
-        for line in ("🟡 Баскетбол — покрыто частично (11 из 12 клубов каталога)", "✅ Футбол — настроен, ещё не проверялся", "✅ Хоккей", "✅ Футзал"):
+        for line in ("✅ Футбол — настроен, ещё не проверялся", "✅ Хоккей", "✅ Футзал"):
             self.assertIn(line, text)
+        self.assertNotIn("Баскетбол", text)
         for line in ("Рабочих источников: 0", "С проблемами: 0", "Ещё не проверялись: 14", "Непокрытых интересов: 0"):
             self.assertIn(line, text)
         self.assertEqual([l for l, _ in self.buttons()][:4], ["🏟 Покрытие", "🌍 Все источники", "⚠️ Проблемы", "🧩 Непокрытые интересы"])
@@ -225,11 +240,12 @@ class OwnerScreens(TribunBase):
     async def test_coverage_and_all_sources_screens(self):
         await self.press(OWNER, "adm:src:cov")
         text = self.last_text()
-        self.assertIn("🟡 Баскетбол — 11 из 12 клубов каталога", text)
-        self.assertIn("🟡 Единая лига ВТБ — 11/12 клубов", text)
-        self.assertIn("✅ КХЛ — 22/22 клубов", text)
-        self.assertIn("✅ NHL — 32/32 клубов", text)
-        self.assertIn("Клубы каталога: покрыто", text)
+        for gone in ("Баскетбол", "ВТБ", "Лига Европы", "Лига конференций"):
+            self.assertNotIn(gone, text)
+        self.assertIn("✅ КХЛ — 22/22", text)
+        self.assertIn("✅ NHL — 32/32", text)
+        self.assertIn("✅ Лига чемпионов — 36/36", text)
+        self.assertIn("Клубы каталога: покрыто 182 из 182.", text)
         await self.press(OWNER, "adm:src:all")
         text = self.last_text()
         self.assertIn("Tavily Search", text)
@@ -240,7 +256,7 @@ class OwnerScreens(TribunBase):
         await self.join(5, "Мария Секретная")
         await self.join(6, "Пётр Секретный")
         for uid in (5, 6):
-            await self.press(uid, "t:sp:basketball")
+            await self.press(uid, "t:sp:football")
             await self.press(uid, "o:cp")
             await self.say(uid, "NBA" if uid == 5 else "НБА")
         await self.press(6, "o:cl")

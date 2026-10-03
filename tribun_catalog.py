@@ -19,8 +19,11 @@ SPORTS = [
     ("football", "⚽", "Футбол", ("football", "soccer")),
     ("hockey", "🏒", "Хоккей", ("hockey",)),
     ("futsal", "🥅", "Футзал", ("futsal", "мини футбол")),
-    ("basketball", "🏀", "Баскетбол", ("basketball",)),
 ]
+
+# ОТЛОЖЕНО (не входит в стартовый пилот, в меню не показывается и в активном покрытии не участвует). Данные снимка и адаптеры источников
+# оставлены в коде, чтобы вернуть направление без переписывания: достаточно перенести запись в SPORTS / COMPETITIONS.
+DEFERRED_SPORTS = [("basketball", "🏀", "Баскетбол", ("basketball",))]
 
 # Чемпионаты (согласованный MVP): (ключ, название, вид спорта, псевдонимы). Порядок = порядок на экране.
 COMPETITIONS = [
@@ -32,11 +35,14 @@ COMPETITIONS = [
     ("laliga", "Ла Лига", "football", ("la liga", "примера")),
     ("seriea", "Серия А", "football", ("serie a",)),
     ("ucl", "Лига чемпионов", "football", ("лч", "champions league", "лига чемпионов уефа")),
+    ("superliga", "Суперлига", "futsal", ("бетсити суперлига", "суперлига по мини футболу")),
+]
+DEFERRED_COMPETITIONS = [
     ("uel", "Лига Европы", "football", ("ле", "europa league", "лига европы уефа")),
     ("uecl", "Лига конференций", "football", ("лк", "conference league", "лига конференций уефа")),
-    ("superliga", "Суперлига", "futsal", ("бетсити суперлига", "суперлига по мини футболу")),
     ("vtb", "Единая лига ВТБ", "basketball", ("лига втб", "vtb")),
 ]
+DEFERRED_KEYS = {c[0] for c in DEFERRED_COMPETITIONS}
 
 # Клубы каталога: ключ → название (названия, совпадающие у разных видов спорта, помечены). Ключи шести клубов SPORTBOT: avtomobilist, sinara, ural, real, arsenal, milan.
 _N = {
@@ -164,6 +170,7 @@ for _c in COMPETITIONS:
 # (ключ, название, вид спорта, псевдонимы)
 CLUBS = [(k, name, _SPORT_OF_CLUB[k], _ALIASES.get(k, ())) for k, name in _N.items() if k in _SPORT_OF_CLUB]
 
+NAME_BY_KEY = dict(_N)                    # названия ВСЕХ клубов снимка, включая клубы отложенных турниров (нужны таблицам алиасов адаптеров)
 SPORT_BY_KEY = {k: (icon, name) for k, icon, name, _ in SPORTS}
 COMP_BY_KEY = {c[0]: c for c in COMPETITIONS}
 CLUB_BY_KEY = {c[0]: c for c in CLUBS}
@@ -209,6 +216,14 @@ def match_any(text: str):
         if key:
             return cat, key
     return None
+
+
+def effective_selection(profile: dict) -> dict:
+    """Что реально учитывается из выбора участника: вид спорта → его чемпионаты → клубы выбранных чемпионатов (клуб из двух турниров остаётся).
+    Выбор, которого больше нет в активном каталоге (баскетбол, ВТБ, ЛЕ, ЛК), физически остаётся в профиле, но не показывается и не считается."""
+    sports = [k for k, _, _, _ in SPORTS if k in profile.get("sports", [])]
+    champs = [c[0] for c in competitions_for(sports) if c[0] in profile.get("championships", [])]
+    return {"sp": sports, "cp": champs, "cl": [c[0] for c in clubs_for_competitions(champs) if c[0] in profile.get("clubs", [])]}
 
 
 def competitions_for(sports) -> list:
