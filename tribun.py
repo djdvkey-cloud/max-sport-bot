@@ -1231,6 +1231,8 @@ class Tribun:
             return f"❌ {name} — источники не отвечают"
         if status == src.FALLBACK_ONLY:
             return f"🟡 {name} — только поиск, без прямого источника"
+        if status == src.PARTIAL:
+            return f"🟡 {name} — покрыто частично ({note})"
         healths = [reg.health(d.source_id) for c in C.CLUBS if c[2] == sport_key for d in reg.serving_club(c[0]) if d.source_type != src.SEARCH and d.enabled]
         if any(h in (src.DEGRADED, src.FAILED_HEALTH) for h in healths):
             return f"🟡 {name} — есть сбои"
@@ -1264,26 +1266,30 @@ class Tribun:
         rows_ = reg.rows()
         enabled = [r for r in rows_ if r["def"].enabled]
         if sub == "cov":
-            lines = ["🏟 Покрытие", "", "Покрытие = что SPORTBOT реально отслеживает (шесть клубов), а не «весь спорт».",
-                     f"Каталог выбора: сезон {C.CURRENT_SEASON}, проверен {C.VERIFIED_AT}. Клуб в каталоге ≠ источник его расписания: «есть в каталоге + GAP» — нормальное состояние.", "", "Виды спорта:"]
+            lines = ["🏟 Покрытие", "", "Покрытие = что SPORTBOT реально умеет получать: расписание и результаты по каждому клубу чемпионата.",
+                     f"Каталог выбора: сезон {C.CURRENT_SEASON}, проверен {C.VERIFIED_AT}. Клуб в каталоге ≠ источник расписания: клуб может быть в каталоге, но иметь GAP.",
+                     "✅ полное · 🟡 частичное · ⚠️ GAP · ❌ источник сломан", "", "Виды спорта:"]
             for key, icon, name, _ in C.SPORTS:
                 st, note = reg.sport_coverage(key)
-                lines.append(f"{src.COVERAGE_ICON[st]} {name} — {src.COVERAGE_TEXT[st]}" + (f" ({note})" if note else ""))
+                lines.append(f"{src.COVERAGE_ICON[st]} {name} — {note}" if st != src.GAP else f"{src.COVERAGE_ICON[st]} {name} — {src.COVERAGE_TEXT[st]}")
             lines += ["", "Чемпионаты:"]
+            pending = []
             for c in C.COMPETITIONS:
-                st, note = reg.competition_coverage(c[0])
-                served = [C.CLUB_BY_KEY[k][1] for k in C.comp_club_keys(c[0]) if reg.serving_club(k)]
-                if st == src.GAP or not served:
-                    lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
-                else:                                              # частичное покрытие: только отслеживаемые клубы, не весь турнир
-                    verb = "покрываются" if len(served) > 1 else "покрывается"
-                    lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {verb}: {', '.join(served)}")
-            lines += ["", "Клубы:"]
-            for c in C.CLUBS:
-                if reg.serving_club(c[0]):
-                    st, note = reg.club_coverage(c[0])
-                    lines.append(f"{src.COVERAGE_ICON[st]} {c[1]} — {src.COVERAGE_TEXT[st]}")
-            lines.append("Остальные клубы справочника SPORTBOT не отслеживает — своих источников нет.")
+                m = reg.competition_matrix(c[0])
+                icon = src.COVERAGE_ICON[m["status"]]
+                if m["status"] == src.GAP:
+                    lines.append(f"{icon} {c[1]} — {src.COVERAGE_TEXT[m['status']]}")
+                    continue
+                tail = " (источник сломан)" if m["status"] == src.FAILED else ""
+                lines.append(f"{icon} {c[1]} — {m['covered']}/{m['total']} клубов · {m['primary']}{' + сверка' if m['crosscheck'] else ''}{tail}")
+                pending += [f"{C.CLUB_BY_KEY[k][1]} ({c[1]})" for k in m["pending"]]
+            if pending:
+                lines += ["", "Ждут первого матча в источнике (название не проверено): " + ", ".join(pending) + "."]
+            total = len(C.CLUBS)
+            covered = sum(1 for c in C.CLUBS if reg.club_coverage(c[0])[0] in (src.COVERED, src.FALLBACK_ONLY))
+            lines += ["", f"Клубы каталога: покрыто {covered} из {total}.",
+                      "Автоматика SPORTBOT по шести клубам (Автомобилист, Синара, Урал, Арсенал, Реал Мадрид, Милан) работает как прежде.",
+                      "«➕ Другое» может оставаться GAP — это нормально."]
             return "\n".join(lines), back
         if sub == "all":
             lines = ["🌍 Все источники", "", "Иерархия: официальный → прямой → агрегатор → медиа → поиск. Поиск (Tavily/OpenAI) и AI — не источники фактов: "

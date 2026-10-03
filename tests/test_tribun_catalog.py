@@ -76,14 +76,13 @@ class CatalogIsNotCoverage(Base):
         return super().make(owner=owner, registry=self.reg, **kw)
 
     def test_catalog_club_without_source_is_gap_and_tracked_clubs_follow_new_tournaments(self):
-        for key in ("zenit", "bayern", "nhl_bos", "uralmash"):
+        for key in ("zenit", "bayern", "nhl_bos", "uralmash"):                     # штатные клубы каталога обязаны иметь источник
             self.assertIn(key, C.CLUB_BY_KEY)
-            self.assertEqual(self.reg.club_coverage(key)[0], SRC.GAP, key)
+            self.assertEqual(self.reg.club_coverage(key)[0], SRC.COVERED, key)
         self.assertEqual(self.reg.club_coverage("milan")[0], SRC.COVERED)
-        self.assertEqual(self.reg.competition_coverage("uel")[0], SRC.COVERED)           # через Милан (отслеживается)
-        self.assertEqual(self.reg.competition_coverage("uecl")[0], SRC.GAP)
-        self.assertEqual(self.reg.competition_coverage("nhl")[0], SRC.GAP)
-        self.assertEqual(self.reg.competition_coverage("vtb")[0], SRC.GAP)
+        for comp in ("uel", "uecl", "nhl", "ucl", "khl"):
+            self.assertEqual(self.reg.competition_coverage(comp)[0], SRC.COVERED, comp)
+        self.assertEqual(self.reg.competition_coverage("vtb")[0], SRC.PARTIAL)
 
     async def test_owner_sees_catalog_snapshot_and_gap_for_selected_catalog_club(self):
         await self.join(5, "А")
@@ -91,28 +90,22 @@ class CatalogIsNotCoverage(Base):
         await self.press(OWNER, "adm:src:cov")
         self.assertIn("сезон 2026/27, проверен 2026-10-03", self.last_text())
         await self.press(OWNER, "adm:src:gap")
-        self.assertIn("Аякс (клуб) — 1 · выбран из списка", self.last_text())
-        self.assertIn("Лига конференций (чемпионат) — 1", self.last_text())
+        self.assertNotIn("Аякс", self.last_text())                                  # штатный клуб и чемпионат больше не GAP
+        self.assertNotIn("Лига конференций", self.last_text())
 
-    async def test_competition_coverage_lists_only_tracked_clubs_not_whole_tournament(self):
+    async def test_coverage_screen_shows_club_counts_per_competition(self):
         await self.press(OWNER, "adm:src:cov")
         text = self.last_text()
-        comps = text.split("Чемпионаты:\n", 1)[1].split("\n\nКлубы:", 1)[0].splitlines()
+        comps = text.split("Чемпионаты:\n", 1)[1].split("\n\n", 1)[0].splitlines()
         by_name = {l[2:].split(" — ")[0].strip(): l for l in comps}
-        self.assertEqual(by_name["КХЛ"], "✅ КХЛ — покрывается: Автомобилист")
-        self.assertEqual(by_name["АПЛ"], "✅ АПЛ — покрывается: Арсенал")
-        self.assertEqual(by_name["Ла Лига"], "✅ Ла Лига — покрывается: Реал Мадрид")
-        self.assertEqual(by_name["Серия А"], "✅ Серия А — покрывается: Милан")
-        self.assertEqual(by_name["Первая лига"], "✅ Первая лига — покрывается: Урал")
-        self.assertEqual(by_name["Лига Европы"], "✅ Лига Европы — покрывается: Милан")
-        self.assertEqual(by_name["Лига чемпионов"], "✅ Лига чемпионов — покрываются: Арсенал, Реал Мадрид")
-        self.assertTrue(by_name["Суперлига"].startswith("✅ Суперлига — покрывается: "))
-        self.assertIn("Синара", by_name["Суперлига"])
-        for gap in ("NHL", "Лига конференций", "Единая лига ВТБ"):
-            self.assertEqual(by_name[gap], f"⚠️ {gap} — надёжного источника нет")
-        self.assertTrue(any(n.startswith("РПЛ") and "надёжного источника нет" in l and l.startswith("⚠️") for n, l in by_name.items()))
-        self.assertNotIn("есть рабочий источник", "\n".join(comps))
-        self.assertIn("✅ Автомобилист — есть рабочий источник", text.split("Клубы:\n", 1)[1])
+        expected = {"КХЛ": "22/22", "NHL": "32/32", "РПЛ / Премьер-лига": "16/16", "Первая лига": "18/18", "АПЛ": "20/20", "Ла Лига": "20/20",
+                    "Серия А": "20/20", "Лига чемпионов": "36/36", "Лига Европы": "36/36", "Лига конференций": "36/36", "Суперлига": "12/12"}
+        for name, ratio in expected.items():
+            self.assertTrue(by_name[name].startswith(f"✅ {name} — {ratio} клубов"), by_name[name])
+        self.assertTrue(by_name["Единая лига ВТБ"].startswith("🟡 Единая лига ВТБ — 11/12 клубов"))
+        self.assertNotIn("есть рабочий источник", "\n".join(comps))                 # без обещаний «весь турнир» там, где покрыто не всё
+        self.assertIn("Ждут первого матча в источнике (название не проверено): Астана (баскетбол) (Единая лига ВТБ).", text)
+        self.assertIn("Автоматика SPORTBOT по шести клубам", text)
 
 
 if __name__ == "__main__":

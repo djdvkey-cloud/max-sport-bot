@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+import club_aliases as A
 import tribun_catalog as C
 from tribun_io import TribunDataError, atomic_write_json, mask_secrets, read_strict, utc_now
 
@@ -21,10 +22,10 @@ OFFICIAL, DIRECT, AGGREGATOR, MEDIA, SEARCH = "OFFICIAL", "DIRECT", "AGGREGATOR"
 TYPE_RANK = {OFFICIAL: 1, DIRECT: 2, AGGREGATOR: 3, MEDIA: 4, SEARCH: 5}
 SCHEDULE, LIVE, RESULT, NEWS, CROSSCHECK = "SCHEDULE", "LIVE", "RESULT", "NEWS", "CROSSCHECK"
 
-COVERED, FALLBACK_ONLY, GAP, FAILED = "COVERED", "FALLBACK_ONLY", "GAP", "FAILED"
-COVERAGE_ICON = {COVERED: "✅", FALLBACK_ONLY: "🟡", GAP: "⚠️", FAILED: "❌"}
+COVERED, FALLBACK_ONLY, GAP, FAILED, PARTIAL = "COVERED", "FALLBACK_ONLY", "GAP", "FAILED", "PARTIAL"
+COVERAGE_ICON = {COVERED: "✅", FALLBACK_ONLY: "🟡", GAP: "⚠️", FAILED: "❌", PARTIAL: "🟡"}
 COVERAGE_TEXT = {COVERED: "есть рабочий источник", FALLBACK_ONLY: "только поиск/резерв", GAP: "надёжного источника нет",
-                 FAILED: "источник настроен, но не работает"}
+                 FAILED: "источник настроен, но не работает", PARTIAL: "покрыто частично"}
 
 OK, DEGRADED, FAILED_HEALTH, UNKNOWN = "OK", "DEGRADED", "FAILED", "UNKNOWN"
 HEALTH_ICON = {OK: "✅", DEGRADED: "🟡", FAILED_HEALTH: "❌", UNKNOWN: "▫️"}
@@ -46,6 +47,27 @@ class SourceDef:
     entity_ids: tuple = ()
     urls: tuple = ()
     enabled: bool = True
+    comp_keys: tuple = ()          # турниры каталога, ВСЕ клубы которых отдаёт этот источник (адаптеры feed.py)
+    live: bool = False             # отдаёт ли идущие матчи
+
+
+def adapter_source_defs() -> list:
+    """Источники-адаптеры турниров (feed.py): один источник отдаёт все клубы турнира, парсеров «на клуб» нет."""
+    football = ("rpl", "apl", "laliga", "seriea", "ucl", "uel", "uecl")
+    return [
+        SourceDef("sportsru:center:football", "Sports.ru — матч-центр (футбол)", "sports.ru", "football", AGGREGATOR, (SCHEDULE, RESULT, LIVE), 2,
+                  competition=tuple(C.COMP_BY_KEY[k][1] for k in football), urls=("https://www.sports.ru/football/match/",), comp_keys=football, live=True),
+        SourceDef("sportsru:center:hockey", "Sports.ru — матч-центр (хоккей)", "sports.ru", "hockey", AGGREGATOR, (SCHEDULE, RESULT, LIVE, CROSSCHECK), 2,
+                  competition=("КХЛ", "NHL"), urls=("https://www.sports.ru/hockey/match/",), comp_keys=("khl", "nhl"), live=True),
+        SourceDef("sportsru:center:basketball", "Sports.ru — матч-центр (баскетбол)", "sports.ru", "basketball", AGGREGATOR, (SCHEDULE, RESULT, LIVE), 2,
+                  competition=("Единая лига ВТБ",), urls=("https://www.sports.ru/basketball/match/",), comp_keys=("vtb",), live=True),
+        SourceDef("nhl:api", "NHL — официальный API (api-web.nhle.com)", "api-web.nhle.com", "hockey", OFFICIAL, (SCHEDULE, RESULT, LIVE, CROSSCHECK), 1,
+                  competition=("NHL",), urls=("https://api-web.nhle.com/v1/schedule/",), comp_keys=("nhl",), live=True),
+        SourceDef("rfs:superliga", "Суперлига — официальный сайт superliga.rfs.ru", "superliga.rfs.ru", "futsal", OFFICIAL, (SCHEDULE, RESULT), 1,
+                  competition=("Суперлига",), urls=("https://superliga.rfs.ru/",), comp_keys=("superliga",)),
+        SourceDef("sportsru:club:football", "Sports.ru — страницы клубов (Первая лига)", "sports.ru", "football", AGGREGATOR, (SCHEDULE, RESULT), 2,
+                  competition=("Первая лига",), urls=("https://www.sports.ru/football/club/",), comp_keys=("fnl1",)),
+    ]
 
 
 def build_source_defs(clubs: list, openai_enabled: bool = False, search_domains: list | None = None) -> list:
@@ -61,6 +83,7 @@ def build_source_defs(clubs: list, openai_enabled: bool = False, search_domains:
                               source_type=DIRECT, purpose=(SCHEDULE, RESULT, CROSSCHECK), priority=2,
                               competition=tuple(c[1] for c in C.COMPETITIONS if club["key"] in C.comp_club_keys(c[0])),
                               entity_ids=(club["key"],), urls=urls))
+    defs.extend(adapter_source_defs())
     keys = tuple(c["key"] for c in clubs)
     defs.append(SourceDef(source_id="search:tavily", name="Tavily Search (список доверенных доменов)", domain="api.tavily.com", sport=None,
                           source_type=SEARCH, purpose=(SCHEDULE, RESULT), priority=5, entity_ids=keys))
@@ -166,34 +189,58 @@ class SourceRegistry:
             return FALLBACK_ONLY, "; ".join(d.name for d in search)
         return GAP, ""
 
+    def adapters_for(self, comp_key: str) -> list:
+        return [d for d in self.defs.values() if d.enabled and comp_key in d.comp_keys]
+
     def serving_club(self, club_key: str) -> list:
-        return [d for d in self.defs.values() if club_key in d.entity_ids]
+        """Источники, обслуживающие клуб: прежние (календарь клуба из sport_bot.CLUBS) и адаптеры его турниров (кроме клубов, ещё не встреченных
+        в реальных данных источника — A.UNVERIFIED)."""
+        out = [d for d in self.defs.values() if club_key in d.entity_ids]
+        for comp in C.COMPETITIONS:
+            if club_key in C.comp_club_keys(comp[0]) and club_key not in A.UNVERIFIED.get(comp[0], ()):
+                out += [d for d in self.adapters_for(comp[0]) if d not in out]
+        return out
 
     def club_coverage(self, club_key: str) -> tuple:
         status, note = self._status(self.serving_club(club_key))
         return status, note
 
+    def competition_matrix(self, comp_key: str) -> dict:
+        """Покрытие турнира по клубам: {status, covered, total, pending:[id], sources:[имена], crosscheck:bool, primary:str}."""
+        keys = C.comp_club_keys(comp_key)
+        adapters = self.adapters_for(comp_key)
+        pending = [k for k in keys if k in A.UNVERIFIED.get(comp_key, ())]
+        if not adapters:
+            return {"status": GAP, "covered": 0, "total": len(keys), "pending": [], "sources": [], "crosscheck": False, "primary": ""}
+        ordered = sorted(adapters, key=lambda d: TYPE_RANK[d.source_type])
+        healths = [self.health(d.source_id) for d in adapters]
+        covered = len(keys) - len(pending)
+        if all(h == FAILED_HEALTH for h in healths):
+            status = FAILED
+        else:
+            status = COVERED if covered == len(keys) else PARTIAL
+        return {"status": status, "covered": covered, "total": len(keys), "pending": pending, "sources": [d.name for d in ordered],
+                "crosscheck": len(adapters) > 1, "primary": ordered[0].name}
+
     def sport_coverage(self, sport_key: str) -> tuple:
-        """Покрытие вида спорта = клубы этого спорта, которые SPORTBOT отслеживает (а не «весь спорт»)."""
-        served = [c for c in C.CLUBS if c[2] == sport_key and self.serving_club(c[0])]
+        """Покрытие вида спорта = клубы этого спорта в каталоге, которые SPORTBOT/Трибун получают источником."""
+        all_clubs = [c for c in C.CLUBS if c[2] == sport_key]
+        served = [c for c in all_clubs if self.serving_club(c[0])]
         if not served:
             return GAP, "SPORTBOT не отслеживает ни одного клуба этого вида спорта"
         statuses = [self.club_coverage(c[0])[0] for c in served]
-        names = ", ".join(c[1] for c in served)
+        note = f"{len(served)} из {len(all_clubs)} клубов каталога"
         if all(s == FAILED for s in statuses):
-            return FAILED, f"отслеживаются: {names}"
+            return FAILED, note
         if all(s == FALLBACK_ONLY for s in statuses):
-            return FALLBACK_ONLY, f"отслеживаются: {names}"
-        return COVERED, f"отслеживаются клубы: {names}"
+            return FALLBACK_ONLY, note
+        return (COVERED if len(served) == len(all_clubs) else PARTIAL), note
 
     def competition_coverage(self, comp_key: str) -> tuple:
-        served = [k for k in C.comp_club_keys(comp_key) if self.serving_club(k)]
-        if not served:
-            return GAP, "ни один отслеживаемый клуб не играет в этом турнире"
-        statuses = [self.club_coverage(k)[0] for k in served]
-        names = ", ".join(C.CLUB_BY_KEY[k][1] for k in served)
-        status = FAILED if all(s == FAILED for s in statuses) else (FALLBACK_ONLY if all(s == FALLBACK_ONLY for s in statuses) else COVERED)
-        return status, f"только матчи наших клубов: {names}"
+        m = self.competition_matrix(comp_key)
+        if m["status"] == GAP:
+            return GAP, "для турнира нет источника"
+        return m["status"], f"{m['covered']}/{m['total']} клубов"
 
     def request_coverage(self, category: str, normalized: str) -> tuple:
         """Покрытие запроса «Другое». Известное совпадение с каталогом наследует его покрытие, остальное — GAP (без догадок)."""
@@ -216,11 +263,9 @@ class SourceRegistry:
                 gaps.append((C.CAT_SPORT, key, name, st, note))
         for comp in C.COMPETITIONS:
             st, note = self.competition_coverage(comp[0])
-            if st in (GAP, FAILED, FALLBACK_ONLY):
+            if st in (GAP, FAILED, FALLBACK_ONLY, PARTIAL):
                 gaps.append((C.CAT_CHAMP, comp[0], comp[1], st, note))
         for club in C.CLUBS:
-            if not self.serving_club(club[0]):
-                continue                                          # остальные клубы справочника не отслеживаются — отдельной строкой не нужны
             st, note = self.club_coverage(club[0])
             if st in (GAP, FAILED, FALLBACK_ONLY):
                 gaps.append((C.CAT_CLUB, club[0], club[1], st, note))

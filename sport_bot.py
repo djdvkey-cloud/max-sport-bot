@@ -82,6 +82,11 @@ NHL.com и др.; в каталоге хранятся источник и да�
 03.10.2026 (2026-10-03.4): экран владельца «🌐 Источники → 🏟 Покрытие» честно показывает частичное покрытие чемпионатов: «КХЛ — покрывается:
 Автомобилист» вместо «есть рабочий источник». Логика покрытия не менялась.
 
+03.10.2026 (2026-10-03.5): покрытие ВСЕГО штатного каталога Трибуна. Новый слой feed.py / matchfeed.py / club_aliases.py: турнир → источник → единый
+формат матча → нормализация клуба (КХЛ, РПЛ, АПЛ, Ла Лига, Серия А, ЛЧ/ЛЕ/ЛК, ВТБ — матч-центр sports.ru; NHL — официальный API + сверка; Суперлига —
+superliga.rfs.ru; Первая лига — страницы клубов sports.ru). Экран «🏟 Покрытие» показывает «N/M клубов». Автоматика шести клубов не изменена.
+Проверка источников при старте и раз в 6 часов (строки [FEED] в логе).
+
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
     MAX_BOT_TOKEN, MAX_CHAT_ID,
     DEEPSEEK_API_KEY, TAVILY_API_KEY
@@ -106,6 +111,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from maxapi import Bot, Dispatcher
 
+import feed as tribun_feed
 import tribun
 import tribun_hooks as hooks
 import sources as tribun_sources
@@ -235,7 +241,7 @@ TAVILY_INCLUDE_DOMAINS = [
 
 # --- Настройки v4: личные уведомления, афиша, контроль расписания --------------
 
-BOT_VERSION = "2026-10-03.4"
+BOT_VERSION = "2026-10-03.5"
 # Первая проверка результата — через RESULT_DELAY_HOURS после начала матча
 # (раньше 2,5 ч, теперь 2 ч). Цикл не ждёт полного интервала: планировщик
 # просыпается точно к этому моменту (см. seconds_until_next_event).
@@ -2690,6 +2696,25 @@ async def tribun_tick_alerts(bot: Bot, now: datetime.datetime) -> None:
             hooks.GUARD.alerts.clear()
 
 
+FEED_HEALTH_INTERVAL = float(os.environ.get("FEED_HEALTH_INTERVAL", "21600"))      # проверка источников турниров: при старте и затем раз в 6 часов
+FEED_HEALTH_FIRST_DELAY = 20.0
+
+
+async def feed_health_loop() -> None:
+    """Реальные запросы ко всем источникам турниров с сервера бота: здоровье источников → реестр (экран «Источники»), итог → лог.
+    Только чтение; сбой проверки не влияет на расписание анонсов и результатов."""
+    await asyncio.sleep(FEED_HEALTH_FIRST_DELAY)
+    while True:
+        try:
+            for line in await tribun_feed.smoke(tribun_feed.MatchFeed()):
+                print(line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[FEED] проверка источников не выполнена: {type(e).__name__}: {e}")
+        await asyncio.sleep(FEED_HEALTH_INTERVAL)
+
+
 async def run_tribun(bot: Bot) -> list:
     """Запускает слушатель MAX (приветствия, личное меню) и сверку состава группы. Любой сбой здесь НЕ должен останавливать
     расписание анонсов и результатов: ошибки только в лог, слушатель перезапускается."""
@@ -2874,6 +2899,8 @@ async def main():
         except Exception as e:
             print(f"[DEBUG] test_openai: ОШИБКА {type(e).__name__}: {e}")
     tribun_tasks = await run_tribun(bot) if TRIBUN_ENABLED else []
+    if TRIBUN_ENABLED:
+        tribun_tasks.append(asyncio.create_task(feed_health_loop()))
     try:
         await scheduler_loop(bot)
     finally:
