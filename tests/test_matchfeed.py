@@ -176,13 +176,13 @@ class NhlApi(unittest.TestCase):
 
 
 class FutsalAndFirstLeague(unittest.TestCase):
-    def test_superliga_league_calendar_uses_ekaterinburg_time(self):
+    def test_superliga_league_calendar_uses_moscow_time(self):
         matches, stats = M.parse_superliga_calendar(read("feed/superliga_main.txt"), datetime.date(2026, 10, 3), source_url="u", retrieved_at=NOW)
         self.assertEqual(stats["unknown_teams"], [])
         m = [x for x in matches if (x["home_team_id"], x["away_team_id"]) == ("sibiryak", "iraero") and x["day"] == datetime.date(2026, 10, 2)][0]
         self.assertEqual((m["competition"], m["status"], m["score_home"], m["score_away"]), ("superliga", M.FINISHED, 4, 4))
-        self.assertEqual(m["kickoff"], datetime.datetime(2026, 10, 2, 10, 0, tzinfo=datetime.timezone.utc))              # 15:00 екб
-        self.assertEqual(m["source_timezone"], "Asia/Yekaterinburg")
+        self.assertEqual(m["kickoff"], datetime.datetime(2026, 10, 2, 12, 0, tzinfo=datetime.timezone.utc))              # 15:00 мск
+        self.assertEqual(m["source_timezone"], "Europe/Moscow")
         sin = [x for x in matches if (x["home_team_id"], x["away_team_id"]) == ("norilsk", "sinara")]
         self.assertEqual(sorted(x["status"] for x in sin), [M.FINISHED, M.SCHEDULED])                 # матч 03.10 сыгран, 04.10 впереди
         played = [x for x in sin if x["status"] == M.FINISHED][0]

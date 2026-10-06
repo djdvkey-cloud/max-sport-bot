@@ -54,7 +54,7 @@ def lines(data_dir: str, owner_id=None, days=("2026-10-02", "2026-10-03", "2026-
             out.append("[STATE] legacy schedule " + _flat({k: e.get(k) for k in ("key", "date", "time", "zone", "tournament", "rival", "source")}))
     dyn = _read(os.path.join(data_dir, "dyn_matches.json"), {"matches": {}})
     for mid, rec in sorted((dyn.get("matches") or {}).items()):
-        out.append("[STATE] dyn " + _flat({k: rec.get(k) for k in ("match_id", "club_key", "rival", "day", "time", "status", "announce_sent", "result_text", "published_at", "conflict")}))
+        out.append("[STATE] dyn " + _flat({k: rec.get(k) for k in ("match_id", "club_key", "rival", "competition", "tournament", "day", "time", "start_utc", "status", "phase", "score", "final_confirmed", "created_via", "created_at", "last_checked_at", "last_source_status", "announce_sent", "result_text", "published_at", "conflict")}))
     dsched = _read(os.path.join(data_dir, "dyn_schedule.json"), {"entries": []})
     for e in dsched.get("entries", []):
         out.append("[STATE] dyn schedule " + _flat({k: e.get(k) for k in ("key", "club_key", "date", "time", "tournament", "rival", "two")}))

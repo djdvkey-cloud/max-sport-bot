@@ -160,20 +160,19 @@ class FutsalTwoMatchesTwoLifecycles(Unified):
         self.assertIn("5:1", self.bot.group[0])
         self.assertIsNone(self.only_rec()["conflict"])
 
-    async def test_futsal_result_waits_for_the_latest_possible_end_of_the_match(self):
-        """Часовой пояс superliga.rfs.ru неоднозначен (Москва / Екатеринбург): «матч точно закончился» считается от самого позднего возможного начала."""
+    async def test_futsal_result_waits_for_the_minimum_match_duration_from_the_moscow_start(self):
+        """Время superliga.rfs.ru — московское (проверено по норильской прессе и расписанию трансляций): итог не раньше начала (10:00Z) + 105 минут."""
         self.dyn_for("sinara")
         self.feed.now = lambda: utc(2026, 10, 6, 10)
-        t1 = utc(2026, 10, 4, 10, 30)                                           # ЕКБ-начало 08:00Z, МСК-начало 10:00Z: матч может ещё идти
+        t1 = utc(2026, 10, 4, 10, 30)
         await self.dyn.recover(self.bot, t1, force=True)
         rec = self.recs()["dyn|superliga|2026-10-04|norilsk|sinara"]
-        rec["start_utc"] = utc(2026, 10, 4, 8, 0).isoformat()
-        st = self.state()
-        st["matches"][rec["match_id"]] = rec
-        self.dyn.save_state(st)
+        self.assertEqual(rec["start_utc"], utc(2026, 10, 4, 10, 0).isoformat())
         await self.tick_results(t1, t1 + datetime.timedelta(minutes=20), t1 + datetime.timedelta(minutes=40), t1 + datetime.timedelta(minutes=60))
-        self.assertEqual([t for t in self.bot.group if "5:1" in t], [])         # 10:00Z (МСК-начало) + 105 мин = 11:45Z — раньше нельзя
-        await self.tick_results(utc(2026, 10, 4, 11, 40), utc(2026, 10, 4, 12, 0))
+        self.assertEqual([t for t in self.bot.group if "5:1" in t], [])         # первая проверка — через 2 ч после начала (12:00Z)
+        await self.tick_results(utc(2026, 10, 4, 12, 0))
+        self.assertEqual([t for t in self.bot.group if "5:1" in t], [])         # первое наблюдение счёта: ещё не устойчив
+        await self.tick_results(utc(2026, 10, 4, 12, 20))
         self.assertEqual(len([t for t in self.bot.group if "5:1" in t]), 1)
 
 
@@ -229,7 +228,7 @@ class FinalityRules(Unified):
         self.assertEqual((rec["phase"], rec["score"], rec["result_text"]), ("LIVE", "2:0", None))
 
     async def test_C2_finished_without_explicit_status_needs_a_stable_score(self):
-        dyn = self.setup_dyn([[fm(M.FINISHED, 2, 0, src="sportsru:club:football")]])           # страница клуба: счёт есть, слова «завершён» нет
+        dyn = self.setup_dyn([[fm(M.FINISHED, 2, 0, src="sportsru:club:football", comp="fnl1")]])           # страница клуба: счёт есть, слова «завершён» нет
         rec = await self.seed_and_check(dyn, [utc(2026, 10, 10, 13, 40)])
         self.assertEqual(self.bot.group, [])                                    # первое наблюдение
         await dyn.results(self.bot, utc(2026, 10, 10, 13, 50))
@@ -238,16 +237,53 @@ class FinalityRules(Unified):
         self.assertEqual(len(self.bot.group), 1)
         self.assertIn("2:0", self.bot.group[0])
 
+    async def test_C5_explicit_only_tournaments_never_use_the_stable_score_fallback(self):
+        """КХЛ/НХЛ/РПЛ/АПЛ/Ла Лига/Серия А/ЛЧ/ЛЕ/ЛК: даже неявный FINISHED со «стабильным» счётом не публикуется — нужен явный «Завершён»."""
+        for comp in ("apl", "rpl", "laliga", "seriea", "ucl", "uel", "uecl", "khl", "nhl"):
+            self.assertFalse(D.stable_fallback_allowed(comp), comp)
+        dyn = self.setup_dyn([[fm(M.FINISHED, 2, 0, src="sportsru:club:football", comp="apl")]])
+        rec = await self.seed_and_check(dyn, [utc(2026, 10, 10, 13, 40), utc(2026, 10, 10, 14, 0), utc(2026, 10, 10, 15, 0), utc(2026, 10, 10, 18, 0)])
+        self.assertEqual(self.bot.group, [])
+        self.assertNotEqual(rec["status"], "published")
+
+    def test_C7_baseline_clubs_keep_their_legacy_names_and_icons_in_texts(self):
+        dyn = self.setup_dyn([[]])
+        m = fm(M.SCHEDULED, None, None, comp="apl")
+        d = dyn.describe(m, {"arsenal"})
+        legacy = next(c for c in S.CLUBS if c["key"] == "arsenal")
+        self.assertEqual((d["club_name"], d["icon"]), (legacy["name"], legacy["icon"]))
+        text = dyn.text_morning(dyn.new_record(m, d, ""))
+        self.assertEqual(text.splitlines()[0], legacy['icon'] + ' Сегодня играет ' + legacy['name'])
+
+    async def test_C8_live_score_is_never_published_even_where_the_stable_fallback_is_allowed(self):
+        """Первая лига / Суперлига: статус LIVE (идёт матч) со «стабильным» счётом — не итог, сколько бы раз счёт ни повторился."""
+        dyn = self.setup_dyn([[fm(M.LIVE, 2, 0, src="sportsru:club:football", comp="fnl1")]])
+        rec = await self.seed_and_check(dyn, [utc(2026, 10, 10, 13, 40), utc(2026, 10, 10, 14, 0), utc(2026, 10, 10, 14, 30), utc(2026, 10, 10, 18, 0)])
+        self.assertEqual(self.bot.group, [])
+        self.assertNotEqual(rec["status"], "published")
+
+    def test_C9_stable_score_is_not_final_before_the_minimum_match_duration(self):
+        dyn = self.setup_dyn([[]])
+        rec = {"competition": "fnl1", "sport": "football", "start_utc": utc(2026, 10, 10, 12, 0).isoformat(),
+               "obs": {"score": "2:0", "first": utc(2026, 10, 10, 13, 0).isoformat(), "last": utc(2026, 10, 10, 13, 10).isoformat(), "n": 3}}
+        found = fm(M.FINISHED, 2, 0, src="sportsru:club:football", comp="fnl1")
+        self.assertFalse(dyn.stable_final(rec, found, utc(2026, 10, 10, 13, 40)))          # 100 мин после начала — футбол ещё идёт (минимум 125)
+        self.assertTrue(dyn.stable_final(rec, found, utc(2026, 10, 10, 14, 10)))           # 130 мин, счёт устойчив
+
+    def test_C6_stable_fallback_is_limited_to_sources_without_a_final_status(self):
+        self.assertEqual(D.STABLE_FALLBACK_COMPETITIONS, {"superliga", "fnl1"})
+        self.assertTrue(D.stable_fallback_allowed("x:кубок россии"))
+
     async def test_C3_changing_score_resets_the_stability_clock(self):
-        batches = [[fm(M.FINISHED, 1, 0, src="sportsru:club:football")]]
+        batches = [[fm(M.FINISHED, 1, 0, src="sportsru:club:football", comp="fnl1")]]
         dyn = self.setup_dyn(batches)
         await self.seed_and_check(dyn, [utc(2026, 10, 10, 13, 40), utc(2026, 10, 10, 14, 0)])
         self.assertEqual(len(self.bot.group), 1)                                # (1:0 было устойчиво) — публикуется
         self.bot.group.clear()
-        dyn2 = self.setup_dyn([[fm(M.FINISHED, 1, 0, src="sportsru:club:football")]])
+        dyn2 = self.setup_dyn([[fm(M.FINISHED, 1, 0, src="sportsru:club:football", comp="fnl1")]])
         dyn2.state_path and os.path.exists(dyn2.state_path) and os.unlink(dyn2.state_path)
         rec = await self.seed_and_check(dyn2, [utc(2026, 10, 10, 13, 40)])
-        dyn2.feed.batches = [[fm(M.FINISHED, 2, 0, src="sportsru:club:football")]]          # пока шла проверка, счёт изменился
+        dyn2.feed.batches = [[fm(M.FINISHED, 2, 0, src="sportsru:club:football", comp="fnl1")]]          # пока шла проверка, счёт изменился
         await dyn2.results(self.bot, utc(2026, 10, 10, 14, 0))
         self.assertEqual(self.bot.group, [])
         self.assertEqual(list(dyn2.load_state()["matches"].values())[0]["obs"]["score"], "2:0")

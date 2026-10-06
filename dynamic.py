@@ -31,6 +31,14 @@ SERVED = set(F.CENTER_COMPETITIONS) - {"vtb"} | {"fnl1", "superliga"}
 # Правило устойчивого счёта для источников БЕЗ явного статуса «завершён»: минимальная длительность матча и срок неизменности счёта
 MIN_MATCH_MINUTES = {"football": 125, "hockey": 150, "futsal": 105}
 STABLE_MINUTES = 15
+# Устойчивый счёт допустим ТОЛЬКО там, где источник технически не пишет статус «завершён»: календарь superliga.rfs.ru (футзал), страницы клубов
+# sports.ru (Первая лига, кубки и товарищеские вне каталога). Во всех остальных турнирах (КХЛ, НХЛ, РПЛ, АПЛ, Ла Лига, Серия А, ЛЧ/ЛЕ/ЛК) итог — только
+# при явном «Завершён» (sports.ru матч-центр, NHL API).
+STABLE_FALLBACK_COMPETITIONS = {"superliga", "fnl1"}
+
+
+def stable_fallback_allowed(competition: str) -> bool:
+    return competition in STABLE_FALLBACK_COMPETITIONS or competition.startswith(M.PSEUDO_PREFIX)
 RECOVERY_DAYS = 2                                    # окно восстановления: последние 48 часов (сегодня и два предыдущих дня)
 RECOVERY_EVERY_MINUTES = 30
 RECOVERY_GIVE_UP_HOURS = 12                          # сколько ждём итог матча, заведённого восстановлением (его начало может быть давно в прошлом)
@@ -225,8 +233,13 @@ class Dynamic:
         else:
             club_key, club, rival = actives[0], away, home
         tournament, sport = comp_info(m)
+        icon = ICON.get(sport, "🏟")
+        if len(actives) == 1 and club_key in self.legacy_keys():                  # постоянные клубы — прежние название и значок (как в тексте шести клубов)
+            own = next((c for c in self.S.CLUBS if c.get("key") == club_key), None)
+            if own:
+                club, icon = own["name"], own.get("icon") or icon
         return {"club_key": club_key, "club_name": club, "rival": rival, "two": len(actives) == 2, "actives": actives,
-                "icon": ICON.get(sport, "🏟"), "sport": sport, "tournament": tournament}
+                "icon": icon, "sport": sport, "tournament": tournament}
 
     def entry(self, m: dict, dynamic_ids: set) -> dict:
         d = self.describe(m, dynamic_ids)
@@ -519,6 +532,9 @@ class Dynamic:
     def stable_final(self, rec: dict, found: dict, now: datetime.datetime) -> bool:
         """Матч завершён по версии источника БЕЗ явного статуса «завершён»: принимаем только устойчивый счёт — одинаков в ≥2 проверках с интервалом
         ≥STABLE_MINUTES и после минимальной длительности матча. Изменился счёт — отсчёт заново (идущий матч так не пройдёт)."""
+        if not stable_fallback_allowed(rec["competition"]):
+            rec["obs"] = None
+            return False
         score = f"{found['score_home']}:{found['score_away']}"
         obs = rec.get("obs")
         if not obs or obs.get("score") != score:
@@ -545,6 +561,9 @@ class Dynamic:
             rec["last_source_status"] = "NOT_FOUND"
             return {"state": "none"}
         rec["last_source_status"] = found["status"]
+        print(f"[DYN] проверка {rec['match_id']}: источники={','.join(found.get('sources') or [found['source_id']])} статус={found['status']} "
+              f"счёт={found['score_home']}:{found['score_away']} явный_финал={bool(found.get('final_explicit'))} подтверждено={bool(found.get('final_confirmed'))} "
+              f"достоверность={found['confidence']}")
         if found["status"] in (M.CANCELLED, M.POSTPONED):
             return {"state": "cancelled", "reason": found["status"]}
         if found["status"] != M.FINISHED or found["score_home"] is None or found["score_away"] is None:
@@ -669,6 +688,8 @@ class Dynamic:
                 rec["start_utc"] = datetime.datetime(m["day"].year, m["day"].month, m["day"].day, tzinfo=M.MSK).astimezone(datetime.timezone.utc).isoformat()
             state["matches"][mid] = rec
             added += 1
+            print(f"[DYN] восстановлен {mid}: {m['home_team']} — {m['away_team']}, турнир={m['competition']}, начало={m['kickoff']}, статус источника={m['status']}, "
+                  f"запись={rec['status']}/{rec.get('phase')}, через={rec['created_via']}")
         state["meta"]["recovered_at"] = now.isoformat()
         if added:
             state["meta"]["recovered_total"] = state["meta"].get("recovered_total", 0) + added
@@ -691,6 +712,8 @@ class Dynamic:
                 state["published_ids"].append(rec["match_id"])
             self.save_state(state)
             mid = rec["match_id"]
+            print(f"[DYN] ОПУБЛИКОВАНО {mid}: фаза={rec.get('phase')} счёт={rec.get('score')} финал_подтверждён={rec.get('final_confirmed')} "
+                  f"текст={rec['result_text'][:200]!r}")
             await S.clear_alerts(bot, [f"dynsend:{mid}", f"dynsrcfail:{mid}", f"dynnores:{mid}", f"dynconflict:{mid}", f"dyngiveup:{mid}"],
                                  f"✅ Трибун\nРезультат матча {title} получен и опубликован.", now)
             return True

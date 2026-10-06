@@ -336,7 +336,7 @@ def _infer_year(month: int, day: int, ref: datetime.date) -> int:
 
 
 def parse_superliga_calendar(text: str, ref: datetime.date, *, source_url: str, retrieved_at: datetime.datetime) -> tuple:
-    """Календарь матчей на главной superliga.rfs.ru: «ДД Месяц / ЧЧ:ММ / Хозяева / счёт|- / [(тайм)] / Гости / счёт|-». Время — екатеринбургское."""
+    """Календарь матчей на главной superliga.rfs.ru: «ДД Месяц / ЧЧ:ММ / Хозяева / счёт|- / [(тайм)] / Гости / счёт|-». Время — МОСКОВСКОЕ (установлено 06.10.2026: местная пресса Норильска «начало матчей в 17:00» = 13:00 мск на сайте лиги, трансляция 12:50 мск)."""
     lines = clean_lines(text)
     n = len(lines)
     out, rows = [], 0
@@ -368,11 +368,10 @@ def parse_superliga_calendar(text: str, ref: datetime.date, *, source_url: str, 
         day = datetime.date(_infer_year(month, int(m.group(1)), ref), month, int(m.group(1)))
         finished = score_h is not None and score_a is not None
         out.append(make_match(sport="futsal", competition="superliga", season=C.CURRENT_SEASON, home=home, away=away,
-                              kickoff=kickoff_utc(day, m.group(3), EKB, placeholder_below=4), tz="Asia/Yekaterinburg",
+                              kickoff=kickoff_utc(day, m.group(3), MSK, placeholder_below=4), tz="Europe/Moscow",
                               status=FINISHED if finished else SCHEDULED, score_home=score_h if finished else None,
                               score_away=score_a if finished else None, method="ОСНОВНОЕ" if finished else None,
-                              source_id="rfs:superliga", source_url=source_url, retrieved_at=retrieved_at, day=day,
-                              kickoff_latest=(kickoff_utc(day, m.group(3), MSK, placeholder_below=4))))
+                              source_id="rfs:superliga", source_url=source_url, retrieved_at=retrieved_at, day=day))
         i = j + 2
     unknown = sorted({("superliga", name) for mm in out for name, tid in ((mm["home_team"], mm["home_team_id"]), (mm["away_team"], mm["away_team_id"])) if tid is None})
     return out, {"raw_blocks": rows, "matches": len(out), "unknown_teams": unknown}
