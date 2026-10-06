@@ -41,8 +41,14 @@ def clean_lines(text: str) -> list:
 
 
 def make_match(*, sport, competition, season, home, away, kickoff, tz, status, score_home=None, score_away=None, method=None,
-               source_id, source_url, retrieved_at, home_id=None, away_id=None, day=None) -> dict:
-    """`day` — московская дата матча (как группирует sports.ru); у завершённых футбольных матчей время не показывается, а дата известна."""
+               source_id, source_url, retrieved_at, home_id=None, away_id=None, day=None, explicit=False, tournament=None,
+               kickoff_latest=None) -> dict:
+    """`day` — московская дата матча (как группирует sports.ru); у завершённых футбольных матчей время не показывается, а дата известна.
+    `explicit` — источник САМ написал статус «завершён» (sports.ru «Завершен», NHL API FINAL/OFF). Счёт без явного статуса (календарь клуба,
+    таблица лиги, Википедия) — не доказательство окончания: такой матч публикуется только по правилу устойчивого счёта (dynamic.stable_final).
+    `tournament` — название турнира так, как его пишет источник (для турниров вне каталога).
+    `kickoff_latest` — самое позднее ВОЗМОЖНОЕ время начала, если часовой пояс источника неоднозначен (superliga.rfs.ru: Москва или Екатеринбург);
+    нужно только правилу устойчивого счёта — «матч точно закончился» считается от самого позднего начала."""
     if home_id is None:
         home_id = A.resolve(competition, home)
     if away_id is None:
@@ -52,7 +58,8 @@ def make_match(*, sport, competition, season, home, away, kickoff, tz, status, s
     return {"sport": sport, "competition": competition, "season": season, "day": day, "home_team_id": home_id, "home_team": home,
             "away_team_id": away_id, "away_team": away, "kickoff": kickoff, "source_timezone": tz, "status": status,
             "score_home": score_home, "score_away": score_away, "method": method, "source_id": source_id, "source_url": source_url,
-            "retrieved_at": retrieved_at}
+            "retrieved_at": retrieved_at, "final_explicit": bool(explicit and status == FINISHED), "tournament": tournament,
+            "kickoff_latest": kickoff_latest}
 
 
 def kickoff_utc(day: datetime.date, hhmm: str | None, zone: datetime.tzinfo, placeholder_below: int | None = None):
@@ -100,6 +107,10 @@ def _status_kind(token: str) -> str:
     if low.startswith("не начался") or token in ("Завтра", "Сегодня", "Вчера"):
         return SCHEDULED
     return LIVE
+
+
+def _explicit_final(token) -> bool:
+    return bool(token) and token.lower().startswith("завершен")
 
 
 def _plain(token: str) -> bool:
@@ -170,7 +181,7 @@ def _parse_football_day(lines: list, day, source_url, retrieved_at) -> tuple:
                 out.append(make_match(sport="football", competition=comp, season=C.CURRENT_SEASON, home=home, away=away,
                                       kickoff=kickoff_utc(match_day, time_str, MSK) if kind == SCHEDULED else None, tz="Europe/Moscow",
                                       status=kind, score_home=score_h, score_away=score_a, source_id="sportsru:center:football",
-                                      source_url=source_url, retrieved_at=retrieved_at, day=match_day))
+                                      source_url=source_url, retrieved_at=retrieved_at, day=match_day, explicit=_explicit_final(tok)))
             i = j
             continue
         i += 1
@@ -248,7 +259,8 @@ def _parse_season_day(sport: str, lines: list, day, source_url, retrieved_at) ->
                 continue
             time_str, status_tok, home, away, score_h, score_a, method = rec
             if entry is not None:
-                kind = _status_kind(status_tok) if status_tok else (FINISHED if score_h is not None else SCHEDULED)
+                # счёт БЕЗ явного статуса — не результат: матч мог идти (раньше такая запись считалась завершённой — так ушёл промежуточный 0:2)
+                kind = _status_kind(status_tok) if status_tok else (LIVE if score_h is not None else SCHEDULED)
                 if kind in (FINISHED, LIVE) and score_h is None:
                     kind = SCHEDULED if kind == LIVE else kind
                 if kind == FINISHED and method is None:
@@ -256,7 +268,8 @@ def _parse_season_day(sport: str, lines: list, day, source_url, retrieved_at) ->
                 out.append(make_match(sport=sport, competition=entry[0], season=C.CURRENT_SEASON, home=home, away=away,
                                       kickoff=kickoff_utc(day, time_str, MSK), tz="Europe/Moscow", status=kind,
                                       score_home=score_h, score_away=score_a, method=method if kind == FINISHED else None,
-                                      source_id=f"sportsru:center:{sport}", source_url=source_url, retrieved_at=retrieved_at))
+                                      source_id=f"sportsru:center:{sport}", source_url=source_url, retrieved_at=retrieved_at,
+                                      explicit=_explicit_final(status_tok)))
             i = j
     return out, blocks, skipped
 
@@ -299,7 +312,7 @@ def parse_nhl_schedule(raw: str, *, source_url: str, retrieved_at: datetime.date
                     away=f'{away["placeName"]["default"]} {away["commonName"]["default"]}', kickoff=start, tz="UTC", status=state,
                     score_home=home.get("score") if finished_or_live else None, score_away=away.get("score") if finished_or_live else None,
                     method=("ОТ" if last == "OT" else "БУЛЛИТЫ" if last == "SO" else "ОСНОВНОЕ") if state == FINISHED else None,
-                    source_id="nhl:api", source_url=source_url, retrieved_at=retrieved_at, home_id=ids[0], away_id=ids[1]))
+                    source_id="nhl:api", source_url=source_url, retrieved_at=retrieved_at, home_id=ids[0], away_id=ids[1], explicit=True))
             except (KeyError, TypeError, ValueError) as e:
                 raise SourceFormatError(f"NHL API: матч не разобран ({type(e).__name__}: {e})") from e
     return out, {"raw_blocks": len(weeks), "matches": len(out), "unknown_teams": sorted(unknown)}
@@ -358,7 +371,8 @@ def parse_superliga_calendar(text: str, ref: datetime.date, *, source_url: str, 
                               kickoff=kickoff_utc(day, m.group(3), EKB, placeholder_below=4), tz="Asia/Yekaterinburg",
                               status=FINISHED if finished else SCHEDULED, score_home=score_h if finished else None,
                               score_away=score_a if finished else None, method="ОСНОВНОЕ" if finished else None,
-                              source_id="rfs:superliga", source_url=source_url, retrieved_at=retrieved_at, day=day))
+                              source_id="rfs:superliga", source_url=source_url, retrieved_at=retrieved_at, day=day,
+                              kickoff_latest=(kickoff_utc(day, m.group(3), MSK, placeholder_below=4))))
         i = j + 2
     unknown = sorted({("superliga", name) for mm in out for name, tid in ((mm["home_team"], mm["home_team_id"]), (mm["away_team"], mm["away_team_id"])) if tid is None})
     return out, {"raw_blocks": rows, "matches": len(out), "unknown_teams": unknown}
@@ -443,10 +457,19 @@ CLUB_DATE_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 CLUB_SCORE_RE = re.compile(r"^(\d{1,2}) : (\d{1,2})$")
 # турнир на странице клуба → ключ каталога
 CLUB_PAGE_TOURNAMENTS = {"Россия. Первая лига": "fnl1"}
+# турниры страниц клубов, которые у нас есть как чемпионаты каталога (для постоянных клубов владельца, режим all_tournaments)
+CLUB_PAGE_KNOWN = {"Россия. Первая лига": "fnl1", "Англия. Премьер-лига": "apl", "Испания. Ла Лига": "laliga", "Италия. Серия А": "seriea",
+                   "Лига чемпионов": "ucl", "Лига Европы": "uel", "Лига Конференций": "uecl", "Лига конференций": "uecl"}
+PSEUDO_PREFIX = "x:"                                               # турнир вне каталога (кубки, суперкубки, товарищеские): ключ «x:<название>», имя — как в источнике
+
+
+def pseudo_competition(tournament: str) -> str:
+    return PSEUDO_PREFIX + A.norm(tournament)
 PLACEHOLDER_HOUR_BELOW = 4                                         # 00:00–03:59 у sports.ru — «время не назначено»
 
 
-def parse_sportsru_club_calendar(text: str, club_id: str, *, sport: str, source_url: str, retrieved_at: datetime.datetime) -> tuple:
+def parse_sportsru_club_calendar(text: str, club_id: str, *, sport: str, source_url: str, retrieved_at: datetime.datetime,
+                                 all_tournaments: bool = False) -> tuple:
     """Таблица сезона на странице клуба: «ДД.ММ.ГГГГ / | / ЧЧ:ММ / Турнир / Соперник / Дома|В гостях / [от|б] / a : b | превью». Время московское,
     счёт — в порядке «хозяева : гости». Берутся только матчи турниров из CLUB_PAGE_TOURNAMENTS (кубки/товарищеские каталогу не нужны)."""
     lines = clean_lines(text)
@@ -471,7 +494,12 @@ def parse_sportsru_club_calendar(text: str, club_id: str, *, sport: str, source_
             cells.append(lines[j])
             j += 1
         i = j
-        comp = CLUB_PAGE_TOURNAMENTS.get(tournament)
+        if all_tournaments:
+            if "(сборные)" in tournament:                                   # сборные — не клубы
+                continue
+            comp = CLUB_PAGE_KNOWN.get(tournament) or pseudo_competition(tournament)
+        else:
+            comp = CLUB_PAGE_TOURNAMENTS.get(tournament)
         if comp is None:
             continue
         sc = next((CLUB_SCORE_RE.match(c) for c in cells if CLUB_SCORE_RE.match(c)), None)
@@ -486,5 +514,5 @@ def parse_sportsru_club_calendar(text: str, club_id: str, *, sport: str, source_
                               status=FINISHED if finished else SCHEDULED,
                               score_home=int(sc.group(1)) if finished else None, score_away=int(sc.group(2)) if finished else None,
                               method=method if finished else None, source_id="sportsru:club:football", source_url=source_url,
-                              retrieved_at=retrieved_at, home_id=home_id, away_id=away_id, day=day))
+                              retrieved_at=retrieved_at, home_id=home_id, away_id=away_id, day=day, tournament=tournament))
     return out, {"raw_blocks": len(out), "matches": len(out), "unknown_teams": sorted({(mm["competition"], nm) for mm in out for nm, tid in ((mm["home_team"], mm["home_team_id"]), (mm["away_team"], mm["away_team_id"])) if tid is None})}

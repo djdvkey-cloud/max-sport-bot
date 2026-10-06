@@ -1,17 +1,18 @@
-"""Динамический контур SPORTBOT: каждый АКТИВНЫЙ клуб получает то же обслуживание, что исторически получают шесть клубов.
+"""ЕДИНЫЙ контур матчей SPORTBOT: SOURCE → MATCH NORMALIZATION → MATCH STORE → STATUS → FINAL SCORE → PUBLICATION. Для ВСЕХ клубов одинаково.
 
-ACTIVE CLUBS = все активные клубы всех участников, которые сейчас состоят в группе (active_in_group): выбор берётся через C.effective_selection
-(активный вид спорта → активный чемпионат → клуб пилотного каталога); скрытые basketball/VTB/UEL/UECL и «➕ Другое» клубами не становятся.
-Список пересчитывается из файла участников на каждом тике — без правки конфига, коммита и деплоя. Число болельщиков клуба — только статистика:
-1 участник или 10 — набор функций один и тот же.
+ACTIVE CLUBS = постоянные клубы владельца (BASELINE: Автомобилист, Синара, Урал, Реал Мадрид, Арсенал, Милан — всегда) ∪ клубы, выбранные активными
+участниками группы (через C.effective_selection). Разница между ними только в том, КАК клуб становится активным; дальше обслуживание одно и то же:
+афиша недели, утро (анонс / изменения), результаты, восстановление пропущенного. Список пересчитывается из файла участников на каждом тике.
 
-Обслуживание (общий слой feed.py: SOURCE → COMPETITION ADAPTER → MATCHES → CLUB NORMALIZATION, затем фильтр по ACTIVE CLUBS; парсеров «на клуб» нет):
-  • афиша — часть единого понедельничного сообщения (вместе с матчами шести клубов), матч двух активных клубов — одна строка;
-  • утро (10:00 ЕКБ) — анонс матчей дня, изменения (время / перенос на сегодня / перенос с сегодня / отмена);
-  • результаты — те же сроки и правила, что у шести клубов: сохранение до отправки, «опубликовано» только после подтверждённой отправки, повторы, дедуп.
-Шесть исторических клубов остаются на прежнем контуре (sport_bot.CLUBS): матч, в котором играет любой из них, динамический контур НЕ трогает —
-так один матч получает одно сообщение каждого типа и никаких двойных публикаций. Снял последний болельщик клуб — новые матчи клуба в афишу и анонсы
-больше не попадают, но уже анонсированный/начавшийся матч доводится до результата. Отдельное состояние: dyn_matches.json / dyn_schedule.json.
+Спортивный факт даёт ТОЛЬКО детерминированный источник (feed.py). Нейросети / Tavily источником факта не являются и в этот контур не входят.
+Правила результата:
+  • публикуется только матч со статусом «завершён»: явным у источника (sports.ru «Завершен», NHL API FINAL) — либо, если источник статус не пишет
+    (таблица лиги, страница клуба), счёт устойчив (stable_final: одинаков в ≥2 проверках с интервалом ≥15 мин и прошло минимальное время матча);
+  • счёт «идёт» / без подтверждения никогда не становится итогом; два завершённых источника с разным счётом — конфликт (в группу ничего, владельцу уведомление);
+  • ошибка источника ≠ «матча нет»; опубликованное не дублируется (published_ids + канонический id матча: турнир|день|хозяева|гости).
+Один матч — одна запись (dyn_matches.json): SCHEDULED → LIVE → FINAL → PUBLISHED (+ CONFLICT / ERROR / EXPIRED).
+recover(): регулярно проверяет последние 48 часов и восстанавливает матчи, пропущенные при первом обнаружении.
+Состояние шести клубов прежнего контура (today_matches.json) читается ТОЛЬКО как список уже закрытых матчей, чтобы ничего не опубликовать дважды.
 Модуль не импортирует sport_bot: нужный модуль (отправка, алерты, константы) передаётся в конструктор — так контур проверяется тестами без сети и без MAX."""
 import datetime
 import os
@@ -25,6 +26,14 @@ import tribun_catalog as C
 ICON = {"football": "⚽", "hockey": "🏒", "futsal": "🥅"}
 CLOSED = ("published", "expired")
 DYN_STATE_VERSION = 1
+# Источники, обслуживаемые адаптерами feed.py (турниры вне этого списка — в т.ч. ВТБ — не опрашиваются)
+SERVED = set(F.CENTER_COMPETITIONS) - {"vtb"} | {"fnl1", "superliga"}
+# Правило устойчивого счёта для источников БЕЗ явного статуса «завершён»: минимальная длительность матча и срок неизменности счёта
+MIN_MATCH_MINUTES = {"football": 125, "hockey": 150, "futsal": 105}
+STABLE_MINUTES = 15
+RECOVERY_DAYS = 2                                    # окно восстановления: последние 48 часов (сегодня и два предыдущих дня)
+RECOVERY_EVERY_MINUTES = 30
+RECOVERY_GIVE_UP_HOURS = 12                          # сколько ждём итог матча, заведённого восстановлением (его начало может быть давно в прошлом)
 
 
 def plain_name(club_id: str) -> str:
@@ -39,8 +48,38 @@ def match_id(m: dict) -> str:
 
 
 def competitions_of(club_ids) -> set:
-    """Все турниры АКТИВНОГО каталога, в которых играет хотя бы один из клубов (клуб обслуживается во всех своих турнирах)."""
-    return {c[0] for c in C.COMPETITIONS if set(club_ids) & set(C.comp_club_keys(c[0]))}
+    """Все турниры снимка сезона, в которых играет хотя бы один из клубов и которые умеют читать адаптеры (клуб обслуживается во всех своих турнирах:
+    Милан — Серия А и Лига Европы). Кубки и товарищеские вне снимка постоянных клубов читаются со страницы клуба (feed.club_page)."""
+    return {k for k in C.SEASONS if k in SERVED and set(club_ids) & set(C.comp_club_keys(k))}
+
+
+def comp_info(m: dict) -> tuple:
+    """(название турнира, вид спорта) матча: каталог → отложенные турниры → название из источника (кубки, товарищеские)."""
+    c = m["competition"]
+    if c in C.COMP_BY_KEY:
+        return C.COMP_BY_KEY[c][1], C.COMP_BY_KEY[c][2]
+    for d in C.DEFERRED_COMPETITIONS:
+        if d[0] == c:
+            return d[1], d[2]
+    return (m.get("tournament") or c), m.get("sport") or "football"
+
+
+def comp_name(comp: str) -> str:
+    if comp in C.COMP_BY_KEY:
+        return C.COMP_BY_KEY[comp][1]
+    return next((d[1] for d in C.DEFERRED_COMPETITIONS if d[0] == comp), comp)
+
+
+def norm_pair_name(name: str) -> str:
+    return A.norm(name or "")
+
+
+def same_team_name(a: str, b: str) -> bool:
+    """Одна и та же команда в разных написаниях: «Норильск» = «Норильский никель», «Амур» = «Амур»; без нечёткого поиска — общее начало ≥5 символов или вхождение."""
+    a, b = norm_pair_name(a), norm_pair_name(b)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a or (len(a) >= 5 and len(b) >= 5 and a[:5] == b[:5])
 
 
 def hhmm(kickoff) -> str | None:
@@ -48,8 +87,9 @@ def hhmm(kickoff) -> str | None:
 
 
 class Dynamic:
-    def __init__(self, S, feed=None, profiles=None):
+    def __init__(self, S, feed=None, profiles=None, baseline=None):
         self.S = S                                  # модуль sport_bot (или его тестовая подмена)
+        self._baseline = None if baseline is None else frozenset(baseline)       # постоянные клубы; None = клубы sport_bot.CLUBS
         self.feed = feed or F.MatchFeed()
         self._profiles = profiles                   # необязательный загрузчик профилей (тесты)
 
@@ -103,19 +143,57 @@ class Dynamic:
         return [tribun.normalize_profile(p) for p in (store.get("members") or {}).values()]
 
     def legacy_keys(self) -> set:
-        return {c["key"] for c in self.S.CLUBS}
+        """Постоянные клубы владельца (BASELINE): всегда активны, независимо от интересов участников."""
+        return set(self._baseline) if self._baseline is not None else {c["key"] for c in self.S.CLUBS}
+
+    baseline_keys = legacy_keys
 
     def active(self) -> dict:
-        """{'fans': {club_id: число участников}, 'dynamic': {id}, 'legacy': {id}, 'members': N}. Пересчитывается при каждом вызове."""
+        """{'fans': {club_id: число участников}, 'dynamic': ВСЕ активные клубы, 'legacy': постоянные клубы владельца, 'members': N}.
+        ACTIVE = BASELINE ∪ выбор активных участников. Пересчитывается при каждом вызове."""
         agg = F.MatchFeed.aggregate_interests(self.profiles())
-        legacy = self.legacy_keys()
+        base = self.legacy_keys()
         fans = dict(agg["clubs"])
-        return {"fans": fans, "dynamic": {k for k in fans if k not in legacy}, "legacy": {k for k in fans if k in legacy}, "members": agg["members"]}
+        for k in base:
+            fans.setdefault(k, 0)                                   # у постоянного клуба может не быть болельщиков — он всё равно активен
+        return {"fans": fans, "dynamic": set(fans), "legacy": set(base), "members": agg["members"]}
 
-    def relevant(self, m: dict, dynamic_ids: set) -> bool:
-        """Матч обслуживает динамический контур: в нём играет активный клуб и НЕ играет ни один из шести исторических (их ведёт прежний контур)."""
+    def relevant(self, m: dict, active_ids: set) -> bool:
+        """Матч обслуживается, если в нём играет хотя бы один активный клуб (постоянный или выбранный участниками) — без исключений."""
         ids = {m["home_team_id"], m["away_team_id"]} - {None}
-        return bool(ids & dynamic_ids) and not (ids & self.legacy_keys())
+        return bool(ids & active_ids)
+
+    # ---- закрытые матчи прежнего контура (чтобы ничего не опубликовать дважды при переходе) -----------------------------------------
+
+    def legacy_records(self) -> list:
+        raw = self.S.read_json_safe(self.S.DATA_FILE, {})
+        recs = list((raw.get("matches") or {}).values()) if isinstance(raw, dict) and isinstance(raw.get("matches"), dict) else []
+        out = [r for r in recs if isinstance(r, dict) and r.get("club_key") and r.get("match_date")]
+        for pid in (raw.get("published_ids") or []) if isinstance(raw, dict) else []:
+            parts = str(pid).split("|")
+            if len(parts) == 3:
+                out.append({"club_key": parts[0], "match_date": parts[1], "rival": parts[2], "status": "published", "result_sent": True, "announce_sent": True})
+        return out
+
+    def legacy_for(self, m: dict):
+        """Запись прежнего контура о ЭТОМ матче постоянного клуба (тот же клуб, день и соперник) или None."""
+        base = self.legacy_keys()
+        for rec in self.legacy_records():
+            key = rec["club_key"]
+            if key not in base or rec["match_date"] != str(m["day"]):
+                continue
+            if key == m["home_team_id"]:
+                other = [m["away_team"], plain_name(m["away_team_id"]) if m["away_team_id"] else ""]
+            elif key == m["away_team_id"]:
+                other = [m["home_team"], plain_name(m["home_team_id"]) if m["home_team_id"] else ""]
+            else:
+                continue
+            if any(same_team_name(rec.get("rival", ""), o) for o in other if o):
+                return rec
+        return None
+
+    def legacy_closed(self, rec) -> bool:
+        return bool(rec) and (rec.get("status") in CLOSED or rec.get("result_sent") or rec.get("result_text"))
 
     # ---- сбор матчей --------------------------------------------------------------------------------------------------------------
 
@@ -124,9 +202,10 @@ class Dynamic:
         if only_comps is not None:
             comps &= set(only_comps)
         fnl = set(dynamic_ids) & set(F.FNL1_SLUGS)
+        pages = set(dynamic_ids) & set(F.BASELINE_PAGES)              # постоянные футбольные клубы: страница клуба целиком (кубки вне каталога)
         found, failed = {}, set()
         for day in days:
-            res = await self.feed.collect(day, competitions=comps, clubs=fnl)
+            res = await self.feed.collect(day, competitions=comps, clubs=fnl, pages=pages)
             failed |= res.failed_competitions
             for m in res.matches:
                 found[match_id(m)] = m
@@ -145,9 +224,9 @@ class Dynamic:
             club_key, club, rival = actives[0], home, away
         else:
             club_key, club, rival = actives[0], away, home
-        sport = C.COMP_BY_KEY[m["competition"]][2]
+        tournament, sport = comp_info(m)
         return {"club_key": club_key, "club_name": club, "rival": rival, "two": len(actives) == 2, "actives": actives,
-                "icon": ICON.get(sport, "🏟"), "sport": sport, "tournament": C.COMP_BY_KEY[m["competition"]][1]}
+                "icon": ICON.get(sport, "🏟"), "sport": sport, "tournament": tournament}
 
     def entry(self, m: dict, dynamic_ids: set) -> dict:
         d = self.describe(m, dynamic_ids)
@@ -170,7 +249,7 @@ class Dynamic:
         matches, failed = await self.gather(days, act["dynamic"])
         if bot is not None:                                                          # «источник не ответил» ≠ «матчей нет»: одно предупреждение и одно «восстановилось»
             for comp in competitions_of(act["dynamic"]):
-                name = C.COMP_BY_KEY[comp][1]
+                name = comp_name(comp)
                 if comp in failed:
                     if not S.DRY_RUN:
                         await S.raise_alert(bot, f"dynweekly:{comp}:{monday}", f"⚠️ Трибун\nНе удалось получить расписание недели: {name}. "
@@ -193,6 +272,11 @@ class Dynamic:
                 sched["entries"] = [x for x in sched["entries"] if x.get("key") != e["key"]] + [e]
             self.save_sched(sched)
         return fresh, failed
+
+    async def refresh_schedule(self, now: datetime.datetime) -> tuple:
+        """Один раз после запуска: расписание текущей недели в хранилище (для контроля изменений времени/переноса). Ничего не отправляет."""
+        entries, failed = await self.weekly_entries(now, persist=True, bot=None)
+        return len(entries), failed
 
     # ---- тексты (форма — как у шести клубов; места у источников нет — строка «Место» не выдумывается) ----------------------------------
 
@@ -255,7 +339,8 @@ class Dynamic:
                "icon": d["icon"], "sport": d["sport"], "competition": m["competition"], "tournament": d["tournament"], "day": str(m["day"]),
                "match_date": str(m["day"]), "time": hhmm(m["kickoff"]), "zone": "мск" if m["kickoff"] else None,
                "start_utc": m["kickoff"].isoformat() if m["kickoff"] else None, "home_id": m["home_team_id"], "away_id": m["away_team_id"],
-               "announce_text": text}
+               "announce_text": text, "phase": "SCHEDULED", "score": None, "final_confirmed": False, "last_checked_at": None, "last_source_status": None,
+               "obs": None, "created_via": "morning"}
         for key, value in self.S.MATCH_DEFAULTS.items():
             rec.setdefault(key, value)
         return rec
@@ -321,7 +406,7 @@ class Dynamic:
         matches, failed = await self.gather([today], dyn, only_comps)
         comps_asked = competitions_of(dyn) if only_comps is None else competitions_of(dyn) & set(only_comps)
         for comp in comps_asked:
-            name = C.COMP_BY_KEY[comp][1]
+            name = comp_name(comp)
             if comp in failed:
                 if not S.DRY_RUN:
                     await S.raise_alert(bot, f"dynmorning:{comp}", f"⚠️ Трибун\nНе удалось проверить расписание на сегодня: {name}.\nПовторю автоматически.", now)
@@ -344,6 +429,15 @@ class Dynamic:
             existing = state["matches"].get(mid)
             if existing:                                                            # повторный прогон в тот же день — ничего не анонсируем заново
                 existing.update({k: rec[k] for k in ("tournament", "time", "zone", "start_utc")})
+                continue
+            if mid in state["published_ids"]:
+                continue
+            leg = self.legacy_for(m)
+            if leg:                                                                 # матч уже вёл прежний контур (переход): повторно не анонсируем и закрытое не открываем
+                if not self.legacy_closed(leg):
+                    rec.update({"announce_sent": bool(leg.get("announce_sent")), "status": "announced" if leg.get("announce_sent") else "found",
+                                "created_via": "legacy"})
+                    state["matches"][mid] = rec
                 continue
             if m["status"] == M.FINISHED:                                           # матч уже сыгран к моменту утра (например ночной NHL): без анонса, результат — по общему порядку
                 rec["announce_sent"], rec["status"], rec["announce_text"] = True, "awaiting_result", None
@@ -422,25 +516,58 @@ class Dynamic:
 
     # ---- результаты ---------------------------------------------------------------------------------------------------------------
 
+    def stable_final(self, rec: dict, found: dict, now: datetime.datetime) -> bool:
+        """Матч завершён по версии источника БЕЗ явного статуса «завершён»: принимаем только устойчивый счёт — одинаков в ≥2 проверках с интервалом
+        ≥STABLE_MINUTES и после минимальной длительности матча. Изменился счёт — отсчёт заново (идущий матч так не пройдёт)."""
+        score = f"{found['score_home']}:{found['score_away']}"
+        obs = rec.get("obs")
+        if not obs or obs.get("score") != score:
+            rec["obs"] = {"score": score, "first": now.isoformat(), "last": now.isoformat(), "n": 1}
+            return False
+        obs["last"], obs["n"] = now.isoformat(), obs.get("n", 1) + 1
+        first = self.S.parse_iso(obs["first"])
+        start = found.get("kickoff_latest") or self.S.parse_iso(rec.get("start_utc"))               # при неоднозначном поясе источника — самое позднее начало
+        enough_time = start is None or now >= start + datetime.timedelta(minutes=MIN_MATCH_MINUTES.get(rec.get("sport"), 125))
+        return obs["n"] >= 2 and now - first >= datetime.timedelta(minutes=STABLE_MINUTES) and enough_time
+
     async def resolve(self, rec: dict, now: datetime.datetime) -> dict:
-        """state: ok (text) | none | conflict (reason) | error (reason). Сбой источника ≠ «результата нет»; расхождение источников — не факт."""
+        """state: ok (text) | none | conflict (reason) | error (reason) | cancelled. Сбой источника ≠ «результата нет»; расхождение источников — не факт;
+        счёт без доказанного «завершён» — не результат."""
         day = datetime.date.fromisoformat(rec["day"])
         clubs = {k for k in (rec.get("home_id"), rec.get("away_id")) if k}
-        res = await self.feed.collect(day, competitions={rec["competition"]}, clubs=clubs)
+        comps = {rec["competition"]} if not rec["competition"].startswith(M.PSEUDO_PREFIX) else set()
+        res = await self.feed.collect(day, competitions=comps, clubs=clubs, pages=clubs & set(F.BASELINE_PAGES))
         found = next((m for m in res.matches if match_id(m) == rec["match_id"]), None)
+        rec["last_checked_at"] = now.isoformat()
         if found is None:
-            if rec["competition"] in res.failed_competitions:
+            if rec["competition"] in res.failed_competitions or (rec["competition"].startswith(M.PSEUDO_PREFIX) and res.failed_clubs):
                 return {"state": "error", "reason": "источники турнира не ответили"}
+            rec["last_source_status"] = "NOT_FOUND"
             return {"state": "none"}
+        rec["last_source_status"] = found["status"]
+        if found["status"] in (M.CANCELLED, M.POSTPONED):
+            return {"state": "cancelled", "reason": found["status"]}
         if found["status"] != M.FINISHED or found["score_home"] is None or found["score_away"] is None:
+            rec["phase"], rec["obs"] = ("LIVE" if found["status"] == M.LIVE else "SCHEDULED"), None
+            if found["score_home"] is not None:
+                rec["score"] = f"{found['score_home']}:{found['score_away']}"
             return {"state": "none"}
+        rec["score"] = f"{found['score_home']}:{found['score_away']}"
         if found["confidence"] == "conflict":
             return {"state": "conflict", "reason": "источники называют разный счёт"}
-        return {"state": "ok", "text": self.text_result(rec, found)}
+        if found.get("final_confirmed"):
+            rec.update({"final_confirmed": True, "phase": "FINAL", "obs": None})
+            return {"state": "ok", "text": self.text_result(rec, found)}
+        rec["phase"] = "LIVE"                                                       # источник не написал «завершён»: ждём устойчивого счёта
+        if self.stable_final(rec, found, now):
+            rec.update({"final_confirmed": True, "phase": "FINAL"})
+            return {"state": "ok", "text": self.text_result(rec, found)}
+        return {"state": "none"}
 
     async def results(self, bot, now: datetime.datetime) -> None:
-        """Тот же жизненный цикл, что у шести клубов: первая проверка через RESULT_DELAY_HOURS после начала, повторы каждый тик, сохранение до отправки,
-        «опубликован» — только после подтверждённой отправки. Идёт по ВСЕМ неоконченным записям, даже если болельщик уже снял клуб."""
+        """Жизненный цикл результата: первая проверка через RESULT_DELAY_HOURS после начала (это расписание опроса, а не доказательство окончания),
+        затем каждый тик; публикуется только доказанный итог (resolve). Сохранение до отправки, «опубликован» — только после подтверждённой отправки.
+        Идёт по ВСЕМ неоконченным записям, даже если болельщик уже снял клуб."""
         S = self.S
         state = self.load_state()
         for rec in list(state["matches"].values()):
@@ -456,8 +583,11 @@ class Dynamic:
             if now < start + datetime.timedelta(hours=S.RESULT_DELAY_HOURS):
                 continue
             age = (now - start).total_seconds() / 3600
-            if rec["result_text"] is None and age > S.RESULT_GIVE_UP_HOURS:
-                rec["status"] = "expired"
+            give_up_age, give_up_limit = age, S.RESULT_GIVE_UP_HOURS
+            if rec.get("created_via") == "recovery" and S.parse_iso(rec.get("created_at")):          # восстановленному матчу — свои 12 часов с момента восстановления
+                give_up_age, give_up_limit = (now - S.parse_iso(rec["created_at"])).total_seconds() / 3600, RECOVERY_GIVE_UP_HOURS
+            if rec["result_text"] is None and give_up_age > give_up_limit:
+                rec["status"], rec["phase"] = "expired", "EXPIRED"
                 self.save_state(state)
                 if not S.DRY_RUN:
                     await S.raise_alert(bot, f"dyngiveup:{rec['match_id']}",
@@ -471,10 +601,14 @@ class Dynamic:
                 if res["state"] == "ok":
                     rec.update({"source_fail_ticks": 0, "conflict": None, "result_text": res["text"], "result_found_at": now.isoformat(), "status": "result_found"})
                     self.save_state(state)                                          # результат сохранён ДО попытки отправки
+                elif res["state"] == "cancelled":
+                    rec.update({"status": "expired", "phase": "CANCELLED", "closed_reason": res["reason"]})
+                    self.save_state(state)
+                    continue
                 elif res["state"] == "conflict":
                     conflict = rec.get("conflict") or {"since": now.isoformat(), "count": 0}
                     conflict.update({"count": conflict["count"] + 1, "last": now.isoformat(), "reason": res["reason"]})
-                    rec["conflict"] = conflict
+                    rec["conflict"], rec["phase"] = conflict, "CONFLICT"
                     self.save_state(state)
                     since = S.parse_iso(conflict["since"])
                     if not S.DRY_RUN and now - since >= datetime.timedelta(minutes=S.CONFLICT_ALERT_AFTER_MINUTES):
@@ -483,6 +617,7 @@ class Dynamic:
                     continue
                 elif res["state"] == "error":
                     rec["source_fail_ticks"] += 1
+                    rec["phase"] = "ERROR"
                     self.save_state(state)
                     if not S.DRY_RUN and rec["source_fail_ticks"] >= S.SOURCE_FAIL_ALERT_TICKS:
                         await S.raise_alert(bot, f"dynsrcfail:{rec['match_id']}",
@@ -490,6 +625,7 @@ class Dynamic:
                     continue
                 else:
                     rec["source_fail_ticks"] = 0
+                    self.save_state(state)
                     if not S.DRY_RUN and age >= S.RESULT_ALERT_AFTER_HOURS:
                         await S.raise_alert(bot, f"dynnores:{rec['match_id']}",
                                             f"⚠️ Трибун\nРезультат матча {title} пока не найден ({S.RESULT_ALERT_AFTER_HOURS:g} ч после начала). "
@@ -497,6 +633,49 @@ class Dynamic:
                     continue
             if rec["result_text"]:
                 await self.publish(bot, state, rec, now)
+
+    # ---- восстановление (self-healing) ---------------------------------------------------------------------------------------------
+
+    async def recover(self, bot, now: datetime.datetime, *, force: bool = False) -> int:
+        """Проверяет последние 48 часов: матчи активных клубов, которые уже начались или завершились, но не имеют записи в хранилище (пропущены утром,
+        потеряны после рестарта, источник временно не работал), — заводит запись, дальше их доводит results(). Опубликованное, закрытое прежним контуром и
+        известное хранилищу не заводится заново. Возвращает число восстановленных матчей."""
+        S = self.S
+        state = self.load_state()
+        last = S.parse_iso(state["meta"].get("recovered_at"))
+        if not force and last and now - last < datetime.timedelta(minutes=RECOVERY_EVERY_MINUTES):
+            return 0
+        act = self.active()
+        today = now.astimezone(M.MSK).date()
+        days = [today - datetime.timedelta(days=i) for i in range(RECOVERY_DAYS, -1, -1)]
+        matches, failed = await self.gather(days, act["dynamic"])
+        added = 0
+        for m in matches:
+            mid = match_id(m)
+            if not self.relevant(m, act["dynamic"]) or m["status"] in (M.CANCELLED, M.POSTPONED):
+                continue
+            started = m["status"] in (M.FINISHED, M.LIVE) or (m["kickoff"] is not None and m["kickoff"] <= now)
+            if not started or mid in state["matches"] or mid in state["published_ids"]:
+                continue
+            leg = self.legacy_for(m)
+            if self.legacy_closed(leg):
+                continue
+            d = self.describe(m, act["dynamic"])
+            rec = self.new_record(m, d, "")
+            rec.update({"announce_sent": True, "status": "awaiting_result", "created_via": "recovery", "created_at": now.isoformat()})
+            if leg and leg.get("announce_sent") is False:
+                rec["announce_sent"] = True                                         # матч уже начался: анонс не нужен
+            if rec["start_utc"] is None:                                            # у завершённых футбольных матчей время не показано — известна только дата
+                rec["start_utc"] = datetime.datetime(m["day"].year, m["day"].month, m["day"].day, tzinfo=M.MSK).astimezone(datetime.timezone.utc).isoformat()
+            state["matches"][mid] = rec
+            added += 1
+        state["meta"]["recovered_at"] = now.isoformat()
+        if added:
+            state["meta"]["recovered_total"] = state["meta"].get("recovered_total", 0) + added
+        self.save_state(state)
+        if added:
+            print(f"[DYN] восстановление: заведено матчей {added}")
+        return added
 
     async def publish(self, bot, state: dict, rec: dict, now: datetime.datetime) -> bool:
         S = self.S

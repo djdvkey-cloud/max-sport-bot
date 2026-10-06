@@ -42,6 +42,9 @@ FNL1_SLUGS = {
     "ufa": "ufa", "volga": "volga-ulyanovsk",
 }
 
+# Постоянные клубы владельца (футбол), у которых страница клуба читается целиком (все турниры: кубки, суперкубки, товарищеские) — slug на sports.ru
+BASELINE_PAGES = {"ural": "ural", "real": "real", "arsenal": "arsenal", "milan": "milan"}
+
 # турнир → (вид спорта, источник центра) для турниров, которые отдаёт матч-центр sports.ru
 CENTER_COMPETITIONS = {"khl": "hockey", "nhl": "hockey", "vtb": "basketball", "rpl": "football", "apl": "football", "laliga": "football",
                        "seriea": "football", "ucl": "football", "uel": "football", "uecl": "football"}
@@ -85,8 +88,9 @@ class SourceReport:
 
 
 class FeedResult:
-    def __init__(self, day: datetime.date, matches: list, reports: list, failed_competitions: set):
+    def __init__(self, day: datetime.date, matches: list, reports: list, failed_competitions: set, failed_clubs: set | None = None):
         self.day, self.matches, self.reports, self.failed_competitions = day, matches, reports, failed_competitions
+        self.failed_clubs = failed_clubs or set()                  # клубы, страница которых не прочиталась (кубки/товарищеские этих клубов могли не попасть)
 
     def for_club(self, club_id: str) -> list:
         return [m for m in self.matches if club_id in (m["home_team_id"], m["away_team_id"])]
@@ -113,7 +117,10 @@ def merge_matches(batches: list) -> list:
     out = []
     for g in groups.values():
         g = sorted(g, key=lambda x: _rank(x["source_id"]))
-        main = dict(g[0])
+        # Явное «завершён» (sports.ru «Завершен», NHL API FINAL) главнее порядка источников: промежуточный счёт «идёт» никогда не становится итогом.
+        explicit = [x for x in g if x["status"] == M.FINISHED and x.get("final_explicit") and x["score_home"] is not None]
+        main = dict(explicit[0] if explicit else g[0])
+        g = [main] + [x for x in g if x is not (explicit[0] if explicit else g[0])]
         main["sources"] = list(dict.fromkeys(x["source_id"] for x in g))
         others = [x for x in g[1:] if x["source_id"] != main["source_id"]]
         if not others:
@@ -133,6 +140,9 @@ def merge_matches(batches: list) -> list:
                 main["confidence"], main["trusted"] = "confirmed", True
             else:
                 main["confidence"], main["trusted"] = "status_differs", True
+        # итог доказан только явным статусом «завершён» у источника, чей счёт не оспорен: остальное решает правило устойчивого счёта (dynamic.stable_final)
+        main["final_confirmed"] = bool(main["status"] == M.FINISHED and main.get("final_explicit") and main["score_home"] is not None
+                                       and main["confidence"] != "conflict")
         out.append(main)
     return sorted(out, key=lambda m: (m["kickoff"] or datetime.datetime.max.replace(tzinfo=M.UTC), m["competition"], m["home_team"]))
 
@@ -219,6 +229,14 @@ class MatchFeed:
             self._cache["wiki_ucl"] = (now, matches, rep)
         return matches, rep
 
+    async def club_page(self, club_id: str) -> tuple:
+        """Страница клуба sports.ru целиком (все турниры): кубки и товарищеские постоянных клубов; статус «завершён» тут не написан — счёт неявный."""
+        now = self.now()
+        url = URL_CLUB.format(slug=BASELINE_PAGES[club_id])
+        return await self._run("sportsru:club:football", url,
+                               lambda t: M.parse_sportsru_club_calendar(t, club_id, sport="football", source_url=url, retrieved_at=now, all_tournaments=True),
+                               sanity=lambda t: any(M.CLUB_DATE_RE.match(ln) for ln in M.clean_lines(t)))
+
     async def fnl1_club(self, club_id: str) -> tuple:
         now = self.now()
         url = URL_CLUB.format(slug=FNL1_SLUGS[club_id])
@@ -228,8 +246,9 @@ class MatchFeed:
 
     # ---- сбор за день ----------------------------------------------------------------------------------------------------------
 
-    async def collect(self, day: datetime.date, *, competitions=None, clubs=None) -> FeedResult:
-        """Матчи дня (московская дата) по турнирам `competitions` (None = все) и, для Первой лиги, только клубов `clubs` (None = все 18)."""
+    async def collect(self, day: datetime.date, *, competitions=None, clubs=None, pages=None) -> FeedResult:
+        """Матчи дня (московская дата) по турнирам `competitions` (None = все) и, для Первой лиги, только клубов `clubs` (None = все 18).
+        `pages` — постоянные клубы, страницу которых читаем целиком (все турниры, включая кубки вне каталога)."""
         wanted = set(competitions) if competitions is not None else {c[0] for c in C.COMPETITIONS}
         jobs, labels = [], []
 
@@ -247,23 +266,32 @@ class MatchFeed:
             add(self.superliga(), {"superliga"})
         if "ucl" in wanted:
             add(self.wiki_ucl(), {"ucl"})
+        paged = sorted(set(pages or ()) & set(BASELINE_PAGES))
         if "fnl1" in wanted:
             for club_id in (sorted(set(clubs) & set(FNL1_SLUGS)) if clubs is not None else sorted(FNL1_SLUGS)):
-                add(self.fnl1_club(club_id), {"fnl1"})
+                add(self.fnl1_club(club_id) if club_id not in paged else self.club_page(club_id), {"fnl1"})
+        page_labels = []
+        for club_id in paged:
+            if not ("fnl1" in wanted and club_id in FNL1_SLUGS and (clubs is None or club_id in clubs)):       # Урал уже прочитан выше (все турниры)
+                add(self.club_page(club_id), set())
+            page_labels.append(club_id)
         results = await asyncio.gather(*jobs)
         batches, reports = [], []
         ok_by_comp: dict = {c: False for c in wanted}
         tried: dict = {c: 0 for c in wanted}
+        failed_clubs = set()
         for (matches, rep), comps in zip(results, labels):
             reports.append(rep)
             batches.append(matches)
+            if rep.outcome == FAILED and rep.source_id == "sportsru:club:football":
+                failed_clubs.add(rep.url)
             for c in comps:
                 tried[c] += 1
                 if rep.outcome != FAILED:
                     ok_by_comp[c] = True
-        merged = [m for m in merge_matches(batches) if m["competition"] in wanted and m["day"] == day]
+        merged = [m for m in merge_matches(batches) if (m["competition"] in wanted or m["competition"].startswith(M.PSEUDO_PREFIX)) and m["day"] == day]
         failed = {c for c in wanted if tried[c] and not ok_by_comp[c]}
-        return FeedResult(day, merged, reports, failed)
+        return FeedResult(day, merged, reports, failed, failed_clubs)
 
     # ---- интересы группы ---------------------------------------------------------------------------------------------------------
 

@@ -971,20 +971,25 @@ class Tribun:
             fans = self.interest_map(self.load_members())["keys"]["cl"]
         except TribunDataError as e:
             return f"🎯 Активные клубы\n\n⚠️ Профили не читаются: {e.reason}"
+        fans = dict(fans)
+        for k in self.legacy_clubs:
+            fans.setdefault(k, 0)                                                                # постоянные клубы владельца активны всегда
+        chosen = any(n for n in fans.values())
         lines = [f"🎯 Активные клубы — {len(fans)}", "",
-                 "Клубы, которые выбрали участники группы. Все обслуживаются одинаково: афиша недели, напоминание в день матча, сообщения об "
-                 "изменениях и результат. Число участников — только статистика, на обслуживание оно не влияет."]
-        if not fans:
-            lines += ["", "Пока никто не выбрал клубы."]
+                 "Постоянные клубы владельца (активны всегда) и клубы, которые выбрали участники группы. Все обслуживаются одинаково, одним контуром: афиша недели, "
+                 "напоминание в день матча, сообщения об изменениях и результат (только после подтверждённого «завершён»). Число участников — только статистика, "
+                 "на обслуживание оно не влияет."]
+        if not any(k not in self.legacy_clubs for k in fans):
+            lines += ["", "Участники пока не выбрали других клубов."]
         for sport, icon, name, _ in C.SPORTS:
             rows = sorted(((C.CLUB_BY_KEY[k][1], n, k) for k, n in fans.items() if C.CLUB_BY_KEY[k][2] == sport), key=lambda r: r[0].casefold())
             if rows:
                 lines += ["", f"{icon} {name}"]
-                lines += [f"{label} — {n}" + (" (историческая автоматика)" if k in self.legacy_clubs else "") for label, n, k in rows]
+                lines += [f"{label} — {n}" + (" (постоянный клуб)" if k in self.legacy_clubs else "") for label, n, k in rows]
         lines += ["", "Список пересчитывается сам при смене интересов, выходе и возвращении участников — деплой и ручное включение не нужны."]
         if self.legacy_clubs:
             names = ", ".join(C.CLUB_BY_KEY[k][1] for k in sorted(self.legacy_clubs) if k in C.CLUB_BY_KEY)
-            lines.append(f"Историческая автоматика обслуживает всегда, даже без болельщиков: {names}.")
+            lines.append(f"Постоянные клубы владельца обслуживаются всегда, даже без болельщиков: {names}.")
         return "\n".join(lines)
 
     def editorial_summary(self, store: dict) -> dict:

@@ -61,6 +61,11 @@ class FakeBot:
         self.admin.append({"to": user_id or chat_id, "text": text, "notify": notify})
 
 
+class _OfflineSession:
+    def __init__(self, *a, **k):
+        raise S.aiohttp.ClientConnectionError("тесты работают без сети")
+
+
 async def _no_sleep(*a, **k):
     return None
 
@@ -77,6 +82,8 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self._patch(S, "DRY_RUN", False)
         self._patch(S, "OPENAI_API_KEY", "")
         self._patch(S.asyncio, "sleep", _no_sleep)
+        # Тесты НЕ ходят в интернет: любой запрос через aiohttp — «нет связи» (тесты, которым нужны ответы, подменяют ClientSession сами)
+        self._patch(S.aiohttp, "ClientSession", _OfflineSession)
         self.bot = FakeBot()
         self.pages = {}           # url -> текст страницы календаря
         self.deepseek = {}        # club_key -> ответ утренней проверки / исключение
@@ -338,14 +345,6 @@ class ResultPublication(Base):
         await S.job_check_results(self.bot, self.START + datetime.timedelta(hours=4))
         self.assertEqual(len(self.bot.admin), 1)
         self.assertIn("время начала", self.bot.admin[0]["text"])
-
-    def test_wakeup_aligned_to_first_check(self):
-        self.setup_match()
-        now = self.START + datetime.timedelta(hours=1, minutes=50)       # до проверки 10 минут
-        self.assertAlmostEqual(S.seconds_until_next_event(now), 601, delta=2)
-        now2 = self.START - datetime.timedelta(hours=10)
-        self.assertEqual(S.seconds_until_next_event(now2), S.CHECK_INTERVAL_SECONDS)
-
 
 class StateMigration(Base):
     def write_v1(self, payload, saved_at):
@@ -686,63 +685,6 @@ class Weekly(Base):
         later = [f for f in sinara if str(f["date"]) == "2026-10-26"][0]
         self.assertIsNone(later["time"])                          # 00:00 на странице лиги = не назначено
 
-    async def test_weekly_message_sorted_icons_and_unknown_time(self):
-        self.pages[self.url("ural")] = sportsru_page([
-            ("10.10.2026", "12:00", "Первая лига", "Велес", "Дома", ["превью", "–"]),
-            ("04.10.2026", "12:00", "Первая лига", "Старый", "Дома", ["1 : 0", "100"]),       # прошлая неделя
-        ])
-        self.pages[self.url("avtomobilist")] = sportsru_page([
-            ("06.10.2026", "17:00", "КХЛ", "Авангард", "Дома", ["превью", "–"]),
-            ("11.10.2026", "01:00", "КХЛ", "Металлург Мг", "В гостях", ["превью", "–"]),       # время-заглушка
-            ("12.10.2026", "17:00", "КХЛ", "Сибирь", "Дома", ["превью", "–"]),                 # следующая неделя
-        ])
-        ok = await S.job_weekly(self.bot, self.MONDAY)
-        self.assertTrue(ok)
-        self.assertEqual(len(self.bot.group), 1)
-        text = self.bot.group[0]
-        self.assertEqual(text, "\n".join([
-            "📅 Наши матчи на этой неделе", "",
-            "🏒 ХК «Автомобилист» — Авангард", "🗓 Вторник · 17:00 (мск)", "",
-            "⚽ ФК «Урал» — Велес", "🗓 Суббота · 12:00 (мск)", "",
-            "🏒 ХК «Автомобилист» — Металлург Мг", "🗓 Воскресенье · время уточняется",
-        ]))
-        self.assertEqual(S.last_weekly_date(), datetime.date(2026, 10, 5))
-        entries = S.load_schedule()["entries"]
-        self.assertEqual(len(entries), 3)
-        self.assertEqual({e["club_key"] for e in entries}, {"ural", "avtomobilist"})
-
-    async def test_no_matches_sends_nothing_but_week_is_done(self):
-        for club in S.CLUBS:
-            self.pages[self.url(club["key"])] = sportsru_page([("20.10.2026", "19:00", "Лига", "Кто-то", "Дома", ["превью", "–"])])
-        ok = await S.job_weekly(self.bot, self.MONDAY)
-        self.assertTrue(ok)
-        self.assertEqual(self.bot.group, [])
-        self.assertEqual(S.last_weekly_date(), datetime.date(2026, 10, 5))
-
-    async def test_one_source_down_others_still_in_afisha_single_alert(self):
-        self.pages[self.url("ural")] = sportsru_page([("10.10.2026", "12:00", "Первая лига", "Велес", "Дома", ["превью", "–"])])
-        # остальные страницы пустые → SourceError
-        await S.job_weekly(self.bot, self.MONDAY)
-        self.assertEqual(len(self.bot.group), 1)
-        self.assertIn("ФК «Урал» — Велес", self.bot.group[0])
-        alerts = [t for t in self.admin_texts() if "Не удалось получить расписание недели" in t]
-        self.assertEqual(len(alerts), 5)                          # по одному на клуб, не повторяясь
-        await S.job_weekly(self.bot, self.MONDAY + datetime.timedelta(minutes=20))
-        self.assertEqual(len([t for t in self.admin_texts() if "Не удалось получить расписание недели" in t]), 5)
-
-    async def test_send_failure_retries_and_alerts_once(self):
-        self.pages[self.url("ural")] = sportsru_page([("10.10.2026", "12:00", "Первая лига", "Велес", "Дома", ["превью", "–"])])
-        for club in S.CLUBS:
-            self.pages.setdefault(self.url(club["key"]), sportsru_page([]))
-        self.bot.fail_group = True
-        self.assertFalse(await S.job_weekly(self.bot, self.MONDAY))
-        self.assertIsNone(S.last_weekly_date())
-        self.assertEqual(len([t for t in self.admin_texts() if "недельную афишу" in t]), 1)
-        self.bot.fail_group = False
-        self.assertTrue(await S.job_weekly(self.bot, self.MONDAY + datetime.timedelta(minutes=20)))
-        self.assertEqual(len(self.bot.group), 1)
-        self.assertTrue(self.admin_texts()[-1].startswith("✅"))
-
     async def test_weekly_trigger_monday_9_only_once_per_week(self):
         """Условие запуска в scheduler_loop."""
         monday = datetime.date(2026, 10, 5)
@@ -758,15 +700,6 @@ class Weekly(Base):
         S.save_last_weekly(monday)
         self.assertFalse(due(ekb(2026, 10, 5, 14, 0)))
         self.assertTrue(due(ekb(2026, 10, 12, 9, 0)))            # следующий понедельник — снова
-
-    async def test_afisha_does_not_replace_morning_announcement(self):
-        """Афиша и утренний анонс независимы: афиша ничего не отмечает в состоянии матчей."""
-        self.pages[self.url("ural")] = sportsru_page([("10.10.2026", "12:00", "Первая лига", "Велес", "Дома", ["превью", "–"])])
-        await S.job_weekly(self.bot, self.MONDAY)
-        self.assertEqual(self.state()["matches"], {})
-
-
-# ============================================================ контроль изменений расписания
 
 class ScheduleChanges(Base):
     TODAY = ekb(2026, 10, 6, 10, 0)
@@ -1049,67 +982,6 @@ class SourceConflicts(Base):
 # ============================================================ планировщик, main, совместимость с maxapi
 
 class Wiring(Base):
-    async def test_scheduler_runs_weekly_morning_results_in_one_tick_then_sleeps_until_check(self):
-        monday_10 = ekb(2026, 10, 5, 10, 0)
-        self._patch(S, "utc_now", lambda: monday_10.astimezone(UTC))
-        for club in S.CLUBS:
-            self.pages[club["extract_urls"][0]] = sportsru_page([])
-        self.pages[self.club("ural")["extract_urls"][0]] = sportsru_page(
-            [("10.10.2026", "12:00", "Первая лига", "Велес", "Дома", ["превью", "–"])])
-
-        async def fake_deepseek(question, sites, search_query=None, extract_urls=None):
-            if self.club("avtomobilist")["name"] in question:
-                return "КХЛ|19:00|мск|Екатеринбург|Амур", "Источник x:\nАвтомобилист Амур"
-            return "НЕТ", ""
-
-        self._patch(S, "ask_deepseek", fake_deepseek)
-
-        class Stop(Exception):
-            pass
-
-        slept = []
-
-        async def stop_sleep(seconds):
-            slept.append(seconds)
-            raise Stop()
-
-        self._patch(S.asyncio, "sleep", stop_sleep)
-        with self.assertRaises(Stop):
-            await S.scheduler_loop(self.bot)
-        texts = self.bot.group
-        self.assertTrue(texts[0].startswith("📅 Наши матчи на этой неделе"))        # сначала афиша
-        self.assertIn("Сегодня играет ХК «Автомобилист»", texts[1])                 # затем утренний анонс
-        self.assertEqual(len(texts), 2)
-        self.assertEqual(S.last_weekly_date(), datetime.date(2026, 10, 5))
-        self.assertEqual(S.load_last_morning_date(), datetime.date(2026, 10, 5))
-        # до первой проверки результата (16:00 мск + 2 ч = 18:00 мск) ещё долго: спим обычный интервал
-        self.assertEqual(slept, [S.CHECK_INTERVAL_SECONDS])
-
-    async def test_scheduler_survives_failing_part_and_alerts_after_three_ticks(self):
-        now = ekb(2026, 10, 7, 12, 0)             # среда, не время афиши/утра
-        self._patch(S, "utc_now", lambda: now.astimezone(UTC))
-
-        async def boom(bot, now_arg):
-            raise RuntimeError("внутренняя ошибка со stacktrace")
-
-        self._patch(S, "job_check_results", boom)
-        count = {"n": 0}
-
-        class Stop(Exception):
-            pass
-
-        async def limited_sleep(seconds):
-            count["n"] += 1
-            if count["n"] >= 4:
-                raise Stop()
-
-        self._patch(S.asyncio, "sleep", limited_sleep)
-        with self.assertRaises(Stop):
-            await S.scheduler_loop(self.bot)
-        alerts = [t for t in self.admin_texts() if "Внутренний сбой планировщика" in t]
-        self.assertEqual(len(alerts), 1)
-        self.assertNotIn("stacktrace", alerts[0])
-
     async def test_main_sends_startup_notice_and_starts_scheduler(self):
         started = mock.AsyncMock()
         self._patch(S, "scheduler_loop", started)

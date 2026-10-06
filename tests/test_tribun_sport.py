@@ -33,9 +33,9 @@ class ClubLayer(Base):
 
     def test_automation_lists_existing_jobs_with_timezone_and_status(self):
         self._patch(S, "utc_now", lambda: ekb(2026, 10, 3, 9, 30).astimezone(S.UTC) if hasattr(S, "UTC") else ekb(2026, 10, 3, 9, 30))
-        S.save_last_morning_date(datetime.date(2026, 10, 2))
+        S.save_dyn_last_morning(datetime.date(2026, 10, 2))
         T.record_job(S.DATA_DIR, "weekly", True, now=ekb(2026, 9, 28, 9, 5).astimezone(datetime.timezone.utc))
-        T.record_job(S.DATA_DIR, "results", False, "RuntimeError: boom", now=ekb(2026, 10, 2, 22, 0).astimezone(datetime.timezone.utc))
+        T.record_job(S.DATA_DIR, "dyn_results", False, "RuntimeError: boom", now=ekb(2026, 10, 2, 22, 0).astimezone(datetime.timezone.utc))
         jobs = {j["name"]: j for j in S.tribun_automation()}
         self.assertEqual(set(jobs), {"Утренний анонс матчей", "Недельная афиша", "Проверка результатов матчей", "Сверка состава группы «Своя Трибуна»"})
         morning = jobs["Утренний анонс матчей"]
@@ -52,7 +52,7 @@ class ClubLayer(Base):
         for secret in (S.MAX_BOT_TOKEN, S.DEEPSEEK_API_KEY, S.TAVILY_API_KEY):
             self.assertNotIn(secret, flat) if len(secret) > 6 else None
         self.assertTrue(st["running"])
-        self.assertTrue(any("Tavily" in s for s in st["sources"]))
+        self.assertTrue(any("детерминированные" in s for s in st["sources"]))
 
     async def test_scheduler_records_tick_and_job_results_for_owner_panel(self):
         now = ekb(2026, 10, 7, 12, 0)
@@ -68,7 +68,7 @@ class ClubLayer(Base):
             await S.scheduler_loop(self.bot)
         jobs = T.read_job_status(S.DATA_DIR)
         self.assertIn("_tick", jobs)
-        self.assertIn("last_ok", jobs["results"])
+        self.assertIn("last_ok", jobs["dyn_results"])
 
     async def test_run_tribun_starts_listener_and_survives_polling_crash(self):
         class Me:

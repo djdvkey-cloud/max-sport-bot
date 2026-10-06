@@ -73,7 +73,7 @@ class DynBase(TS.Base):
         self.profiles = []
         self.fetch = FakeFetch(all_routes())
         self.feed = F.MatchFeed(fetch=self.fetch, now=lambda: utc(2026, 10, 3, 10))
-        self.dyn = D.Dynamic(S, feed=self.feed, profiles=lambda: self.profiles)
+        self.dyn = D.Dynamic(S, feed=self.feed, profiles=lambda: self.profiles, baseline=())      # изолируем логику выбора участников: постоянные клубы — отдельные тесты
         self._patch(S, "DYNAMIC", self.dyn)
         self._patch(S, "pick_intro", lambda kind, rng=None: "ВВОДНАЯ")
 
@@ -143,10 +143,19 @@ class ActiveClubs(DynBase):
         self.assertEqual(act["dynamic"], {"man_city"})
         self.assertEqual(D.competitions_of(act["dynamic"]), {"apl", "ucl"})
 
-    def test_legacy_clubs_are_counted_but_served_by_the_old_pipeline(self):
-        self.profiles = [profile(["football", "hockey"], ["apl", "khl"], ["arsenal", "avtomobilist", "zenit_stub"])]
-        act = self.dyn.active()
-        self.assertEqual((act["legacy"], act["dynamic"]), ({"arsenal", "avtomobilist"}, set()))
+    def test_baseline_clubs_are_always_active_and_members_add_to_them(self):
+        dyn = D.Dynamic(S, feed=self.feed, profiles=lambda: self.profiles)                       # постоянные клубы — шесть клубов sport_bot.CLUBS
+        self.profiles = []
+        act = dyn.active()
+        self.assertEqual(act["dynamic"], {"avtomobilist", "sinara", "ural", "real", "arsenal", "milan"})
+        self.assertEqual(act["legacy"], act["dynamic"])
+        self.assertEqual(set(act["fans"].values()), {0})                                         # болельщиков нет — клубы всё равно активны
+        self.profiles = [profile(["football", "hockey"], ["apl", "khl", "rpl"], ["arsenal", "zenit"])]      # выбор участника
+        act = dyn.active()
+        self.assertEqual(act["dynamic"], {"avtomobilist", "sinara", "ural", "real", "arsenal", "milan", "zenit"})
+        self.assertEqual((act["fans"]["arsenal"], act["fans"]["zenit"], act["fans"]["milan"]), (1, 1, 0))
+        self.profiles[0]["active_in_group"] = False                                              # участник вышел: постоянные остаются, Зенит снят
+        self.assertEqual(dyn.active()["dynamic"], {"avtomobilist", "sinara", "ural", "real", "arsenal", "milan"})
 
     def test_active_clubs_come_from_the_real_members_file_without_any_config_or_deploy(self):
         from test_tribun import Base as TribunBase
@@ -160,7 +169,7 @@ class ActiveClubs(DynBase):
         case.setUp()
         data_dir = asyncio.run(case.run_it())
         with mock.patch.object(S, "DATA_DIR", data_dir):
-            real = D.Dynamic(S, feed=self.feed)
+            real = D.Dynamic(S, feed=self.feed, baseline=())
             self.assertEqual(real.active()["dynamic"], {"zenit"})                              # сохранил профиль → клуб появился сам
             asyncio.run(case.tribun.on_user_removed(GROUP, user(5)))
             self.assertEqual(real.active()["dynamic"], set())                                  # вышел → снят
@@ -177,12 +186,13 @@ class ActiveClubs(DynBase):
         case.setUp()
         data_dir = asyncio.run(case.run_it())
         with mock.patch.object(S, "DATA_DIR", data_dir):
-            self.assertEqual(D.Dynamic(S, feed=self.feed).active()["dynamic"], set())
+            self.assertEqual(D.Dynamic(S, feed=self.feed, baseline=()).active()["dynamic"], set())
 
     def test_relevance_rules(self):
         async def go():
             m = await self.match_of("2026-10-10", "apl", {"leeds"}, "arsenal", "leeds")
-            self.assertFalse(self.dyn.relevant(m, {"leeds"}))                                    # в матче играет legacy-клуб → его ведёт прежний контур
+            self.assertTrue(self.dyn.relevant(m, {"leeds"}))                                     # достаточно ОДНОГО активного клуба в матче
+            self.assertTrue(self.dyn.relevant(m, {"arsenal"}))
             n = await self.match_of("2026-10-10", "apl", {"fulham"}, "ipswich", "fulham")
             self.assertTrue(self.dyn.relevant(n, {"fulham"}))
             self.assertFalse(self.dyn.relevant(n, {"chelsea"}))
@@ -200,19 +210,6 @@ class Weekly(DynBase):
                          [("Зенит", "Краснодар", "2026-10-10", "19:30", "мск", "РПЛ / Премьер-лига")])
         text = S.format_weekly(entries)
         self.assertEqual(text, "📅 Наши матчи на этой неделе\n\n⚽ Зенит — Краснодар\n🗓 Суббота · 19:30 (мск)")
-
-    async def test_weekly_is_one_message_together_with_legacy_clubs(self):
-        self.profiles = [profile(["football"], ["rpl"], ["zenit"])]
-        for club in S.CLUBS:
-            self.pages[club["extract_urls"][0]] = QUIET_PAGE
-        self.pages[self.club("ural")["extract_urls"][0]] = sportsru_page([("10.10.2026", "12:00", "Первая лига", "Велес", "Дома", ["превью", "–"])])
-        self._patch(S, "utc_now", lambda: ekb(2026, 10, 5, 9).astimezone(TS.UTC))
-        self.assertTrue(await S.job_weekly(self.bot, ekb(2026, 10, 5, 9).astimezone(TS.UTC)))
-        self.assertEqual(len(self.bot.group), 1)                                                 # одно общее сообщение, а не две афиши
-        text = self.bot.group[0]
-        self.assertIn("⚽ ФК «Урал» — Велес", text)
-        self.assertIn("⚽ Зенит — Краснодар", text)
-        self.assertLess(text.index("Урал"), text.index("Зенит"))                                 # сортировка по времени: 12:00 мск раньше 19:30 мск
 
     async def test_unknown_time_is_clarified_and_two_active_clubs_are_one_line(self):
         self.profiles = [profile(["football"], ["rpl"], ["zenit", "krasnodar"])]
@@ -275,9 +272,10 @@ class WeeklyDedup(DynBase):
         later = dict(b, date="2026-10-15")                                                        # тот же день недели — другая дата: это другой матч
         self.assertEqual(S.format_weekly([a, later]).count("🗓"), 2)
 
-    def test_dynamic_competitions_exclude_deferred_ones(self):
-        self.assertEqual(D.competitions_of({"sunderland"}), {"apl"})                              # Сандерленд играет и в Лиге Европы — она отложена
-        self.assertEqual(D.competitions_of({"zenit_b"}), set())
+    def test_competitions_of_a_club_include_all_served_tournaments_but_not_unserved_ones(self):
+        self.assertEqual(D.competitions_of({"sunderland"}), {"apl", "uel"})                       # клуб обслуживается во всех своих турнирах, включая Лигу Европы
+        self.assertEqual(D.competitions_of({"milan"}), {"seriea", "uel"})
+        self.assertEqual(D.competitions_of({"zenit_b"}), set())                                   # ВТБ адаптерами не обслуживается
 
 
 # ==================================================================== утро и изменения
@@ -307,14 +305,13 @@ class Morning(DynBase):
         self.assertEqual(self.bot.group, ["ВВОДНАЯ\n\n⚽ Сегодня играют Краснодар — Зенит\nТурнир: РПЛ / Премьер-лига\nВремя: 19:30 (мск)"])
         self.assertEqual(len(self.dyn.load_state()["matches"]), 1)
 
-    async def test_legacy_club_match_is_left_to_the_old_pipeline(self):
-        self.profiles = [profile(["football"], ["apl"], ["leeds", "fulham"])]                    # Арсенал — Лидс ведёт legacy; Ипсвич — Фулхэм — динамика
+    async def test_any_active_club_in_a_match_is_enough(self):
+        self.profiles = [profile(["football"], ["apl"], ["leeds", "fulham"])]                    # Арсенал — Лидс (Лидс активен) и Ипсвич — Фулхэм
         await self.dyn.morning(self.bot, self.NOW)
         joined = "\n".join(self.bot.group)
         self.assertIn("Фулхэм", joined)
-        self.assertNotIn("Лидс", joined)
-        self.assertNotIn("Арсенал", joined)
-        self.assertEqual(len(self.dyn.load_state()["matches"]), 1)
+        self.assertIn("Лидс", joined)
+        self.assertEqual(len(self.dyn.load_state()["matches"]), 2)
 
     async def test_intro_is_not_repeated_if_legacy_already_added_it(self):
         self.profiles = [profile(["football"], ["rpl"], ["zenit"])]
@@ -572,11 +569,16 @@ class Results(DynBase):
         await self.dyn.results(self.bot, utc(2026, 10, 3, 7, 0))
         self.assertEqual(len(self.bot.group), 1)
 
-    async def test_legacy_and_dynamic_do_not_publish_the_same_match(self):
-        self.profiles = [profile(["football"], ["apl"], ["leeds"])]                              # Лидс активен, но играет с Арсеналом (legacy)
-        await self.dyn.morning(self.bot, ekb(2026, 10, 10, 10).astimezone(TS.UTC))
-        await self.dyn.results(self.bot, utc(2026, 10, 10, 20, 0))
-        self.assertEqual((self.bot.group, self.dyn.load_state()["matches"]), ([], {}))
+    async def test_match_closed_by_the_old_pipeline_is_never_republished(self):
+        """Переход: прежний контур уже опубликовал / закрыл матч — единый контур его не заводит и не анонсирует заново."""
+        dyn = D.Dynamic(S, feed=self.feed, profiles=lambda: [], baseline=("arsenal",))
+        start = ekb(2026, 10, 10, 14, 30).astimezone(TS.UTC)
+        self.put(self.rec("arsenal", start, rival="Лидс", status="published", day=datetime.date(2026, 10, 10), result_sent=True))
+        await dyn.morning(self.bot, ekb(2026, 10, 10, 10).astimezone(TS.UTC))
+        await dyn.results(self.bot, utc(2026, 10, 10, 20, 0))
+        await dyn.recover(self.bot, utc(2026, 10, 10, 20, 0), force=True)
+        await dyn.results(self.bot, utc(2026, 10, 10, 20, 30))
+        self.assertEqual((self.bot.group, dyn.load_state()["matches"]), ([], {}))
 
 
 # ==================================================================== приёмка: Зенит и контрольные клубы (dry-run без отправки)
@@ -689,28 +691,13 @@ class Wiring(DynBase):
         self.assertAlmostEqual(S.seconds_until_next_event(now), 10 * 60 + 1, delta=2)
         self.assertEqual(S.seconds_until_next_event(utc(2026, 10, 10, 17, 0)), S.CHECK_INTERVAL_SECONDS)     # дальше обычного интервала — спим интервал
 
-    async def test_failure_of_dynamic_weekly_does_not_break_legacy_weekly(self):
-        for club in S.CLUBS:
-            self.pages[club["extract_urls"][0]] = QUIET_PAGE
-        self.pages[self.club("ural")["extract_urls"][0]] = sportsru_page([("10.10.2026", "12:00", "Первая лига", "Велес", "Дома", ["превью", "–"])])
-
-        async def boom(*a, **k):
-            raise RuntimeError("сбой динамики")
-
-        self.dyn.weekly_entries = boom
-        self.assertTrue(await S.job_weekly(self.bot, ekb(2026, 10, 5, 9).astimezone(TS.UTC)))
-        self.assertEqual(len(self.bot.group), 1)
-        self.assertIn("Урал", self.bot.group[0])
-
-
-# ==================================================================== владельцу
-
 class OwnerSummary(DynBase):
     def test_summary_lists_clubs_with_fans_as_statistics(self):
+        dyn = D.Dynamic(S, feed=self.feed, profiles=lambda: self.profiles, baseline=("arsenal", "avtomobilist"))
         self.profiles = [profile(["football", "hockey"], ["rpl", "khl", "apl"], ["zenit", "avtomobilist", "arsenal"], uid=1),
                          profile(["football"], ["apl"], ["arsenal"], uid=2)]
-        s = self.dyn.summary()
-        self.assertEqual((s["total"], s["dynamic"], s["legacy"], s["members"]), (3, ["zenit"], ["arsenal", "avtomobilist"], 2))
+        s = dyn.summary()
+        self.assertEqual((s["total"], s["dynamic"], s["legacy"], s["members"]), (3, ["arsenal", "avtomobilist", "zenit"], ["arsenal", "avtomobilist"], 2))
         self.assertEqual(s["fans"], {"zenit": 1, "avtomobilist": 1, "arsenal": 2})
 
 

@@ -87,25 +87,12 @@ class IndependentOfProfiles(TS.Base):
         self.assertTrue(await S.job_weekly(self.bot, self.MONDAY))
         return list(self.bot.group)
 
-    async def test_weekly_poster_is_identical_with_hostile_profiles(self):
-        plain = await self.weekly_text()
-        self.assertTrue(plain)
-        self.write_profiles([(["basketball"], ["vtb"], []), ([], [], [])])        # никто не хочет ни Урал, ни Автомобилист
-        self.assertEqual(await self.weekly_text(), plain)
-
     async def test_morning_and_results_do_not_read_member_profiles(self):
         for job in (S.job_weekly, S.job_morning, S.job_check_results, S.check_morning, S.resolve_result, S.retry_failed_morning,
                     S.retry_unsent_announcements):
             src = inspect.getsource(job)
             for token in ("tribun_members", "interest_map", "load_members", "sports\"]", "championships", "tribun."):
                 self.assertNotIn(token, src, f"{job.__name__}: {token}")
-
-    async def test_removed_interest_does_not_remove_club_from_weekly(self):
-        self.write_profiles([(["hockey"], ["khl"], [])])
-        text = " ".join(await self.weekly_text())
-        self.assertIn("Автомобилист", text)
-        self.assertIn("Урал", text)                                                # футбольный клуб тоже в афише, хотя у участника интереса нет
-
 
 class Scheduler(TS.Base):
     async def test_single_scheduler_and_tribun_never_starts_its_own(self):

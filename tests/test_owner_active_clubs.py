@@ -23,15 +23,17 @@ class ActiveClubsScreen(Base):
         await self.onboard(7, sports=("football",), comps=("rpl",), clubs=("zenit",))
         await self.press(OWNER, "adm:ac")
         text = self.last_text()
-        self.assertTrue(text.startswith("🎯 Активные клубы — 3\n"))
-        self.assertIn("⚽ Футбол\nАрсенал — 2 (историческая автоматика)\nЗенит — 2", text)
-        self.assertIn("🏒 Хоккей\nАвтомобилист — 1 (историческая автоматика)", text)
-        self.assertIn("Все обслуживаются одинаково", text)
+        self.assertTrue(text.startswith("🎯 Активные клубы — 7\n"))
+        self.assertIn("Арсенал — 2 (постоянный клуб)", text)
+        self.assertIn("Зенит — 2", text)
+        self.assertIn("Автомобилист — 1 (постоянный клуб)", text)
+        self.assertIn("Милан — 0 (постоянный клуб)", text)           # постоянные клубы видны и без болельщиков
+        self.assertIn("Все обслуживаются одинаково, одним контуром", text)
         self.assertIn("Число участников — только статистика, на обслуживание оно не влияет.", text)
         self.assertIn("деплой и ручное включение не нужны", text)
         for name in ("Анна", "Борис", "Вера"):
             self.assertNotIn(name, text)                                                       # имён нет
-        self.assertIn("Историческая автоматика обслуживает всегда", text)
+        self.assertIn("Постоянные клубы владельца обслуживаются всегда", text)
 
     async def test_screen_follows_profile_changes_leaving_and_returning(self):
         await self.join(5, "Анна")
@@ -39,15 +41,15 @@ class ActiveClubsScreen(Base):
         await self.join(6, "Борис")
         await self.onboard(6, sports=("football",), comps=("rpl",), clubs=("spartak",))
         await self.press(OWNER, "adm:ac")
-        self.assertTrue(self.last_text().startswith("🎯 Активные клубы — 2\n"))
+        self.assertTrue(self.last_text().startswith("🎯 Активные клубы — 8\n"))
         await self.tribun.on_user_removed(GROUP, user(5))
         await self.press(OWNER, "adm:ac")
         text = self.last_text()
-        self.assertTrue(text.startswith("🎯 Активные клубы — 1\n"))
+        self.assertTrue(text.startswith("🎯 Активные клубы — 7\n"))
         self.assertNotIn("Зенит", text.split("Список пересчитывается")[0])
         await self.join(5, "Анна")
         await self.press(OWNER, "adm:ac")
-        self.assertTrue(self.last_text().startswith("🎯 Активные клубы — 2\n"))
+        self.assertTrue(self.last_text().startswith("🎯 Активные клубы — 8\n"))
 
     async def test_hidden_and_other_selections_are_not_shown(self):
         await self.join(5, "Анна")
@@ -58,14 +60,14 @@ class ActiveClubsScreen(Base):
             self.tribun.save_members(store)
         await self.press(OWNER, "adm:ac")
         text = self.last_text()
-        self.assertTrue(text.startswith("🎯 Активные клубы — 1\n"))
+        self.assertTrue(text.startswith("🎯 Активные клубы — 7\n"))
         self.assertNotIn("Бенфика", text)
         self.assertNotIn("Бока", text)
 
     async def test_empty_group(self):
         await self.press(OWNER, "adm:ac")
-        self.assertTrue(self.last_text().startswith("🎯 Активные клубы — 0\n"))
-        self.assertIn("Пока никто не выбрал клубы.", self.last_text())
+        self.assertTrue(self.last_text().startswith("🎯 Активные клубы — 6\n"))
+        self.assertIn("Участники пока не выбрали других клубов.", self.last_text())
 
     async def test_only_owner_sees_it(self):
         await self.join(5, "Анна")
